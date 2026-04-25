@@ -1276,7 +1276,7 @@ fn test_multi_token_usdc_fallback() {
 
     let pid = s
         .client
-        .create_payment_multi_token(&customer, &merchant, &500, &s.usdc_addr, &50);
+        .create_payment_multi_token(&customer, &merchant, &500, &s.usdc_addr, &Some(50));
 
     // Verify payment was created
     let payment = s.client.get_payment(&pid);
@@ -1305,7 +1305,7 @@ fn test_multi_token_xlm_payment_correct_amount() {
 
     let pid = s
         .client
-        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &50);
+        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &Some(50));
 
     // required_token_amount = 100 * 10_000_000 / 1_000_000 = 1000
     assert_eq!(s.xlm_client.balance(&customer), 1000);
@@ -1332,7 +1332,7 @@ fn test_multi_token_different_rate() {
     s.xlm_admin.mint(&customer, &500);
 
     s.client
-        .create_payment_multi_token(&customer, &merchant, &50, &s.xlm_addr, &100);
+        .create_payment_multi_token(&customer, &merchant, &50, &s.xlm_addr, &Some(100));
 
     // required = 50 * 10_000_000 / 5_000_000 = 100
     assert_eq!(s.xlm_client.balance(&customer), 400);
@@ -1356,7 +1356,7 @@ fn test_multi_token_stale_oracle_rejected() {
     s.xlm_admin.mint(&customer, &2000);
 
     s.client
-        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &50);
+        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &Some(50));
 }
 
 /// Unavailable oracle (no price set) must be rejected.
@@ -1371,7 +1371,7 @@ fn test_multi_token_oracle_unavailable() {
     s.xlm_admin.mint(&customer, &2000);
 
     s.client
-        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &50);
+        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &Some(50));
 }
 
 /// Zero slippage tolerance: exact integer division must not deviate.
@@ -1388,7 +1388,7 @@ fn test_multi_token_zero_slippage_exact_rate() {
     s.xlm_admin.mint(&customer, &500);
 
     s.client
-        .create_payment_multi_token(&customer, &merchant, &200, &s.xlm_addr, &0);
+        .create_payment_multi_token(&customer, &merchant, &200, &s.xlm_addr, &Some(0));
 
     // required = 200 * 10_000_000 / 10_000_000 = 200 — no deviation
     assert_eq!(s.xlm_client.balance(&s.client.address), 200);
@@ -1431,7 +1431,7 @@ fn test_multi_token_emits_event() {
     s.xlm_admin.mint(&customer, &2000);
 
     s.client
-        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &50);
+        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &Some(50));
 
     let events = s.env.events().all();
     assert!(events.len() > 0);
@@ -1448,9 +1448,9 @@ fn test_multi_token_payment_counter() {
     s.xlm_admin.mint(&customer, &5000);
 
     s.client
-        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &50);
+        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &Some(50));
     s.client
-        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &50);
+        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &Some(50));
 
     assert_eq!(s.client.get_payment_counter(), 2);
 }
@@ -1466,9 +1466,9 @@ fn test_multi_token_customer_tracking() {
     s.xlm_admin.mint(&customer, &5000);
 
     s.client
-        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &50);
+        .create_payment_multi_token(&customer, &merchant, &100, &s.xlm_addr, &Some(50));
     s.client
-        .create_payment_multi_token(&customer, &merchant, &200, &s.xlm_addr, &50);
+        .create_payment_multi_token(&customer, &merchant, &200, &s.xlm_addr, &Some(50));
 
     let ids = s.client.get_customer_payments(&customer);
     assert_eq!(ids.len(), 2);
@@ -5185,4 +5185,391 @@ fn test_invoice_hash_consistency() {
     let hash1 = s.client.get_invoice_hash(&payment_id1).unwrap();
     let hash2 = s.client.get_invoice_hash(&payment_id2).unwrap();
     assert_eq!(hash1, hash2);
+}
+
+// ===========================================================================
+//  #135 Dynamic Slippage Tolerance Configuration Per Payment
+// ===========================================================================
+
+#[test]
+fn test_multi_token_uses_global_default_slippage_when_none() {
+    let s = setup_multi_token();
+    // 1.0 USDC/XLM
+    set_oracle_price(&s, 10_000_000, 100);
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.xlm_admin.mint(&customer, &500);
+
+    // Pass None — should use global default (50 bps)
+    let pid = s
+        .client
+        .create_payment_multi_token(&customer, &merchant, &200, &s.xlm_addr, &None);
+
+    let payment = s.client.get_payment(&pid);
+    assert_eq!(payment.amount, 200);
+}
+
+#[test]
+fn test_multi_token_uses_provided_slippage_within_bounds() {
+    let s = setup_multi_token();
+    set_oracle_price(&s, 10_000_000, 100);
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.xlm_admin.mint(&customer, &500);
+
+    // Provide explicit 100 bps — within default bounds [0, 10000]
+    let pid = s
+        .client
+        .create_payment_multi_token(&customer, &merchant, &200, &s.xlm_addr, &Some(100));
+
+    let payment = s.client.get_payment(&pid);
+    assert_eq!(payment.amount, 200);
+}
+
+#[test]
+fn test_update_slippage_config_and_enforce_bounds() {
+    let s = setup_multi_token();
+    // Set tight bounds: default=100, min=50, max=200
+    s.client
+        .update_slippage_config(&s._admin, &100, &50, &200);
+
+    let cfg = s.client.get_slippage_config();
+    assert_eq!(cfg.default_bps, 100);
+    assert_eq!(cfg.min_bps, 50);
+    assert_eq!(cfg.max_bps, 200);
+}
+
+#[test]
+#[should_panic(expected = "slippage_bps below minimum allowed")]
+fn test_multi_token_slippage_below_min_rejected() {
+    let s = setup_multi_token();
+    // Set min=50
+    s.client
+        .update_slippage_config(&s._admin, &100, &50, &200);
+
+    set_oracle_price(&s, 10_000_000, 100);
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.xlm_admin.mint(&customer, &500);
+
+    // 10 bps < min 50 — must reject
+    s.client
+        .create_payment_multi_token(&customer, &merchant, &200, &s.xlm_addr, &Some(10));
+}
+
+#[test]
+#[should_panic(expected = "slippage_bps exceeds maximum allowed")]
+fn test_multi_token_slippage_above_max_rejected() {
+    let s = setup_multi_token();
+    // Set max=200
+    s.client
+        .update_slippage_config(&s._admin, &100, &50, &200);
+
+    set_oracle_price(&s, 10_000_000, 100);
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.xlm_admin.mint(&customer, &500);
+
+    // 300 bps > max 200 — must reject
+    s.client
+        .create_payment_multi_token(&customer, &merchant, &200, &s.xlm_addr, &Some(300));
+}
+
+#[test]
+fn test_slippage_tolerance_applied_event_emitted() {
+    let s = setup_multi_token();
+    set_oracle_price(&s, 10_000_000, 100);
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.xlm_admin.mint(&customer, &500);
+
+    s.client
+        .create_payment_multi_token(&customer, &merchant, &200, &s.xlm_addr, &Some(50));
+
+    let events = s.env.events().all();
+    assert!(events.len() > 0);
+}
+
+#[test]
+#[should_panic(expected = "default_bps must be within")]
+fn test_update_slippage_config_default_out_of_bounds_rejected() {
+    let s = setup_multi_token();
+    // default=300 is outside [50, 200]
+    s.client
+        .update_slippage_config(&s._admin, &300, &50, &200);
+}
+
+// ===========================================================================
+//  #131 Aggregate Volume Caps Per Merchant
+// ===========================================================================
+
+#[test]
+fn test_set_and_get_merchant_volume_cap() {
+    let s = setup();
+    s.init();
+
+    let merchant = Address::generate(&s.env);
+    s.client
+        .set_merchant_volume_cap(&s.admin, &merchant, &1000, &3600);
+
+    let cap = s.client.get_merchant_volume_cap(&merchant).unwrap();
+    assert_eq!(cap.cap_amount, 1000);
+    assert_eq!(cap.window_seconds, 3600);
+}
+
+#[test]
+fn test_merchant_without_cap_has_no_restriction() {
+    let s = setup();
+    s.init();
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &10_000);
+
+    // No cap set — payments should complete freely
+    for _ in 0..3 {
+        let pid = s.client.create_payment(
+            &customer,
+            &merchant,
+            &500,
+            &s.token_addr,
+            &None,
+            &None,
+            &None,
+        );
+        s.client.complete_payment(&pid);
+    }
+
+    assert_eq!(s.client.get_merchant_stats(&merchant).payments_completed, 3);
+}
+
+#[test]
+fn test_payments_within_cap_succeed() {
+    let s = setup();
+    s.init();
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &10_000);
+
+    // Cap = 1000 per hour; each payment = 300, so 3 payments = 900 < 1000
+    s.client
+        .set_merchant_volume_cap(&s.admin, &merchant, &1000, &3600);
+
+    s.env.ledger().set_timestamp(1000);
+
+    for _ in 0..3 {
+        let pid = s.client.create_payment(
+            &customer,
+            &merchant,
+            &300,
+            &s.token_addr,
+            &None,
+            &None,
+            &None,
+        );
+        s.client.complete_payment(&pid);
+    }
+
+    assert_eq!(s.client.get_merchant_stats(&merchant).payments_completed, 3);
+}
+
+#[test]
+fn test_payment_exceeding_cap_is_rejected() {
+    let s = setup();
+    s.init();
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &10_000);
+
+    // Cap = 900 per hour; 3 payments of 300 = 900 (boundary), 4th must fail
+    s.client
+        .set_merchant_volume_cap(&s.admin, &merchant, &900, &3600);
+
+    s.env.ledger().set_timestamp(1000);
+
+    // N-1 = 2 payments pass (600 total)
+    for _ in 0..2 {
+        let pid = s.client.create_payment(
+            &customer,
+            &merchant,
+            &300,
+            &s.token_addr,
+            &None,
+            &None,
+            &None,
+        );
+        s.client.complete_payment(&pid);
+    }
+
+    // 3rd payment (300) would bring total to 900 — exactly at cap, should pass
+    let pid3 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.complete_payment(&pid3);
+
+    // 4th payment would exceed cap (900 + 300 = 1200 > 900) — must be rejected
+    let pid4 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let result = s.client.try_complete_payment(&pid4);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        Error::MerchantVolumeCapped.into()
+    );
+}
+
+#[test]
+fn test_cap_window_resets_after_window_seconds() {
+    let s = setup();
+    s.init();
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &10_000);
+
+    // Cap = 500 per 3600 seconds
+    s.client
+        .set_merchant_volume_cap(&s.admin, &merchant, &500, &3600);
+
+    s.env.ledger().set_timestamp(1000);
+
+    // Fill cap in first window
+    let pid1 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &500,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.complete_payment(&pid1);
+
+    // Next payment in same window must fail
+    let pid2 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let blocked = s.client.try_complete_payment(&pid2);
+    assert_eq!(
+        blocked.unwrap_err().unwrap(),
+        Error::MerchantVolumeCapped.into()
+    );
+
+    // Advance to next window (1000 + 3600 = 4600 → bucket changes)
+    s.env.ledger().set_timestamp(5000);
+
+    // Payment in new window should succeed
+    let pid3 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &400,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.complete_payment(&pid3);
+    assert_eq!(
+        s.client.get_payment(&pid3).status,
+        PaymentStatus::Completed
+    );
+}
+
+#[test]
+fn test_remove_merchant_volume_cap() {
+    let s = setup();
+    s.init();
+
+    let merchant = Address::generate(&s.env);
+    s.client
+        .set_merchant_volume_cap(&s.admin, &merchant, &500, &3600);
+
+    assert!(s.client.get_merchant_volume_cap(&merchant).is_some());
+
+    // Remove cap by setting cap_amount = 0
+    s.client
+        .set_merchant_volume_cap(&s.admin, &merchant, &0, &0);
+
+    assert!(s.client.get_merchant_volume_cap(&merchant).is_none());
+}
+
+#[test]
+fn test_volume_cap_boundary_n_minus_1_pass_nth_rejected() {
+    let s = setup();
+    s.init();
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &10_000);
+
+    // Cap = 300 per window; each payment = 100; N=3 payments allowed, 4th rejected
+    s.client
+        .set_merchant_volume_cap(&s.admin, &merchant, &300, &3600);
+
+    s.env.ledger().set_timestamp(500);
+
+    // N-1 = 2 payments pass
+    for _ in 0..2 {
+        let pid = s.client.create_payment(
+            &customer,
+            &merchant,
+            &100,
+            &s.token_addr,
+            &None,
+            &None,
+            &None,
+        );
+        s.client.complete_payment(&pid);
+    }
+
+    // Nth payment (exactly at cap) passes
+    let pid_n = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.complete_payment(&pid_n);
+
+    // N+1 payment is rejected
+    let pid_over = s.client.create_payment(
+        &customer,
+        &merchant,
+        &1,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let result = s.client.try_complete_payment(&pid_over);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        Error::MerchantVolumeCapped.into()
+    );
 }
