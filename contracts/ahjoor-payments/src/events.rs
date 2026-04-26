@@ -708,3 +708,59 @@ pub fn emit_collateral_slashed(e: &Env, merchant: Address, amount: i128, payment
     }
     .publish(e);
 }
+
+// --- Slippage Tolerance Event (#135) ---
+
+/// Event: Slippage tolerance applied to a multi-token payment
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SlippageToleranceApplied {
+    pub payment_id: u32,
+    pub tolerance_bps: u32,
+    pub oracle_price: i128,
+    pub settled_amount: i128,
+}
+
+pub fn emit_slippage_tolerance_applied(
+    e: &Env,
+    payment_id: u32,
+    tolerance_bps: u32,
+    oracle_price: i128,
+    settled_amount: i128,
+) {
+    SlippageToleranceApplied {
+        payment_id,
+        tolerance_bps,
+        oracle_price,
+        settled_amount,
+    }
+    .publish(e);
+}
+
+// --- Volume Cap Event (#131) ---
+
+/// Event: Merchant payment rejected due to volume cap
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct VolumeCapped {
+    pub merchant: Address,
+    pub payment_id: u32,
+    pub current_volume: i128,
+    pub cap: i128,
+}
+
+pub fn emit_volume_capped(
+    e: &Env,
+    merchant: Address,
+    payment_id: u32,
+    current_volume: i128,
+    cap: i128,
+) {
+    VolumeCapped {
+        merchant,
+        payment_id,
+        current_volume,
+        cap,
+    }
+    .publish(e);
+}
