@@ -125,6 +125,14 @@ pub struct PaymentAuthorized {
     pub capture_deadline: u64,
 }
 
+/// Event: Payment created with a merchant-defined expiry override (#130)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentExpiryOverride {
+    pub payment_id: u32,
+    pub expiry_seconds: u64,
+}
+
 /// Event: Authorized payment captured by merchant — funds released (#127)
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -380,6 +388,14 @@ pub fn emit_payment_authorized(e: &Env, payment_id: u32, capture_deadline: u64) 
     PaymentAuthorized {
         payment_id,
         capture_deadline,
+    }
+    .publish(e);
+}
+
+pub fn emit_payment_expiry_override(e: &Env, payment_id: u32, expiry_seconds: u64) {
+    PaymentExpiryOverride {
+        payment_id,
+        expiry_seconds,
     }
     .publish(e);
 }

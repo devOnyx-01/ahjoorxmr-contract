@@ -241,6 +241,23 @@ pub struct Dispute {
 /// Default payment timeout: 7 days in seconds.
 const DEFAULT_PAYMENT_TIMEOUT: u64 = 7 * 24 * 60 * 60;
 
+/// Default lower bound for merchant-defined payment expiry overrides (#130): 1 minute.
+const DEFAULT_MIN_PAYMENT_EXPIRY: u64 = 60;
+/// Default upper bound for merchant-defined payment expiry overrides (#130): 30 days.
+const DEFAULT_MAX_PAYMENT_EXPIRY: u64 = 30 * 24 * 60 * 60;
+
+/// Maximum allowed `page_size` for `get_customer_payments_page` (#132).
+pub const MAX_CUSTOMER_PAYMENTS_PAGE_SIZE: u32 = 50;
+
+/// Paginated view over a customer's payment IDs (#132).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomerPaymentsPage {
+    pub payments: Vec<u32>,
+    pub total_count: u32,
+    pub has_more: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Subscription {
@@ -321,6 +338,10 @@ pub enum DataKey {
     PauseReason,
     /// Global payment timeout in seconds (default: 7 days)
     PaymentTimeout,
+    /// Lower bound (inclusive) for merchant-defined per-payment expiry overrides (#130)
+    MinPaymentExpiry,
+    /// Upper bound (inclusive) for merchant-defined per-payment expiry overrides (#130)
+    MaxPaymentExpiry,
     /// When true, merchant allowlist is bypassed (open mode)
     MerchantOpenMode,
     /// Subscription counter
@@ -537,6 +558,41 @@ impl AhjoorPaymentsContract {
         execute_after: Option<u64>,
         idempotency_key: Option<BytesN<32>>,
     ) -> u32 {
+        Self::create_payment_with_expiry(
+            env,
+            customer,
+            merchant,
+            amount,
+            token,
+            reference,
+            metadata,
+            split_recipients,
+            execute_after,
+            idempotency_key,
+            None,
+        )
+    }
+
+    /// Extended payment creation with an optional merchant-defined expiry (#130).
+    ///
+    /// When `expiry_seconds` is `Some(value)`, `value` must lie within the
+    /// admin-configured `[min_expiry, max_expiry]` bounds and replaces the
+    /// global default for this payment only. When `None`, the existing global
+    /// `PaymentTimeout` is used (preserving the previous behaviour).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_payment_with_expiry(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        reference: Option<String>,
+        metadata: Option<Map<String, String>>,
+        split_recipients: Option<Vec<SplitRecipient>>,
+        execute_after: Option<u64>,
+        idempotency_key: Option<BytesN<32>>,
+        expiry_seconds: Option<u64>,
+    ) -> u32 {
         Self::require_not_paused(&env);
         customer.require_auth();
 
@@ -572,11 +628,19 @@ impl AhjoorPaymentsContract {
         let client = token::Client::new(&env, &token);
         client.transfer(&customer, &env.current_contract_address(), &amount);
 
-        let timeout: u64 = env
+        let default_timeout: u64 = env
             .storage()
             .instance()
             .get(&DataKey::PaymentTimeout)
             .unwrap_or(DEFAULT_PAYMENT_TIMEOUT);
+        let custom_expiry = match expiry_seconds {
+            Some(value) => {
+                Self::require_expiry_within_bounds(&env, value);
+                Some(value)
+            }
+            None => None,
+        };
+        let timeout = custom_expiry.unwrap_or(default_timeout);
         let now = env.ledger().timestamp();
         let execute_after_ts = execute_after.unwrap_or(0);
         let status = if execute_after_ts > now {
@@ -642,6 +706,9 @@ impl AhjoorPaymentsContract {
         events::emit_payment_created(&env, payment_id, customer, merchant, amount, token);
         if execute_after_ts > now {
             events::emit_payment_scheduled(&env, payment_id, execute_after_ts);
+        }
+        if let Some(value) = custom_expiry {
+            events::emit_payment_expiry_override(&env, payment_id, value);
         }
 
         env.storage()
@@ -1911,11 +1978,68 @@ impl AhjoorPaymentsContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Returns all payment IDs recorded for a customer.
+    ///
+    /// Backward-compatible single-page read; for unbounded lists use the
+    /// paginated form `get_customer_payments_page`.
     pub fn get_customer_payments(env: Env, customer: Address) -> Vec<u32> {
         env.storage()
             .persistent()
             .get(&DataKey::CustomerPayments(customer))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Paginated read of a customer's payment IDs (#132).
+    ///
+    /// Returns the requested slice along with `total_count` and `has_more`
+    /// so callers can drive UI pagination without an extra round-trip.
+    /// `page_size` must be in `1..=MAX_CUSTOMER_PAYMENTS_PAGE_SIZE`.
+    pub fn get_customer_payments_page(
+        env: Env,
+        customer: Address,
+        page: u32,
+        page_size: u32,
+    ) -> CustomerPaymentsPage {
+        if page_size == 0 {
+            panic!("page_size must be greater than 0");
+        }
+        if page_size > MAX_CUSTOMER_PAYMENTS_PAGE_SIZE {
+            panic!("page_size exceeds maximum of 50");
+        }
+
+        let all: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CustomerPayments(customer))
+            .unwrap_or(Vec::new(&env));
+
+        let total_count = all.len();
+        let start = page.saturating_mul(page_size);
+        let end = start
+            .saturating_add(page_size)
+            .min(total_count);
+
+        let mut slice = Vec::new(&env);
+        if start < end {
+            for i in start..end {
+                slice.push_back(all.get(i).unwrap());
+            }
+        }
+
+        CustomerPaymentsPage {
+            payments: slice,
+            total_count,
+            has_more: end < total_count,
+        }
+    }
+
+    /// Returns the total number of payment IDs recorded for a customer (#132).
+    pub fn get_customer_payment_count(env: Env, customer: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&DataKey::CustomerPayments(customer))
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     pub fn get_payment_counter(env: Env) -> u32 {
@@ -1993,6 +2117,68 @@ impl AhjoorPaymentsContract {
             .instance()
             .get(&DataKey::PaymentTimeout)
             .unwrap_or(DEFAULT_PAYMENT_TIMEOUT)
+    }
+
+    // --- Per-payment expiry bounds (#130) ---
+
+    /// Admin sets the inclusive `[min, max]` bounds for merchant-defined
+    /// per-payment expiry overrides (#130). Both values are in seconds.
+    pub fn set_payment_expiry_bounds(env: Env, min_seconds: u64, max_seconds: u64) {
+        Self::require_not_paused(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if min_seconds == 0 {
+            panic!("min_expiry must be greater than 0");
+        }
+        if min_seconds > max_seconds {
+            panic!("min_expiry must be <= max_expiry");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinPaymentExpiry, &min_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPaymentExpiry, &max_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    pub fn get_min_payment_expiry(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinPaymentExpiry)
+            .unwrap_or(DEFAULT_MIN_PAYMENT_EXPIRY)
+    }
+
+    pub fn get_max_payment_expiry(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxPaymentExpiry)
+            .unwrap_or(DEFAULT_MAX_PAYMENT_EXPIRY)
+    }
+
+    fn require_expiry_within_bounds(env: &Env, expiry_seconds: u64) {
+        let min_expiry: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinPaymentExpiry)
+            .unwrap_or(DEFAULT_MIN_PAYMENT_EXPIRY);
+        let max_expiry: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPaymentExpiry)
+            .unwrap_or(DEFAULT_MAX_PAYMENT_EXPIRY);
+        if expiry_seconds < min_expiry {
+            panic!("expiry_seconds is below the configured minimum");
+        }
+        if expiry_seconds > max_expiry {
+            panic!("expiry_seconds exceeds the configured maximum");
+        }
     }
 
     /// Expire a pending or authorized payment after its deadline. Callable by anyone.
