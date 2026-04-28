@@ -96,6 +96,14 @@ pub enum Error {
     SubscriptionInTrial = 4,
     MerchantVolumeCapped = 4,
     TokenNotAllowed = 5,
+    DuplicateExternalId = 6,
+    MultisigNotRequired = 7,
+    AlreadyApproved = 8,
+    NotASigner = 9,
+    VoucherExpired = 10,
+    VoucherExhausted = 11,
+    VoucherRevoked = 12,
+    VoucherNotFound = 13,
 }
 
 /// Direction for oracle price condition (#125)
@@ -125,6 +133,8 @@ pub enum PaymentStatus {
     Expired = 4,
     Authorized = 5,
     ScheduledPending = 6,
+    /// Awaiting M-of-N multi-sig approval before proceeding.
+    PendingApproval = 7,
 }
 
 #[contracttype]
@@ -197,6 +207,8 @@ pub struct Payment {
     pub capture_deadline: u64,
     // Optional oracle price condition required for completion (#125)
     // pub release_condition: Option<OracleCondition>,
+    /// Optional off-chain order correlation key (hash of merchant order ID).
+    pub external_id: Option<BytesN<32>>,
 }
 
 #[contracttype]
@@ -419,6 +431,17 @@ pub enum DataKey {
     Dispute(u32),
     /// Temporary: idempotency key → payment_id mapping (expires after 24h)
     IdempotencyKey(BytesN<32>),
+    // --- Task 1: External ID Index ---
+    /// Persistent: (merchant, external_id) → payment_id
+    ExternalIdIndex(Address, BytesN<32>),
+    // --- Task 2: Multi-Sig ---
+    /// Instance: per-merchant multi-sig policy
+    MultisigPolicy(Address),
+    /// Persistent: per-payment approval state
+    ApprovalState(u32),
+    // --- Task 3: Vouchers ---
+    /// Persistent: (merchant, code_hash) → Voucher
+    Voucher(Address, BytesN<32>),
 }
 
 mod events;
@@ -677,6 +700,7 @@ impl AhjoorPaymentsContract {
             tags: None,
             capture_deadline: 0,
             // // release_condition: None,
+            external_id: None,
         };
 
         // Persistent: per-payment record with individual TTL
@@ -795,6 +819,7 @@ impl AhjoorPaymentsContract {
                 tags: None,
                 capture_deadline: 0,
                 // release_condition: None,
+                external_id: None,
             };
 
             // Persistent: per-payment record with individual TTL
@@ -1345,6 +1370,7 @@ impl AhjoorPaymentsContract {
                 tags: None,
                 capture_deadline: 0,
                 // release_condition: None,
+                external_id: None,
             };
 
             env.storage()
@@ -1464,6 +1490,7 @@ impl AhjoorPaymentsContract {
             tags: None,
             capture_deadline: 0,
             // release_condition: None,
+            external_id: None,
         };
 
         env.storage()
@@ -1951,6 +1978,562 @@ impl AhjoorPaymentsContract {
             .persistent()
             .get(&DataKey::Payment(payment_id))
             .expect("Payment not found")
+    }
+
+    // =========================================================================
+    // Task 1: External ID — Off-Chain Order Correlation
+    // =========================================================================
+
+    /// Look up a payment by merchant + external_id.
+    /// Returns the full Payment struct.
+    pub fn get_payment_by_external_id(
+        env: Env,
+        merchant: Address,
+        external_id: BytesN<32>,
+    ) -> Payment {
+        let payment_id: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExternalIdIndex(merchant, external_id))
+            .expect("No payment found for this external_id");
+        env.storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found")
+    }
+
+    // =========================================================================
+    // Task 2: Multi-Signature Approval for High-Value Payments
+    // =========================================================================
+
+    /// Merchant (or admin) configures a multi-sig policy.
+    /// `threshold`: minimum payment amount that requires approval.
+    /// `signers`: authorized co-signer addresses.
+    /// `m`: number of approvals required (must be ≤ signers.len()).
+    /// `approval_window_seconds`: time window before unapproved payment auto-cancels.
+    pub fn set_multisig_policy(
+        env: Env,
+        merchant: Address,
+        threshold: i128,
+        signers: Vec<Address>,
+        m: u32,
+        approval_window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if threshold <= 0 {
+            panic!("threshold must be positive");
+        }
+        if signers.is_empty() {
+            panic!("signers cannot be empty");
+        }
+        if m == 0 || m > signers.len() {
+            panic!("m must be between 1 and signers.len()");
+        }
+        if approval_window_seconds == 0 {
+            panic!("approval_window_seconds must be positive");
+        }
+
+        let policy = MultisigPolicy {
+            m,
+            signers,
+            threshold,
+            approval_window_seconds,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigPolicy(merchant), &policy);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the multi-sig policy for a merchant.
+    pub fn get_multisig_policy(env: Env, merchant: Address) -> Option<MultisigPolicy> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultisigPolicy(merchant))
+    }
+
+    /// A signer approves a PendingApproval payment.
+    /// Once `m` approvals are recorded the payment transitions to Pending.
+    pub fn approve_payment(env: Env, signer: Address, payment_id: u32) {
+        Self::require_not_paused(&env);
+        signer.require_auth();
+
+        let mut payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+
+        if payment.status != PaymentStatus::PendingApproval {
+            panic!("Payment is not pending approval");
+        }
+
+        let policy: MultisigPolicy = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigPolicy(payment.merchant.clone()))
+            .expect("No multisig policy for merchant");
+
+        // Verify signer is in the policy set
+        let mut is_valid_signer = false;
+        for i in 0..policy.signers.len() {
+            if policy.signers.get(i).unwrap() == signer {
+                is_valid_signer = true;
+                break;
+            }
+        }
+        if !is_valid_signer {
+            panic_with_error!(&env, Error::NotASigner);
+        }
+
+        // Check approval window
+        let mut state: ApprovalState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ApprovalState(payment_id))
+            .expect("Approval state not found");
+
+        let now = env.ledger().timestamp();
+        if now > state.created_at + policy.approval_window_seconds {
+            // Window expired — auto-cancel and refund
+            let client = token::Client::new(&env, &payment.token);
+            client.transfer(
+                &env.current_contract_address(),
+                &payment.customer,
+                &payment.amount,
+            );
+            let old_status = payment.status;
+            payment.status = PaymentStatus::Refunded;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(payment_id), &payment);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Payment(payment_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            events::emit_payment_approval_expired(&env, payment_id);
+            events::emit_payment_status_changed(&env, payment_id, old_status, PaymentStatus::Refunded);
+            env.storage()
+                .instance()
+                .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+            return;
+        }
+
+        // Check for duplicate approval
+        for i in 0..state.approvals.len() {
+            if state.approvals.get(i).unwrap() == signer {
+                panic_with_error!(&env, Error::AlreadyApproved);
+            }
+        }
+
+        state.approvals.push_back(signer.clone());
+        events::emit_payment_approved(&env, payment_id, signer);
+
+        if state.approvals.len() >= policy.m {
+            // Quorum reached — transition to Pending
+            let old_status = payment.status;
+            payment.status = PaymentStatus::Pending;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(payment_id), &payment);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Payment(payment_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            events::emit_payment_status_changed(&env, payment_id, old_status, PaymentStatus::Pending);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ApprovalState(payment_id), &state);
+            env.storage().persistent().extend_ttl(
+                &DataKey::ApprovalState(payment_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Anyone can call this to expire an unapproved payment after the approval window.
+    pub fn expire_pending_approval(env: Env, payment_id: u32) {
+        Self::require_not_paused(&env);
+
+        let mut payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+
+        if payment.status != PaymentStatus::PendingApproval {
+            panic!("Payment is not pending approval");
+        }
+
+        let policy: MultisigPolicy = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigPolicy(payment.merchant.clone()))
+            .expect("No multisig policy for merchant");
+
+        let state: ApprovalState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ApprovalState(payment_id))
+            .expect("Approval state not found");
+
+        let now = env.ledger().timestamp();
+        if now <= state.created_at + policy.approval_window_seconds {
+            panic!("Approval window has not expired yet");
+        }
+
+        let client = token::Client::new(&env, &payment.token);
+        client.transfer(
+            &env.current_contract_address(),
+            &payment.customer,
+            &payment.amount,
+        );
+
+        let old_status = payment.status;
+        payment.status = PaymentStatus::Refunded;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Payment(payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_payment_approval_expired(&env, payment_id);
+        events::emit_payment_status_changed(&env, payment_id, old_status, PaymentStatus::Refunded);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // =========================================================================
+    // Task 3: Voucher / Coupon Code Redemption
+    // =========================================================================
+
+    /// Merchant issues a voucher on-chain.
+    /// `code_hash`: sha256 hash of the promo code (prevents front-running).
+    /// `discount_type`: Fixed or Percentage.
+    /// `discount_value`: token units (Fixed) or 0–100 (Percentage).
+    /// `max_uses`: maximum redemptions; 0 = unlimited.
+    /// `expiry`: ledger timestamp after which voucher is invalid; 0 = no expiry.
+    pub fn issue_voucher(
+        env: Env,
+        merchant: Address,
+        code_hash: BytesN<32>,
+        discount_type: DiscountType,
+        discount_value: u32,
+        max_uses: u32,
+        expiry: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if discount_type == DiscountType::Percentage && discount_value > 100 {
+            panic!("Percentage discount cannot exceed 100");
+        }
+        if discount_value == 0 {
+            panic!("discount_value must be positive");
+        }
+
+        let key = DataKey::Voucher(merchant.clone(), code_hash.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("Voucher with this code_hash already exists");
+        }
+
+        let voucher = Voucher {
+            merchant: merchant.clone(),
+            discount_type,
+            discount_value,
+            max_uses,
+            uses_remaining: max_uses,
+            expiry,
+            revoked: false,
+        };
+
+        env.storage().persistent().set(&key, &voucher);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_voucher_issued(&env, merchant, code_hash, discount_type, discount_value, max_uses, expiry);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant revokes a voucher immediately.
+    pub fn revoke_voucher(env: Env, merchant: Address, code_hash: BytesN<32>) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let key = DataKey::Voucher(merchant.clone(), code_hash.clone());
+        let mut voucher: Voucher = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Voucher not found");
+
+        if voucher.merchant != merchant {
+            panic!("Only the issuing merchant can revoke this voucher");
+        }
+        if voucher.revoked {
+            panic!("Voucher already revoked");
+        }
+
+        voucher.revoked = true;
+        env.storage().persistent().set(&key, &voucher);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_voucher_revoked(&env, merchant, code_hash);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get voucher details.
+    pub fn get_voucher(env: Env, merchant: Address, code_hash: BytesN<32>) -> Voucher {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Voucher(merchant, code_hash))
+            .expect("Voucher not found")
+    }
+
+    /// Create a payment with an optional voucher code hash for discount.
+    /// The discount is applied to the required payment amount.
+    pub fn create_payment_with_voucher(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        reference: Option<String>,
+        metadata: Option<Map<String, String>>,
+        idempotency_key: Option<BytesN<32>>,
+        voucher_code_hash: Option<BytesN<32>>,
+        external_id: Option<BytesN<32>>,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        customer.require_auth();
+
+        // Check idempotency key first
+        if let Some(ref key) = idempotency_key {
+            if let Some(existing_payment_id) = env
+                .storage()
+                .temporary()
+                .get::<DataKey, u32>(&DataKey::IdempotencyKey(key.clone()))
+            {
+                return existing_payment_id;
+            }
+        }
+
+        Self::enforce_rate_limit(&env, &customer, 1);
+
+        if amount <= 0 {
+            panic!("Payment amount must be positive");
+        }
+
+        Self::validate_reference(&env, &reference);
+        Self::validate_metadata(&env, &metadata);
+        Self::require_token_allowed(&env, &token);
+        Self::require_merchant_approved(&env, &merchant);
+
+        // --- External ID uniqueness check ---
+        if let Some(ref ext_id) = external_id {
+            let idx_key = DataKey::ExternalIdIndex(merchant.clone(), ext_id.clone());
+            if env.storage().persistent().has(&idx_key) {
+                panic_with_error!(&env, Error::DuplicateExternalId);
+            }
+        }
+
+        // --- Voucher discount ---
+        let effective_amount = if let Some(ref code_hash) = voucher_code_hash {
+            let voucher_key = DataKey::Voucher(merchant.clone(), code_hash.clone());
+            let mut voucher: Voucher = env
+                .storage()
+                .persistent()
+                .get(&voucher_key)
+                .expect("Voucher not found");
+
+            let now = env.ledger().timestamp();
+            if voucher.revoked {
+                panic_with_error!(&env, Error::VoucherRevoked);
+            }
+            if voucher.expiry > 0 && now > voucher.expiry {
+                panic_with_error!(&env, Error::VoucherExpired);
+            }
+            if voucher.max_uses > 0 && voucher.uses_remaining == 0 {
+                panic_with_error!(&env, Error::VoucherExhausted);
+            }
+
+            let discount: i128 = match voucher.discount_type {
+                DiscountType::Fixed => voucher.discount_value as i128,
+                DiscountType::Percentage => (amount * voucher.discount_value as i128) / 100,
+            };
+            let discounted = (amount - discount).max(0);
+
+            // Decrement uses
+            if voucher.max_uses > 0 {
+                voucher.uses_remaining -= 1;
+            }
+            let exhausted = voucher.max_uses > 0 && voucher.uses_remaining == 0;
+            if exhausted {
+                voucher.revoked = true; // mark exhausted by setting revoked (uses_remaining=0 is the real signal)
+            }
+            env.storage().persistent().set(&voucher_key, &voucher);
+            env.storage().persistent().extend_ttl(
+                &voucher_key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            events::emit_voucher_redeemed(&env, merchant.clone(), code_hash.clone(), customer.clone(), discount);
+            if exhausted {
+                events::emit_voucher_exhausted(&env, merchant.clone(), code_hash.clone());
+            }
+
+            discounted
+        } else {
+            amount
+        };
+
+        if effective_amount <= 0 {
+            panic!("Effective payment amount after discount must be positive");
+        }
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&customer, &env.current_contract_address(), &effective_amount);
+
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentTimeout)
+            .unwrap_or(DEFAULT_PAYMENT_TIMEOUT);
+        let now = env.ledger().timestamp();
+
+        // --- Multi-sig gate check ---
+        let policy_opt: Option<MultisigPolicy> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigPolicy(merchant.clone()));
+
+        let status = if let Some(ref policy) = policy_opt {
+            if effective_amount >= policy.threshold {
+                PaymentStatus::PendingApproval
+            } else {
+                PaymentStatus::Pending
+            }
+        } else {
+            PaymentStatus::Pending
+        };
+
+        let payment_id = Self::next_payment_id(&env);
+        let payment = Payment {
+            id: payment_id,
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: effective_amount,
+            token: token.clone(),
+            status,
+            created_at: now,
+            expires_at: now + timeout,
+            refunded_amount: 0,
+            reference: reference.clone(),
+            metadata,
+            split_recipients: None,
+            execute_after: 0,
+            category: None,
+            tags: None,
+            capture_deadline: 0,
+            external_id: external_id.clone(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Payment(payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::add_customer_payment(&env, &customer, payment_id);
+
+        if let Some(ref r) = reference {
+            Self::index_payment_by_reference(&env, &merchant, r, payment_id);
+        }
+
+        // --- Store external_id index ---
+        if let Some(ref ext_id) = external_id {
+            let idx_key = DataKey::ExternalIdIndex(merchant.clone(), ext_id.clone());
+            env.storage().persistent().set(&idx_key, &payment_id);
+            env.storage().persistent().extend_ttl(
+                &idx_key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            events::emit_payment_indexed_by_external_id(&env, payment_id, ext_id.clone());
+        }
+
+        // --- Store approval state if PendingApproval ---
+        if status == PaymentStatus::PendingApproval {
+            let state = ApprovalState {
+                payment_id,
+                approvals: Vec::new(&env),
+                created_at: now,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::ApprovalState(payment_id), &state);
+            env.storage().persistent().extend_ttl(
+                &DataKey::ApprovalState(payment_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        if let Some(ref key) = idempotency_key {
+            env.storage()
+                .temporary()
+                .set(&DataKey::IdempotencyKey(key.clone()), &payment_id);
+            env.storage().temporary().extend_ttl(
+                &DataKey::IdempotencyKey(key.clone()),
+                IDEMPOTENCY_KEY_LIFETIME_THRESHOLD,
+                IDEMPOTENCY_KEY_BUMP_AMOUNT,
+            );
+        }
+
+        Self::inc_global_created(&env);
+        Self::inc_merchant_created(&env, &merchant);
+
+        events::emit_payment_created(&env, payment_id, customer, merchant, effective_amount, token);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        payment_id
     }
 
     /// Returns the 32-byte sha256 receipt hash for a completed payment (#65).
@@ -4439,5 +5022,8 @@ mod test_collateral;
 
 #[cfg(test)]
 mod test_notification_keys;
+
+#[cfg(test)]
+mod test_external_id_multisig_voucher;
 
 pub use events::*;

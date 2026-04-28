@@ -84,6 +84,18 @@ pub struct DisputeResolved {
     pub resolved_by: Address,
 }
 
+/// Event: Dispute resolved with a percentage split between buyer and seller
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DisputeResolvedSplit {
+    pub escrow_id: u32,
+    pub buyer_percent: u32,
+    pub seller_percent: u32,
+    pub buyer_amount: i128,
+    pub seller_amount: i128,
+    pub resolved_by: Address,
+}
+
 /// Event: Dispute escalation threshold reached
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -354,6 +366,26 @@ pub fn emit_dispute_resolved(
     DisputeResolved {
         escrow_id,
         release_to_seller,
+        resolved_by,
+    }
+    .publish(e);
+}
+
+pub fn emit_dispute_resolved_split(
+    e: &Env,
+    escrow_id: u32,
+    buyer_percent: u32,
+    seller_percent: u32,
+    buyer_amount: i128,
+    seller_amount: i128,
+    resolved_by: Address,
+) {
+    DisputeResolvedSplit {
+        escrow_id,
+        buyer_percent,
+        seller_percent,
+        buyer_amount,
+        seller_amount,
         resolved_by,
     }
     .publish(e);

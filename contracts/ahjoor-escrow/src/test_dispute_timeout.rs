@@ -67,7 +67,7 @@ fn test_arbiter_resolves_before_timeout() {
         li.timestamp += 3 * 24 * 60 * 60; // 3 days
     });
 
-    client.resolve_dispute(&arbiter, &escrow_id, &true);
+    client.resolve_dispute(&arbiter, &escrow_id, &0u32);
 
     // Verify dispute is resolved
     let dispute = client.get_dispute(&escrow_id);
@@ -238,7 +238,7 @@ fn test_enforce_timeout_on_resolved_dispute() {
 
     // Raise and resolve dispute
     client.dispute_escrow(&buyer, &escrow_id, &String::from_str(&env, "test"), &1000);
-    client.resolve_dispute(&arbiter, &escrow_id, &true);
+    client.resolve_dispute(&arbiter, &escrow_id, &0u32);
 
     // Advance time past timeout
     env.ledger().with_mut(|li| {

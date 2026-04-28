@@ -1236,9 +1236,15 @@ impl AhjoorEscrowContract {
     }
 
     /// Resolve a dispute. Only arbiter can call this.
-    pub fn resolve_dispute(env: Env, arbiter: Address, escrow_id: u32, release_to_seller: bool) {
+    /// `buyer_percent` is 0–100; seller receives the remainder.
+    /// Use 100 for full buyer win, 0 for full seller win, or any value in between for a split.
+    pub fn resolve_dispute(env: Env, arbiter: Address, escrow_id: u32, buyer_percent: u32) {
         Self::require_not_paused(&env);
         arbiter.require_auth();
+
+        if buyer_percent > 100 {
+            panic!("buyer_percent must be between 0 and 100");
+        }
 
         let mut escrow: Escrow = env
             .storage()
@@ -1288,27 +1294,41 @@ impl AhjoorEscrowContract {
             events::emit_protocol_fee_paid(&env, escrow_id, protocol_fee, fee_recipient);
         }
 
-        let winner_amount = escrow.amount - protocol_fee - arbiter_fee;
+        let distributable = escrow.amount - protocol_fee - arbiter_fee;
 
-        if winner_amount < 0 {
+        if distributable < 0 {
             panic!("Fee configuration exceeds escrow amount");
         }
 
-        if release_to_seller {
-            client.transfer(
-                &env.current_contract_address(),
-                &escrow.seller,
-                &winner_amount,
-            );
-            escrow.status = EscrowStatus::Released;
-        } else {
+        let seller_percent = 100 - buyer_percent;
+
+        // Integer-safe split: buyer gets floor, seller gets the rest to avoid precision loss
+        let buyer_amount = (distributable * buyer_percent as i128) / 100;
+        let seller_amount = distributable - buyer_amount;
+
+        if buyer_amount > 0 {
             client.transfer(
                 &env.current_contract_address(),
                 &escrow.buyer,
-                &winner_amount,
+                &buyer_amount,
             );
-            escrow.status = EscrowStatus::Refunded;
         }
+        if seller_amount > 0 {
+            client.transfer(
+                &env.current_contract_address(),
+                &escrow.seller,
+                &seller_amount,
+            );
+        }
+
+        // Determine final status: if buyer gets everything → Refunded, seller gets everything → Released, else Resolved
+        escrow.status = if buyer_percent == 100 {
+            EscrowStatus::Refunded
+        } else if buyer_percent == 0 {
+            EscrowStatus::Released
+        } else {
+            EscrowStatus::Resolved
+        };
 
         env.storage()
             .persistent()
@@ -1331,6 +1351,18 @@ impl AhjoorEscrowContract {
                 .set(&DataKey::Dispute(escrow_id), &dispute);
         }
 
+        // Emit split event (covers binary cases too)
+        events::emit_dispute_resolved_split(
+            &env,
+            escrow_id,
+            buyer_percent,
+            seller_percent,
+            buyer_amount,
+            seller_amount,
+            arbiter.clone(),
+        );
+        // Also emit legacy binary event for backward-compatible indexers
+        let release_to_seller = buyer_percent == 0;
         events::emit_dispute_resolved(&env, escrow_id, release_to_seller, arbiter);
 
         env.storage()
