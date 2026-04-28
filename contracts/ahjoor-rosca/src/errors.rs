@@ -150,4 +150,8 @@ pub enum ExtError {
     InvalidDissolutionConfig = 68,
     /// Group start time is in the future.
     GroupNotYetActive = 69,
+    /// Group is frozen by contract-level admin pending investigation.
+    GroupFrozen = 72,
+    /// Group is not currently frozen.
+    GroupNotFrozen = 73,
 }
