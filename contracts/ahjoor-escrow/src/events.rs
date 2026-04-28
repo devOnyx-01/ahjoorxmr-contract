@@ -801,3 +801,31 @@ pub struct EscrowToppedUp {
 pub fn emit_escrow_topped_up(e: &Env, escrow_id: u32, added_amount: i128, new_total: i128, buyer: Address) {
     EscrowToppedUp { escrow_id, added_amount, new_total, buyer }.publish(e);
 }
+
+// --- Issue #241: Delivery Proof Hash ---
+
+/// Event: Seller submitted a delivery proof; auto_released indicates if escrow was released.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DeliveryProofSubmitted {
+    pub escrow_id: u32,
+    pub seller: Address,
+    pub proof_hash: BytesN<32>,
+    pub auto_released: bool,
+}
+
+pub fn emit_delivery_proof_submitted(
+    e: &Env,
+    escrow_id: u32,
+    seller: Address,
+    proof_hash: BytesN<32>,
+    auto_released: bool,
+) {
+    DeliveryProofSubmitted {
+        escrow_id,
+        seller,
+        proof_hash,
+        auto_released,
+    }
+    .publish(e);
+}

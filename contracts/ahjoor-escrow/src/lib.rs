@@ -116,6 +116,8 @@ pub struct EscrowExtensions {
     pub arbiter_fee_bps: Option<u32>,
     /// Optional per-escrow default winner override for dispute timeout (0 = Buyer, 1 = Seller).
     pub dispute_default_winner: Option<u32>,
+    /// #241: Optional pre-committed delivery proof hash set by buyer at creation.
+    pub delivery_proof_hash: Option<BytesN<32>>,
 }
 
 #[contracttype]
@@ -271,6 +273,8 @@ pub enum DataKey {
     MaxTopUpBps,
     /// #225: cumulative top-up amount per escrow
     EscrowToppedUpAmount(u32),
+    /// #241: delivery proof hash submitted by seller (stores proof_hash for event; not the raw proof)
+    DeliveryProofSubmitted(u32),
 }
 
 const MAX_PROTOCOL_FEE_BPS: u32 = 200; // 2%
@@ -629,6 +633,7 @@ impl AhjoorEscrowContract {
                 release_threshold_price,
                 arbiter_fee_bps,
                 dispute_default_winner,
+                delivery_proof_hash: None,
             },
         };
 
@@ -3748,6 +3753,7 @@ impl AhjoorEscrowContract {
                 release_threshold_price: source.extensions.release_threshold_price,
                 arbiter_fee_bps: source.extensions.arbiter_fee_bps,
                 dispute_default_winner: source.extensions.dispute_default_winner,
+                delivery_proof_hash: source.extensions.delivery_proof_hash.clone(),
             },
         };
 
@@ -3909,6 +3915,95 @@ impl AhjoorEscrowContract {
 
         events::emit_escrow_topped_up(&env, escrow_id, amount, new_total, buyer);
 
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // --- Issue #241: Delivery Proof Hash ---
+
+    /// Buyer sets (or updates) the delivery proof hash on an Active escrow.
+    /// Can only be called while the escrow is Active and no dispute has been raised.
+    pub fn set_delivery_proof_hash(
+        env: Env,
+        buyer: Address,
+        escrow_id: u32,
+        proof_hash: BytesN<32>,
+    ) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+        if escrow.buyer != buyer {
+            panic!("Only buyer can set delivery proof hash");
+        }
+        if escrow.status != EscrowStatus::Active {
+            panic!("Escrow must be Active to set delivery proof hash");
+        }
+        escrow.extensions.delivery_proof_hash = Some(proof_hash);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Seller submits a raw proof. If sha256(proof) matches the stored delivery_proof_hash,
+    /// the escrow is automatically released to the seller.
+    /// Panics if no proof hash is set, if the escrow is not Active, or if the hash mismatches.
+    pub fn submit_delivery_proof(env: Env, seller: Address, escrow_id: u32, proof: BytesN<32>) {
+        Self::require_not_paused(&env);
+        seller.require_auth();
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+        if escrow.seller != seller {
+            panic!("Only seller can submit delivery proof");
+        }
+        if escrow.status == EscrowStatus::Disputed {
+            panic!("Proof submission locked: escrow is under dispute");
+        }
+        if !Self::is_open_escrow_status(escrow.status) {
+            panic!("Escrow is not active");
+        }
+        let expected_hash = escrow
+            .extensions
+            .delivery_proof_hash
+            .clone()
+            .expect("No delivery proof hash set on this escrow");
+
+        // Compute sha256 of the submitted proof bytes
+        let proof_bytes = soroban_sdk::Bytes::from(proof.clone());
+        let computed: BytesN<32> = env.crypto().sha256(&proof_bytes).into();
+        if computed != expected_hash {
+            panic!("InvalidDeliveryProof");
+        }
+
+        // Auto-release: transfer funds to seller(s)
+        let total = escrow.amount;
+        Self::transfer_to_sellers(&env, &escrow, total, escrow_id);
+        escrow.status = EscrowStatus::Released;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_delivery_proof_submitted(&env, escrow_id, seller, computed, true);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
