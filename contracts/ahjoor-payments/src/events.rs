@@ -1034,3 +1034,11 @@ pub fn emit_appeal_approved(e: &Env, merchant: Address) {
 pub fn emit_appeal_rejected(e: &Env, merchant: Address) {
     AppealRejected { merchant }.publish(e);
 }
+
+// #231: Withdrawal Rate Limiting Events
+pub fn emit_withdrawal_rate_limit_set(e: &Env, merchant: Address, window_seconds: u64, cap: i128) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "WdrlLimitSet"),), (merchant, window_seconds, cap));
+}
+pub fn emit_withdrawal_rate_limit_exceeded(e: &Env, merchant: Address, attempted: i128, cap: i128) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "WdrlLimitExceeded"),), (merchant, attempted, cap));
+}
