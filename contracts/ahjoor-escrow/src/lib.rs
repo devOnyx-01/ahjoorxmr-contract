@@ -25,6 +25,8 @@ pub enum EscrowStatus {
     Refunded = 4,
     PartiallyReleased = 5,
     PartiallyDisputed = 6,
+    /// Arbiter has recorded a verdict; funds held pending cooling-off window.
+    CoolingOff = 7,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +253,16 @@ pub enum DataKey {
 
 const MAX_PROTOCOL_FEE_BPS: u32 = 200; // 2%
 const MAX_ARBITER_FEE_BPS: u32 = 1_000; // 10%
+const DEFAULT_RESOLUTION_COOLING_OFF_SECONDS: u64 = 24 * 60 * 60; // 24 hours
+
+/// Verdict recorded by arbiter during cooling-off period.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingVerdict {
+    pub buyer_percent: u32,
+    pub arbiter: Address,
+    pub recorded_at: u64,
+}
 
 mod oracle {
     use crate::PriceData;
@@ -1027,6 +1039,7 @@ impl AhjoorEscrowContract {
             release_comparison: None,
             release_threshold_price: None,
             arbiter_fee_bps: None,
+            dispute_default_winner: None,
         };
         let escrow_id = Self::create_escrow_core(&env, &buyer, request);
 
@@ -1249,6 +1262,8 @@ impl AhjoorEscrowContract {
     /// Resolve a dispute. Only arbiter can call this.
     /// `buyer_percent` is 0–100; seller receives the remainder.
     /// Use 100 for full buyer win, 0 for full seller win, or any value in between for a split.
+    /// If a cooling-off window is configured, the escrow enters CoolingOff state and funds
+    /// are NOT moved until `finalize_resolution` is called after the window expires.
     pub fn resolve_dispute(env: Env, arbiter: Address, escrow_id: u32, buyer_percent: u32) {
         Self::require_not_paused(&env);
         arbiter.require_auth();
@@ -1273,17 +1288,218 @@ impl AhjoorEscrowContract {
             panic!("Only arbiter can resolve dispute");
         }
 
-        let client = token::Client::new(&env, &escrow.token);
+        let cooling_off_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ResolutionCoolingOffSeconds)
+            .unwrap_or(0);
 
-        let arbiter_fee_bps = Self::effective_arbiter_fee_bps(&env, &escrow);
+        if cooling_off_seconds > 0 {
+            // Enter cooling-off state — record verdict, do NOT move funds yet
+            let verdict = PendingVerdict {
+                buyer_percent,
+                arbiter: arbiter.clone(),
+                recorded_at: env.ledger().timestamp(),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingVerdict(escrow_id), &verdict);
+            env.storage().persistent().extend_ttl(
+                &DataKey::PendingVerdict(escrow_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            escrow.status = EscrowStatus::CoolingOff;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(escrow_id), &escrow);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Escrow(escrow_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            events::emit_resolution_cooling_off(&env, escrow_id, buyer_percent, arbiter, env.ledger().timestamp() + cooling_off_seconds);
+
+            env.storage()
+                .instance()
+                .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+            return;
+        }
+
+        // No cooling-off configured — execute immediately (legacy path)
+        Self::execute_verdict(&env, escrow_id, escrow, buyer_percent, arbiter);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Flag a procedural error during the cooling-off window.
+    /// Only the losing party (buyer if seller wins, seller if buyer wins) may call this.
+    /// Pauses fund release and escalates to admin queue.
+    pub fn flag_resolution_error(env: Env, caller: Address, escrow_id: u32, reason_hash: BytesN<32>) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::CoolingOff {
+            panic!("Escrow is not in cooling-off state");
+        }
+
+        let verdict: PendingVerdict = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingVerdict(escrow_id))
+            .expect("No pending verdict");
+
+        // Only buyer or seller may flag
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can flag a resolution error");
+        }
+
+        // Enforce cooling-off window has not expired
+        let cooling_off_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ResolutionCoolingOffSeconds)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        if now > verdict.recorded_at + cooling_off_seconds {
+            panic!("Cooling-off window has expired");
+        }
+
+        // Prevent duplicate flags
+        if env.storage().persistent().has(&DataKey::ResolutionFlag(escrow_id)) {
+            panic!("Resolution already flagged");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ResolutionFlag(escrow_id), &(caller.clone(), reason_hash.clone()));
+        env.storage().persistent().extend_ttl(
+            &DataKey::ResolutionFlag(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_resolution_flagged(&env, escrow_id, caller, reason_hash);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Finalize a resolution after the cooling-off window has elapsed with no flag.
+    /// Anyone can call this once the window expires.
+    pub fn finalize_resolution(env: Env, escrow_id: u32) {
+        Self::require_not_paused(&env);
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::CoolingOff {
+            panic!("Escrow is not in cooling-off state");
+        }
+
+        let verdict: PendingVerdict = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingVerdict(escrow_id))
+            .expect("No pending verdict");
+
+        let cooling_off_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ResolutionCoolingOffSeconds)
+            .unwrap_or(0);
+
+        let now = env.ledger().timestamp();
+        if now <= verdict.recorded_at + cooling_off_seconds {
+            panic!("Cooling-off window has not elapsed");
+        }
+
+        // Ensure no unresolved flag is blocking release
+        if env.storage().persistent().has(&DataKey::ResolutionFlag(escrow_id)) {
+            panic!("Resolution is flagged; admin must review before finalization");
+        }
+
+        let buyer_percent = verdict.buyer_percent;
+        let arbiter = verdict.arbiter.clone();
+
+        // Clean up verdict
+        env.storage().persistent().remove(&DataKey::PendingVerdict(escrow_id));
+
+        Self::execute_verdict(&env, escrow_id, escrow, buyer_percent, arbiter);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin clears a resolution flag (after review) and allows finalization to proceed.
+    pub fn clear_resolution_flag(env: Env, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::ResolutionFlag(escrow_id)) {
+            panic!("No flag to clear");
+        }
+
+        env.storage().persistent().remove(&DataKey::ResolutionFlag(escrow_id));
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin sets the global cooling-off window in seconds (0 = disabled).
+    pub fn set_resolution_cooling_off_seconds(env: Env, admin: Address, seconds: u64) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can configure cooling-off period");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ResolutionCoolingOffSeconds, &seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Internal: execute a verdict (transfer funds per buyer_percent split).
+    fn execute_verdict(env: &Env, escrow_id: u32, mut escrow: Escrow, buyer_percent: u32, arbiter: Address) {
+        let client = token::Client::new(env, &escrow.token);
+
+        let arbiter_fee_bps = Self::effective_arbiter_fee_bps(env, &escrow);
         let arbiter_fee = (escrow.amount * arbiter_fee_bps as i128) / 10_000;
 
         if arbiter_fee > 0 {
             client.transfer(&env.current_contract_address(), &arbiter, &arbiter_fee);
-            events::emit_arbiter_fee_paid(&env, escrow_id, arbiter.clone(), arbiter_fee);
+            events::emit_arbiter_fee_paid(env, escrow_id, arbiter.clone(), arbiter_fee);
         }
 
-        // Compute and deduct protocol fee
         let fee_bps: u32 = env
             .storage()
             .instance()
@@ -1302,7 +1518,7 @@ impl AhjoorEscrowContract {
                 &fee_recipient,
                 &protocol_fee,
             );
-            events::emit_protocol_fee_paid(&env, escrow_id, protocol_fee, fee_recipient);
+            events::emit_protocol_fee_paid(env, escrow_id, protocol_fee, fee_recipient);
         }
 
         let distributable = escrow.amount - protocol_fee - arbiter_fee;
@@ -1313,7 +1529,6 @@ impl AhjoorEscrowContract {
 
         let seller_percent = 100 - buyer_percent;
 
-        // Integer-safe split: buyer gets floor, seller gets the rest to avoid precision loss
         let buyer_amount = (distributable * buyer_percent as i128) / 100;
         let seller_amount = distributable - buyer_amount;
 
@@ -1332,7 +1547,6 @@ impl AhjoorEscrowContract {
             );
         }
 
-        // Determine final status: if buyer gets everything → Refunded, seller gets everything → Released, else Resolved
         escrow.status = if buyer_percent == 100 {
             EscrowStatus::Refunded
         } else if buyer_percent == 0 {
@@ -1350,7 +1564,6 @@ impl AhjoorEscrowContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        // Mark dispute as resolved
         if let Some(mut dispute) = env
             .storage()
             .persistent()
@@ -1362,9 +1575,8 @@ impl AhjoorEscrowContract {
                 .set(&DataKey::Dispute(escrow_id), &dispute);
         }
 
-        // Emit split event (covers binary cases too)
         events::emit_dispute_resolved_split(
-            &env,
+            env,
             escrow_id,
             buyer_percent,
             seller_percent,
@@ -1372,13 +1584,9 @@ impl AhjoorEscrowContract {
             seller_amount,
             arbiter.clone(),
         );
-        // Also emit legacy binary event for backward-compatible indexers
         let release_to_seller = buyer_percent == 0;
-        events::emit_dispute_resolved(&env, escrow_id, release_to_seller, arbiter);
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_dispute_resolved(env, escrow_id, release_to_seller, arbiter.clone());
+        events::emit_resolution_finalized(env, escrow_id, buyer_percent, arbiter);
     }
 
     /// Returns true when an unresolved dispute has exceeded its timeout window.
@@ -3293,3 +3501,6 @@ mod test_dispute_timeout;
 
 #[cfg(test)]
 mod test_token_whitelist;
+
+#[cfg(test)]
+mod test_cooling_off;

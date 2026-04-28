@@ -68,6 +68,8 @@ pub enum RefundStatus {
     UnderAppeal = 4,
     /// Terminal status: refund request was cancelled before approval (#168)
     Cancelled = 5,
+    /// Merchant has made a counter-offer; awaiting customer response
+    CounterOffered = 6,
 }
 
 #[contracttype]
@@ -167,9 +169,24 @@ pub enum DataKey {
     FraudScoreLastUpdate(Address),
     /// Fraud score decay interval in seconds (default: 30 days)
     FraudScoreDecayInterval,
+    /// Counter-offer record per refund_id
+    CounterOffer(u32),
+    /// Configurable counter-offer expiry window in seconds
+    CounterOfferExpirySeconds,
 }
 
 mod events;
+
+/// Counter-offer record stored during negotiation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CounterOffer {
+    pub amount: i128,
+    pub offered_at: u64,
+    pub expiry: u64,
+}
+
+const DEFAULT_COUNTER_OFFER_EXPIRY_SECONDS: u64 = 48 * 60 * 60; // 48 hours
 
 /// Optional extended configuration for `initialize`.
 /// Groups the extra parameters that would otherwise exceed Soroban's 10-parameter limit.
@@ -2553,6 +2570,232 @@ impl AhjoorRefundContract {
             refund.processed_at.unwrap(),
         );
     }
+
+    // --- Counter-Offer Negotiation ---
+
+    /// Admin sets the counter-offer expiry window in seconds.
+    pub fn set_counter_offer_expiry_seconds(env: Env, admin: Address, seconds: u64) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can configure counter-offer expiry");
+        }
+        if seconds == 0 {
+            panic!("Expiry must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CounterOfferExpirySeconds, &seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant submits a counter-offer (partial amount) for a refund request.
+    /// Only one counter-offer is permitted per refund.
+    pub fn counter_offer_refund(env: Env, merchant: Address, refund_id: u32, amount: i128) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if amount <= 0 {
+            panic!("Counter-offer amount must be positive");
+        }
+
+        let mut refund: Refund = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Refund(refund_id))
+            .expect("Refund not found");
+
+        if refund.status != RefundStatus::Requested {
+            panic!("Refund is not in Requested state");
+        }
+
+        if merchant != refund.merchant {
+            panic!("Only the merchant can make a counter-offer");
+        }
+
+        if amount > refund.amount {
+            panic!("Counter-offer cannot exceed original refund amount");
+        }
+
+        // Prevent duplicate counter-offers
+        if env.storage().persistent().has(&DataKey::CounterOffer(refund_id)) {
+            panic!("Counter-offer already submitted for this refund");
+        }
+
+        let expiry_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CounterOfferExpirySeconds)
+            .unwrap_or(DEFAULT_COUNTER_OFFER_EXPIRY_SECONDS);
+
+        let now = env.ledger().timestamp();
+        let offer = CounterOffer {
+            amount,
+            offered_at: now,
+            expiry: now + expiry_seconds,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CounterOffer(refund_id), &offer);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CounterOffer(refund_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        refund.status = RefundStatus::CounterOffered;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id), &refund);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Refund(refund_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_refund_counter_offered(&env, refund_id, merchant, amount, offer.expiry);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Customer accepts the counter-offer; the counter-offer amount is released immediately.
+    pub fn accept_counter_offer(env: Env, customer: Address, refund_id: u32) {
+        Self::require_not_paused(&env);
+        customer.require_auth();
+
+        let mut refund: Refund = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Refund(refund_id))
+            .expect("Refund not found");
+
+        if refund.status != RefundStatus::CounterOffered {
+            panic!("Refund is not in CounterOffered state");
+        }
+
+        if customer != refund.customer {
+            panic!("Only the customer can accept a counter-offer");
+        }
+
+        let offer: CounterOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CounterOffer(refund_id))
+            .expect("Counter-offer not found");
+
+        let now = env.ledger().timestamp();
+        if now > offer.expiry {
+            // Expired — auto-escalate to admin
+            Self::escalate_counter_offer_to_admin(&env, refund_id, &mut refund);
+            return;
+        }
+
+        // Transfer counter-offer amount to customer
+        let client = token::Client::new(&env, &refund.token);
+        client.transfer(&env.current_contract_address(), &refund.customer, &offer.amount);
+
+        refund.status = RefundStatus::Processed;
+        refund.processed_at = Some(now);
+        refund.fee_amount = None;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id), &refund);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Refund(refund_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage().persistent().remove(&DataKey::CounterOffer(refund_id));
+
+        events::emit_refund_counter_accepted(&env, refund_id, customer, offer.amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Customer rejects the counter-offer; escalates to admin review.
+    pub fn reject_counter_offer(env: Env, customer: Address, refund_id: u32) {
+        Self::require_not_paused(&env);
+        customer.require_auth();
+
+        let mut refund: Refund = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Refund(refund_id))
+            .expect("Refund not found");
+
+        if refund.status != RefundStatus::CounterOffered {
+            panic!("Refund is not in CounterOffered state");
+        }
+
+        if customer != refund.customer {
+            panic!("Only the customer can reject a counter-offer");
+        }
+
+        env.storage().persistent().remove(&DataKey::CounterOffer(refund_id));
+
+        Self::escalate_counter_offer_to_admin(&env, refund_id, &mut refund);
+
+        events::emit_refund_counter_rejected(&env, refund_id, customer);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Check if a counter-offer has expired and auto-escalate if so.
+    /// Anyone can call this to trigger expiry escalation.
+    pub fn check_counter_offer_expiry(env: Env, refund_id: u32) {
+        Self::require_not_paused(&env);
+
+        let mut refund: Refund = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Refund(refund_id))
+            .expect("Refund not found");
+
+        if refund.status != RefundStatus::CounterOffered {
+            panic!("Refund is not in CounterOffered state");
+        }
+
+        let offer: CounterOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CounterOffer(refund_id))
+            .expect("Counter-offer not found");
+
+        if env.ledger().timestamp() <= offer.expiry {
+            panic!("Counter-offer has not expired yet");
+        }
+
+        env.storage().persistent().remove(&DataKey::CounterOffer(refund_id));
+        Self::escalate_counter_offer_to_admin(&env, refund_id, &mut refund);
+    }
+
+    fn escalate_counter_offer_to_admin(env: &Env, refund_id: u32, refund: &mut Refund) {
+        refund.status = RefundStatus::UnderAppeal;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id), refund);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Refund(refund_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2560,3 +2803,6 @@ mod test;
 
 #[cfg(test)]
 mod test_token_whitelist;
+
+#[cfg(test)]
+mod test_counter_offer;

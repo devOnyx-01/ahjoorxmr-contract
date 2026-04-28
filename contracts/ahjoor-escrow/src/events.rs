@@ -256,6 +256,34 @@ pub struct BuyerRoleTransferred {
     pub new_buyer: Address,
 }
 
+/// Event: Dispute resolution entered cooling-off state
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ResolutionCoolingOff {
+    pub escrow_id: u32,
+    pub buyer_percent: u32,
+    pub arbiter: Address,
+    pub cooling_off_ends_at: u64,
+}
+
+/// Event: Resolution error flagged by a party during cooling-off
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ResolutionFlagged {
+    pub escrow_id: u32,
+    pub flagger: Address,
+    pub reason_hash: BytesN<32>,
+}
+
+/// Event: Resolution finalized and funds released
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ResolutionFinalized {
+    pub escrow_id: u32,
+    pub buyer_percent: u32,
+    pub finalized_by: Address,
+}
+
 // --- Helper Emission Functions ---
 
 pub fn emit_escrow_created(

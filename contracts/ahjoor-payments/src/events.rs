@@ -973,3 +973,64 @@ pub fn emit_preferred_token_set(e: &Env, merchant: Address, token: Address) {
 pub fn emit_swap_router_set(e: &Env, router: Address) {
     SwapRouterSet { router }.publish(e);
 }
+
+// --- Merchant Ban/Appeal Events ---
+
+/// Event: Merchant suspended by admin
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantSuspended {
+    pub merchant: Address,
+    pub reason_hash: BytesN<32>,
+    pub suspension_expires_at: u64,
+}
+
+/// Event: Merchant permanently banned by admin
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantBanned {
+    pub merchant: Address,
+    pub reason_hash: BytesN<32>,
+}
+
+/// Event: Banned merchant submitted an appeal
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct AppealSubmitted {
+    pub merchant: Address,
+    pub evidence_hash: BytesN<32>,
+}
+
+/// Event: Admin approved a merchant appeal
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct AppealApproved {
+    pub merchant: Address,
+}
+
+/// Event: Admin rejected a merchant appeal
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct AppealRejected {
+    pub merchant: Address,
+}
+
+pub fn emit_merchant_suspended(e: &Env, merchant: Address, reason_hash: BytesN<32>, suspension_expires_at: u64) {
+    MerchantSuspended { merchant, reason_hash, suspension_expires_at }.publish(e);
+}
+
+pub fn emit_merchant_banned(e: &Env, merchant: Address, reason_hash: BytesN<32>) {
+    MerchantBanned { merchant, reason_hash }.publish(e);
+}
+
+pub fn emit_appeal_submitted(e: &Env, merchant: Address, evidence_hash: BytesN<32>) {
+    AppealSubmitted { merchant, evidence_hash }.publish(e);
+}
+
+pub fn emit_appeal_approved(e: &Env, merchant: Address) {
+    AppealApproved { merchant }.publish(e);
+}
+
+pub fn emit_appeal_rejected(e: &Env, merchant: Address) {
+    AppealRejected { merchant }.publish(e);
+}

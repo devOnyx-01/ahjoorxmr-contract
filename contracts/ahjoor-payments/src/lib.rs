@@ -114,6 +114,26 @@ pub enum OracleDirection {
     Lte = 1,
 }
 
+/// Merchant status for fine-grained access control.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MerchantStatus {
+    Active = 0,
+    Suspended = 1,
+    Banned = 2,
+}
+
+/// On-chain appeal record for a banned merchant.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantAppeal {
+    pub merchant: Address,
+    pub evidence_hash: BytesN<32>,
+    pub submitted_at: u64,
+    pub resolved: bool,
+    pub approved: bool,
+}
+
 /// Conditional release based on oracle price (#125)
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -442,6 +462,16 @@ pub enum DataKey {
     // --- Task 3: Vouchers ---
     /// Persistent: (merchant, code_hash) → Voucher
     Voucher(Address, BytesN<32>),
+    /// Persistent: merchant status (Active/Suspended/Banned)
+    MerchantStatus(Address),
+    /// Persistent: merchant suspension expiry timestamp
+    MerchantSuspensionExpiry(Address),
+    /// Persistent: active appeal record per merchant
+    MerchantAppeal(Address),
+    /// Persistent: timestamp after which a rejected merchant may re-appeal
+    AppealCooldownUntil(Address),
+    /// Instance: appeal rejection cooldown in seconds
+    AppealRejectionCooldownSeconds,
 }
 
 mod events;
@@ -4636,6 +4666,29 @@ impl AhjoorPaymentsContract {
 
     /// Validates merchant is approved or open mode is enabled.
     fn require_merchant_approved(env: &Env, merchant: &Address) {
+        // Always enforce ban/suspension regardless of open mode
+        let status: MerchantStatus = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantStatus(merchant.clone()))
+            .unwrap_or(MerchantStatus::Active);
+
+        match status {
+            MerchantStatus::Banned => panic!("Merchant is banned"),
+            MerchantStatus::Suspended => {
+                let expiry: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::MerchantSuspensionExpiry(merchant.clone()))
+                    .unwrap_or(0);
+                if expiry == 0 || env.ledger().timestamp() <= expiry {
+                    panic!("Merchant is suspended");
+                }
+                // Suspension expired — fall through to allowlist check
+            }
+            MerchantStatus::Active => {}
+        }
+
         let open_mode: bool = env
             .storage()
             .instance()
@@ -5009,6 +5062,309 @@ impl AhjoorPaymentsContract {
         );
     }
 
+    // --- Merchant Ban Management & On-Chain Appeal ---
+
+    /// Admin sets the appeal rejection cooldown in seconds.
+    pub fn set_appeal_rejection_cooldown(env: Env, admin: Address, seconds: u64) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can configure appeal cooldown");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AppealRejectionCooldownSeconds, &seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin suspends a merchant for a given duration (seconds). Payments are paused.
+    pub fn suspend_merchant(env: Env, admin: Address, merchant: Address, reason_hash: BytesN<32>, duration_seconds: u64) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can suspend merchants");
+        }
+        if duration_seconds == 0 {
+            panic!("Suspension duration must be positive");
+        }
+
+        let expiry = env.ledger().timestamp() + duration_seconds;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantStatus(merchant.clone()), &MerchantStatus::Suspended);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantSuspensionExpiry(merchant.clone()), &expiry);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantStatus(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantSuspensionExpiry(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_merchant_suspended(&env, merchant, reason_hash, expiry);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin permanently bans a merchant. Banned merchants cannot create or receive payments.
+    pub fn ban_merchant(env: Env, admin: Address, merchant: Address, reason_hash: BytesN<32>) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can ban merchants");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantStatus(merchant.clone()), &MerchantStatus::Banned);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantApproved(merchant.clone()), &false);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantStatus(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_merchant_banned(&env, merchant, reason_hash);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin reinstates a merchant (clears ban/suspension, restores Active status).
+    pub fn reinstate_merchant(env: Env, admin: Address, merchant: Address) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can reinstate merchants");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantStatus(merchant.clone()), &MerchantStatus::Active);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantApproved(merchant.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantStatus(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Banned merchant submits an appeal. Only one active appeal per merchant.
+    pub fn submit_appeal(env: Env, merchant: Address, evidence_hash: BytesN<32>) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let status: MerchantStatus = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantStatus(merchant.clone()))
+            .unwrap_or(MerchantStatus::Active);
+
+        if status != MerchantStatus::Banned {
+            panic!("Only banned merchants can submit an appeal");
+        }
+
+        // Enforce one-active-appeal guard
+        if let Some(existing): Option<MerchantAppeal> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantAppeal(merchant.clone()))
+        {
+            if !existing.resolved {
+                panic!("An active appeal already exists");
+            }
+        }
+
+        // Enforce cooldown after rejection
+        let cooldown_until: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AppealCooldownUntil(merchant.clone()))
+            .unwrap_or(0);
+        if env.ledger().timestamp() < cooldown_until {
+            panic!("Appeal cooldown has not elapsed");
+        }
+
+        let appeal = MerchantAppeal {
+            merchant: merchant.clone(),
+            evidence_hash: evidence_hash.clone(),
+            submitted_at: env.ledger().timestamp(),
+            resolved: false,
+            approved: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantAppeal(merchant.clone()), &appeal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantAppeal(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_appeal_submitted(&env, merchant, evidence_hash);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin approves an appeal — reinstates the merchant.
+    pub fn approve_appeal(env: Env, admin: Address, merchant: Address) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can approve appeals");
+        }
+
+        let mut appeal: MerchantAppeal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantAppeal(merchant.clone()))
+            .expect("No appeal found");
+
+        if appeal.resolved {
+            panic!("Appeal already resolved");
+        }
+
+        appeal.resolved = true;
+        appeal.approved = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantAppeal(merchant.clone()), &appeal);
+
+        // Reinstate merchant
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantStatus(merchant.clone()), &MerchantStatus::Active);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantApproved(merchant.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantStatus(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_appeal_approved(&env, merchant);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin rejects an appeal — merchant remains banned and cooldown is applied.
+    pub fn reject_appeal(env: Env, admin: Address, merchant: Address) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can reject appeals");
+        }
+
+        let mut appeal: MerchantAppeal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantAppeal(merchant.clone()))
+            .expect("No appeal found");
+
+        if appeal.resolved {
+            panic!("Appeal already resolved");
+        }
+
+        appeal.resolved = true;
+        appeal.approved = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantAppeal(merchant.clone()), &appeal);
+
+        // Apply cooldown
+        let cooldown_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AppealRejectionCooldownSeconds)
+            .unwrap_or(0);
+        if cooldown_seconds > 0 {
+            let cooldown_until = env.ledger().timestamp() + cooldown_seconds;
+            env.storage()
+                .persistent()
+                .set(&DataKey::AppealCooldownUntil(merchant.clone()), &cooldown_until);
+            env.storage().persistent().extend_ttl(
+                &DataKey::AppealCooldownUntil(merchant.clone()),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        events::emit_appeal_rejected(&env, merchant);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the current status of a merchant.
+    pub fn get_merchant_status(env: Env, merchant: Address) -> MerchantStatus {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantStatus(merchant))
+            .unwrap_or(MerchantStatus::Active)
+    }
+
+    /// Get the active appeal for a merchant, if any.
+    pub fn get_merchant_appeal(env: Env, merchant: Address) -> Option<MerchantAppeal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantAppeal(merchant))
+    }
+
 }
 
 #[cfg(test)]
@@ -5025,5 +5381,8 @@ mod test_notification_keys;
 
 #[cfg(test)]
 mod test_external_id_multisig_voucher;
+
+#[cfg(test)]
+mod test_merchant_ban;
 
 pub use events::*;

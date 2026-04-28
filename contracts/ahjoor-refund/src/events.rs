@@ -98,6 +98,33 @@ pub struct ContractResumed {
     pub timestamp: u64,
 }
 
+/// Event: Merchant made a counter-offer on a refund request
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RefundCounterOffered {
+    pub refund_id: u32,
+    pub merchant: Address,
+    pub counter_amount: i128,
+    pub expires_at: u64,
+}
+
+/// Event: Customer accepted the counter-offer
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RefundCounterAccepted {
+    pub refund_id: u32,
+    pub customer: Address,
+    pub amount: i128,
+}
+
+/// Event: Customer rejected the counter-offer (escalated to admin)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RefundCounterRejected {
+    pub refund_id: u32,
+    pub customer: Address,
+}
+
 /// Event: Refund auto-approved after dispute window elapsed without merchant response
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -505,4 +532,16 @@ pub fn emit_fraud_score_decay_applied(e: &Env, buyer: Address, old_score: u32, n
 
 pub fn emit_fraud_score_block_threshold_updated(e: &Env, old_threshold: u32, new_threshold: u32) {
     FraudScoreBlockThresholdUpdated { old_threshold, new_threshold }.publish(e);
+}
+
+pub fn emit_refund_counter_offered(e: &Env, refund_id: u32, merchant: Address, counter_amount: i128, expires_at: u64) {
+    RefundCounterOffered { refund_id, merchant, counter_amount, expires_at }.publish(e);
+}
+
+pub fn emit_refund_counter_accepted(e: &Env, refund_id: u32, customer: Address, amount: i128) {
+    RefundCounterAccepted { refund_id, customer, amount }.publish(e);
+}
+
+pub fn emit_refund_counter_rejected(e: &Env, refund_id: u32, customer: Address) {
+    RefundCounterRejected { refund_id, customer }.publish(e);
 }

@@ -1233,6 +1233,7 @@ impl AhjoorContract {
             if count >= max_defaults && !suspended_members.contains(&member) {
                 suspended_members.push_back(member.clone());
                 events::emit_suspended(&env, member.clone(), count);
+                Self::try_promote_from_waitlist(&env, &member);
             }
         }
 
@@ -1324,6 +1325,7 @@ impl AhjoorContract {
                     .instance()
                     .set(&DataKey::SuspendedMembers, &suspended_members);
                 events::emit_suspended(&env, member.clone(), new_default_count);
+                Self::try_promote_from_waitlist(&env, &member);
             }
         }
     }
@@ -3743,6 +3745,9 @@ impl AhjoorContract {
 
         events::emit_exit_ok(&env, member.clone(), refund_amount);
 
+        // Auto-promote from waitlist to fill the vacancy
+        Self::try_promote_from_waitlist(&env, &member);
+
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -4363,9 +4368,250 @@ impl AhjoorContract {
             .unwrap_or(1);
         (co_admins, threshold)
     }
+
+    // --- Waitlist Functions ---
+
+    /// Join the waitlist for this ROSCA group.
+    /// Caller is added to the end of the waitlist in registration order.
+    pub fn join_waitlist(env: Env, caller: Address) {
+        internals::check_not_paused(&env);
+        caller.require_auth();
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if members.contains(&caller) {
+            panic_with_error!(&env, Error::AlreadyAMember);
+        }
+
+        let exited_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExitedMembers)
+            .unwrap_or(Vec::new(&env));
+        if exited_members.contains(&caller) {
+            panic_with_error!(&env, Error::MemberHasExited);
+        }
+
+        let mut waitlist: Vec<(Address, u64)> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::Waitlist)
+            .unwrap_or(Vec::new(&env));
+
+        // Check not already on waitlist
+        for i in 0..waitlist.len() {
+            let (addr, _) = waitlist.get(i).unwrap();
+            if addr == caller {
+                panic!("Already on waitlist");
+            }
+        }
+
+        waitlist.push_back((caller.clone(), env.ledger().timestamp()));
+        env.storage().instance().set(&DataKey2::Waitlist, &waitlist);
+
+        events::emit_waitlist_updated(&env, caller, true, waitlist.len() as u32);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Leave the waitlist voluntarily.
+    pub fn leave_waitlist(env: Env, caller: Address) {
+        internals::check_not_paused(&env);
+        caller.require_auth();
+
+        let waitlist: Vec<(Address, u64)> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::Waitlist)
+            .unwrap_or(Vec::new(&env));
+
+        let mut new_waitlist: Vec<(Address, u64)> = Vec::new(&env);
+        let mut found = false;
+        for i in 0..waitlist.len() {
+            let entry = waitlist.get(i).unwrap();
+            if entry.0 == caller {
+                found = true;
+            } else {
+                new_waitlist.push_back(entry);
+            }
+        }
+        if !found {
+            panic!("Not on waitlist");
+        }
+
+        env.storage().instance().set(&DataKey2::Waitlist, &new_waitlist);
+        events::emit_waitlist_updated(&env, caller, false, new_waitlist.len() as u32);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin removes an address from the waitlist.
+    pub fn remove_from_waitlist(env: Env, admin: Address, target: Address) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic!("Only admin can remove from waitlist");
+        }
+
+        let waitlist: Vec<(Address, u64)> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::Waitlist)
+            .unwrap_or(Vec::new(&env));
+
+        let mut new_waitlist: Vec<(Address, u64)> = Vec::new(&env);
+        let mut found = false;
+        for i in 0..waitlist.len() {
+            let entry = waitlist.get(i).unwrap();
+            if entry.0 == target {
+                found = true;
+            } else {
+                new_waitlist.push_back(entry);
+            }
+        }
+        if !found {
+            panic!("Address not on waitlist");
+        }
+
+        env.storage().instance().set(&DataKey2::Waitlist, &new_waitlist);
+        events::emit_waitlist_updated(&env, target, false, new_waitlist.len() as u32);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the current waitlist as a Vec of (address, joined_at) pairs.
+    pub fn get_waitlist(env: Env) -> Vec<(Address, u64)> {
+        env.storage()
+            .instance()
+            .get(&DataKey2::Waitlist)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Internal: promote the first waitlisted address to fill a vacancy left by `vacated_by`.
+    /// Records the catch-up contribution debt; the new member must call `pay_catch_up_contribution`.
+    fn try_promote_from_waitlist(env: &Env, vacated_by: &Address) {
+        let waitlist: Vec<(Address, u64)> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::Waitlist)
+            .unwrap_or(Vec::new(&env));
+
+        if waitlist.is_empty() {
+            return;
+        }
+
+        let (new_member, _) = waitlist.get(0).unwrap();
+
+        // Remove from waitlist
+        let mut new_waitlist: Vec<(Address, u64)> = Vec::new(&env);
+        for i in 1..waitlist.len() {
+            new_waitlist.push_back(waitlist.get(i).unwrap());
+        }
+        env.storage().instance().set(&DataKey2::Waitlist, &new_waitlist);
+
+        // Add to members
+        let mut members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        members.push_back(new_member.clone());
+        env.storage().instance().set(&DataKey::Members, &members);
+
+        // Add to payout order at the end
+        let mut payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .expect("Payout order not set");
+        payout_order.push_back(new_member.clone());
+        env.storage().instance().set(&DataKey::PayoutOrder, &payout_order);
+
+        // Calculate catch-up contribution: rounds already elapsed × contribution_amount
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let contribution_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContributionAmt)
+            .unwrap_or(0);
+        let catch_up_amount = (current_round as i128) * contribution_amount;
+
+        // Collect catch-up immediately (new_member must have authorized this call chain)
+        if catch_up_amount > 0 {
+            let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            let client = token::Client::new(env, &token_addr);
+            client.transfer(&new_member, &env.current_contract_address(), &catch_up_amount);
+        }
+
+        events::emit_member_enrolled_from_waitlist(
+            env,
+            new_member.clone(),
+            vacated_by.clone(),
+            current_round,
+            catch_up_amount,
+        );
+    }
+
+    /// New member pays their catch-up contribution after being promoted from the waitlist.
+    pub fn pay_catch_up_contribution(env: Env, member: Address) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+
+        let mut debts: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CatchUpDebt)
+            .unwrap_or(Map::new(&env));
+
+        let amount = debts.get(member.clone()).unwrap_or(0);
+        if amount == 0 {
+            panic!("No catch-up contribution owed");
+        }
+
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&member, &env.current_contract_address(), &amount);
+
+        debts.remove(member.clone());
+        env.storage().instance().set(&DataKey2::CatchUpDebt, &debts);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the catch-up contribution owed by a member.
+    pub fn get_catch_up_debt(env: Env, member: Address) -> i128 {
+        let debts: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CatchUpDebt)
+            .unwrap_or(Map::new(&env));
+        debts.get(member).unwrap_or(0)
+    }
 }
+
 mod test;
 mod test_new_features;
 mod test_skip;
 mod test_quorum;
+mod test_waitlist;
 pub use events::*;
