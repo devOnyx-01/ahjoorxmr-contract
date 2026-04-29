@@ -830,4 +830,55 @@ pub fn emit_seller_transfer_expired_approved(e: &Env, escrow_id: u32, new_seller
         (soroban_sdk::Symbol::new(e, "SellerTransferExpired"),),
         (escrow_id, new_seller),
     );
+// --- Issue #146: Post-Resolution Rating System ---
+
+/// Event: Rating submitted after escrow completion
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RatingSubmitted {
+    pub escrow_id: u32,
+    pub rater: Address,
+    pub ratee: Address,
+    pub rating: u32,
+    pub comment_hash: Option<BytesN<32>>,
+}
+
+pub fn emit_rating_submitted(
+    e: &Env,
+    escrow_id: u32,
+    rater: Address,
+    ratee: Address,
+    rating: u32,
+    comment_hash: Option<BytesN<32>>,
+) {
+    RatingSubmitted {
+        escrow_id,
+        rater,
+        ratee,
+        rating,
+        comment_hash,
+    }
+    .publish(e);
+}
+
+// --- Issue #219: Multi-Party Split Release ---
+
+/// Event: Multi-seller escrow created with explicit payee list and shares
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MultiSellerEscrowCreated {
+    pub escrow_id: u32,
+    pub sellers_count: u32,
+}
+
+pub fn emit_multi_seller_escrow_created(
+    e: &Env,
+    escrow_id: u32,
+    sellers: soroban_sdk::Vec<(Address, u32)>,
+) {
+    MultiSellerEscrowCreated {
+        escrow_id,
+        sellers_count: sellers.len(),
+    }
+    .publish(e);
 }

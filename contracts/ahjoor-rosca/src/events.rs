@@ -1154,3 +1154,60 @@ pub fn emit_round_duration_update_scheduled(e: &Env, old_duration: u64, new_dura
 pub fn emit_round_duration_applied(e: &Env, round: u32, duration: u64) {
     RoundDurationApplied { round, duration }.publish(e);
 }
+
+// #240: Co-Signer Guarantee Events
+
+pub fn emit_co_signer_set(e: &Env, group_id: u32, member: Address, co_signer: Address) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerSet"),), (group_id, member, co_signer));
+}
+
+pub fn emit_co_signer_accepted(e: &Env, group_id: u32, member: Address, co_signer: Address) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerAccepted"),), (group_id, member, co_signer));
+}
+
+pub fn emit_co_signer_contributed(e: &Env, group_id: u32, member: Address, co_signer: Address, amount: i128) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerContributed"),), (group_id, member, co_signer, amount));
+}
+
+pub fn emit_co_signer_window_expired(e: &Env, group_id: u32, member: Address) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerWinExpired"),), (group_id, member));
+// #236: Group Activity Freeze Events
+
+/// Event: Group frozen by contract-level admin
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct GroupFrozen {
+    pub group_id: u32,
+    pub reason_hash: BytesN<32>,
+    pub frozen_at: u32,
+}
+
+/// Event: Group unfrozen by contract-level admin
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct GroupUnfrozen {
+    pub group_id: u32,
+    pub resolution_hash: BytesN<32>,
+    pub unfrozen_at: u32,
+}
+
+pub fn emit_group_frozen(e: &Env, group_id: u32, reason_hash: BytesN<32>, frozen_at: u32) {
+    GroupFrozen { group_id, reason_hash, frozen_at }.publish(e);
+}
+
+pub fn emit_group_unfrozen(e: &Env, group_id: u32, resolution_hash: BytesN<32>, unfrozen_at: u32) {
+    GroupUnfrozen { group_id, resolution_hash, unfrozen_at }.publish(e);
+// #243: Group State Snapshot Events
+
+/// Event: Group state snapshot taken
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SnapshotTaken {
+    pub snapshot_id: u32,
+    pub taken_by: Address,
+    pub state_hash: BytesN<32>,
+}
+
+pub fn emit_snapshot_taken(e: &Env, snapshot_id: u32, taken_by: Address, state_hash: BytesN<32>) {
+    SnapshotTaken { snapshot_id, taken_by, state_hash }.publish(e);
+}
