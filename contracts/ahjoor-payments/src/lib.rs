@@ -105,6 +105,12 @@ pub enum Error {
     VoucherRevoked = 12,
     VoucherNotFound = 13,
     WithdrawalRateLimitExceeded = 14,
+    /// Slippage tolerance exceeded on dynamic payment settlement (#246)
+    SlippageExceeded = 15,
+    /// Oracle address is not on the admin whitelist (#246)
+    OracleNotWhitelisted = 16,
+    /// Dynamic payment has expired (#246)
+    DynamicPaymentExpired = 17,
     /// Customer cumulative spend would exceed the merchant-configured cap (#235)
     CustomerSpendLimitExceeded = 15,
 }
@@ -376,6 +382,22 @@ pub struct SlippageConfig {
     pub max_bps: u32,
 }
 
+/// Oracle-backed dynamic payment record (#246).
+/// The settlement amount is computed at complete_payment time using the oracle rate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicPayment {
+    pub payment_id: u32,
+    pub fiat_amount: i128,
+    pub fiat_currency: Symbol,
+    pub oracle_address: Address,
+    pub token: Address,
+    pub slippage_bps: u32,
+    /// Oracle price at creation time (scaled by 10^7), used for slippage check at settlement
+    pub creation_rate: i128,
+    pub expiry: u64,
+}
+
 /// Per-merchant volume cap configuration (#131)
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -528,6 +550,10 @@ pub enum DataKey {
     MerchantWithdrawalWindow(Address),
     /// Persistent: per-merchant revenue dashboard summary (#226)
     MerchantSummary(Address),
+    /// Persistent: dynamic payment record (#246)
+    DynamicPayment(u32),
+    /// Instance: admin-maintained oracle whitelist (#246)
+    OracleWhitelist,
     /// Persistent: per-(merchant,customer) spend limit override (#235)
     CustomerSpendLimit(Address, Address),
     /// Persistent: merchant-level default spend limit (#235)
@@ -4306,6 +4332,8 @@ impl AhjoorPaymentsContract {
             panic!("Payment has expired");
         }
 
+        // #246: Recompute token amount at current oracle rate for dynamic payments
+        Self::settle_dynamic_payment_if_needed(env, &mut payment);
         // #235: Check customer spend limit before finalizing
         Self::check_and_update_customer_spend_limit(env, &payment.merchant, &payment.customer, payment.amount);
 
@@ -6066,6 +6094,7 @@ mod test_external_id_multisig_voucher;
 mod test_merchant_ban;
 
 #[cfg(test)]
+mod test_dynamic_settlement;
 mod test_spending_limit;
 
 pub use events::*;
