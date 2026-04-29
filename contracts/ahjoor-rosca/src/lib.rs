@@ -1313,7 +1313,54 @@ impl AhjoorContract {
             .get(&DataKey::MaxDefaults)
             .unwrap_or(3);
 
+        // #240: co-signer window config
+        let co_signer_window: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSignerWindowLedgers)
+            .unwrap_or(0);
+        let co_signers: Map<Address, CoSignerRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSigners)
+            .unwrap_or(Map::new(&env));
+        let mut window_starts: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSignerWindowStart)
+            .unwrap_or(Map::new(&env));
+
         for member in defaulters.iter() {
+            // #240: if member has an active co-signer and window > 0, open grace period
+            // instead of immediately applying the penalty
+            if co_signer_window > 0 {
+                if let Some(record) = co_signers.get(member.clone()) {
+                    if record.status == CoSignerStatus::Active {
+                        // Open window if not already open
+                        if window_starts.get(member.clone()).is_none() {
+                            window_starts.set(member.clone(), env.ledger().sequence());
+                            env.storage()
+                                .instance()
+                                .set(&DataKey2::CoSignerWindowStart, &window_starts);
+                            // Skip penalty this round — co-signer has a window to act
+                            continue;
+                        }
+                        // Window already open — check if expired
+                        let start = window_starts.get(member.clone()).unwrap();
+                        if env.ledger().sequence() < start + co_signer_window {
+                            // Still within window — skip penalty
+                            continue;
+                        }
+                        // Window expired — clear it and fall through to penalty
+                        window_starts.remove(member.clone());
+                        env.storage()
+                            .instance()
+                            .set(&DataKey2::CoSignerWindowStart, &window_starts);
+                        events::emit_co_signer_window_expired(&env, 0, member.clone());
+                    }
+                }
+            }
+
             let count = default_count.get(member.clone()).unwrap_or(0) + 1;
             default_count.set(member.clone(), count);
 
@@ -5045,6 +5092,9 @@ impl AhjoorContract {
         if admin != stored_admin {
             panic_with_error!(&env, ExtError::OnlyAdminAllowed);
         }
+        env.storage()
+            .instance()
+            .set(&DataKey2::CoSignerWindowLedgers, &window_ledgers);
 
         let is_frozen: bool = env
             .storage()
@@ -5083,6 +5133,34 @@ impl AhjoorContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Member designates a co-signer guarantor. Co-signer must call accept_co_signer to activate.
+    pub fn set_co_signer(env: Env, member: Address, group_id: u32, co_signer: Address) {
+        member.require_auth();
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+
+        let mut co_signers: Map<Address, CoSignerRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSigners)
+            .unwrap_or(Map::new(&env));
+        if co_signers.contains_key(member.clone()) {
+            panic_with_error!(&env, ExtError::CoSignerAlreadySet);
+        }
+
+        co_signers.set(member.clone(), CoSignerRecord {
+            co_signer: co_signer.clone(),
+            status: CoSignerStatus::Pending,
+        });
+        env.storage().instance().set(&DataKey2::CoSigners, &co_signers);
+
+        events::emit_co_signer_set(&env, group_id, member, co_signer);
     /// Contract-level admin unfreezes the group, logging the resolution on-chain.
     pub fn unfreeze_group(env: Env, admin: Address, group_id: u32, resolution_hash: BytesN<32>) {
         admin.require_auth();
@@ -5130,6 +5208,138 @@ impl AhjoorContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Co-signer accepts the guarantee designation, activating it.
+    pub fn accept_co_signer(env: Env, co_signer: Address, group_id: u32, member: Address) {
+        co_signer.require_auth();
+
+        let mut co_signers: Map<Address, CoSignerRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSigners)
+            .unwrap_or(Map::new(&env));
+        let mut record = co_signers.get(member.clone()).unwrap_or_else(|| {
+            panic_with_error!(&env, ExtError::NoCoSignerFound)
+        });
+        if record.co_signer != co_signer {
+            panic_with_error!(&env, ExtError::NotTheCoSigner);
+        }
+        record.status = CoSignerStatus::Active;
+        co_signers.set(member.clone(), record);
+        env.storage().instance().set(&DataKey2::CoSigners, &co_signers);
+
+        events::emit_co_signer_accepted(&env, group_id, member, co_signer);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Co-signer pays on behalf of a defaulting member during the grace window.
+    /// The contribution is recorded as the member's own.
+    pub fn co_signer_contribute(
+        env: Env,
+        co_signer: Address,
+        group_id: u32,
+        member: Address,
+        token: Address,
+        amount: i128,
+    ) {
+        co_signer.require_auth();
+
+        let co_signers: Map<Address, CoSignerRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSigners)
+            .unwrap_or(Map::new(&env));
+        let record = co_signers.get(member.clone()).unwrap_or_else(|| {
+            panic_with_error!(&env, ExtError::NoCoSignerFound)
+        });
+        if record.co_signer != co_signer {
+            panic_with_error!(&env, ExtError::NotTheCoSigner);
+        }
+        if record.status != CoSignerStatus::Active {
+            panic_with_error!(&env, ExtError::CoSignerNotAccepted);
+        }
+
+        // Verify window is open
+        let window_starts: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSignerWindowStart)
+            .unwrap_or(Map::new(&env));
+        let start = window_starts.get(member.clone()).unwrap_or_else(|| {
+            panic_with_error!(&env, ExtError::CoSignerWindowNotOpen)
+        });
+        let co_signer_window: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSignerWindowLedgers)
+            .unwrap_or(0);
+        if env.ledger().sequence() >= start + co_signer_window {
+            panic_with_error!(&env, ExtError::CoSignerWindowExpired);
+        }
+
+        // Transfer from co-signer to contract on behalf of member
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&co_signer, &env.current_contract_address(), &amount);
+
+        // Record contribution under member's name
+        let mut paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .unwrap_or(Vec::new(&env));
+        if !paid_members.contains(&member) {
+            paid_members.push_back(member.clone());
+        }
+        env.storage().instance().set(&DataKey::PaidMembers, &paid_members);
+
+        // Clear the window
+        let mut window_starts_mut: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSignerWindowStart)
+            .unwrap_or(Map::new(&env));
+        window_starts_mut.remove(member.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey2::CoSignerWindowStart, &window_starts_mut);
+
+        events::emit_co_signer_contributed(&env, group_id, member, co_signer, amount);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Member removes their co-signer designation (only between rounds).
+    pub fn remove_co_signer(env: Env, member: Address, group_id: u32) {
+        member.require_auth();
+
+        // Only allowed between rounds (paid_members must be empty)
+        let paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .unwrap_or(Vec::new(&env));
+        if !paid_members.is_empty() {
+            panic_with_error!(&env, Error::CannotChangeMidRound);
+        }
+
+        let mut co_signers: Map<Address, CoSignerRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::CoSigners)
+            .unwrap_or(Map::new(&env));
+        if !co_signers.contains_key(member.clone()) {
+            panic_with_error!(&env, ExtError::NoCoSignerFound);
+        }
+        co_signers.remove(member.clone());
+        env.storage().instance().set(&DataKey2::CoSigners, &co_signers);
+
+        let _ = group_id; // used in event
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
     /// Returns the freeze log (read-only, available even when frozen).
     pub fn get_freeze_log(env: Env) -> Vec<FreezeRecord> {
         env.storage()
@@ -5248,6 +5458,7 @@ mod test_new_features;
 mod test_skip;
 mod test_quorum;
 mod test_waitlist;
+mod test_cosigner_guarantee;
 mod test_group_freeze;
 mod test_snapshot;
 pub use events::*;

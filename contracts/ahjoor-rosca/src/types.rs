@@ -264,6 +264,10 @@ pub enum DataKey2 {
     CatchUpDebt,             // Map<Address, i128> — catch-up contributions owed
     StartAt,                 // u64
     GroupActivationEmitted,  // bool
+    // #240: Co-Signer Guarantee
+    CoSigners,               // Map<Address, CoSignerRecord> — member → co-signer record
+    CoSignerWindowLedgers,   // u32 — grace period ledgers before penalty applied
+    CoSignerWindowStart,     // Map<Address, u32> — member → ledger when window opened
     // #236: Group Activity Freeze
     IsFrozen,                // bool — group is frozen by contract-level admin
 }
@@ -306,6 +310,22 @@ pub struct GroupSnapshot {
     pub member_statuses: Vec<MemberStatus>,
     pub payout_order: Vec<Address>,
     pub state_hash: BytesN<32>,
+}
+
+// #240: Co-Signer Guarantee
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum CoSignerStatus {
+    Pending = 0,   // set by member, not yet accepted
+    Active = 1,    // accepted by co-signer
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoSignerRecord {
+    pub co_signer: Address,
+    pub status: CoSignerStatus,
 }
 
 // ── Audit Trail ────────────────────────────────────────────────────────────────

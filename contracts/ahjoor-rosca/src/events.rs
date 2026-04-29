@@ -1155,6 +1155,22 @@ pub fn emit_round_duration_applied(e: &Env, round: u32, duration: u64) {
     RoundDurationApplied { round, duration }.publish(e);
 }
 
+// #240: Co-Signer Guarantee Events
+
+pub fn emit_co_signer_set(e: &Env, group_id: u32, member: Address, co_signer: Address) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerSet"),), (group_id, member, co_signer));
+}
+
+pub fn emit_co_signer_accepted(e: &Env, group_id: u32, member: Address, co_signer: Address) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerAccepted"),), (group_id, member, co_signer));
+}
+
+pub fn emit_co_signer_contributed(e: &Env, group_id: u32, member: Address, co_signer: Address, amount: i128) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerContributed"),), (group_id, member, co_signer, amount));
+}
+
+pub fn emit_co_signer_window_expired(e: &Env, group_id: u32, member: Address) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerWinExpired"),), (group_id, member));
 // #236: Group Activity Freeze Events
 
 /// Event: Group frozen by contract-level admin
