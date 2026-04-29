@@ -105,6 +105,10 @@ pub enum Error {
     VoucherRevoked = 12,
     VoucherNotFound = 13,
     WithdrawalRateLimitExceeded = 14,
+    /// Referred merchant already has a merchant record (#242)
+    ReferralAlreadyExists = 15,
+    /// No pending commission to claim (#242)
+    NoCommissionToClaim = 16,
     /// Slippage tolerance exceeded on dynamic payment settlement (#246)
     SlippageExceeded = 15,
     /// Oracle address is not on the admin whitelist (#246)
@@ -131,6 +135,13 @@ pub struct WithdrawalWindowState {
     pub withdrawn: i128,
 }
 
+/// Referral record: tracks referrer, registration ledger, and accrual window (#242).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferralRecord {
+    pub referrer: Address,
+    pub registered_at_ledger: u32,
+    pub window_ledgers: u32,
 /// Per-customer (or default) spend cap config (#235).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -550,6 +561,14 @@ pub enum DataKey {
     MerchantWithdrawalWindow(Address),
     /// Persistent: per-merchant revenue dashboard summary (#226)
     MerchantSummary(Address),
+    /// Instance: global referral commission in basis points (#242)
+    ReferralCommissionBps,
+    /// Instance: global referral window in ledgers (#242)
+    ReferralWindowLedgers,
+    /// Persistent: referral record for a referred merchant (#242)
+    ReferralRecord(Address),
+    /// Persistent: pending commission balance for a referrer (#242)
+    PendingCommission(Address),
     /// Persistent: dynamic payment record (#246)
     DynamicPayment(u32),
     /// Instance: admin-maintained oracle whitelist (#246)
@@ -4623,6 +4642,8 @@ impl AhjoorPaymentsContract {
                 fee_recipient,
                 final_token.clone(),
             );
+            // #242: Accrue referral commission on the fee collected for referred merchants
+            Self::accrue_referral_commission(env, &payment.merchant, payment_id, fee_amount);
         }
 
         let split_transfers = Self::distribute_net_payment(env, payment, net_amount);
@@ -5789,6 +5810,8 @@ impl AhjoorPaymentsContract {
     }
 
     // =========================================================================
+    // #242: Merchant Referral Commission Tracking
+    // =========================================================================
     // #235: Merchant-Level Customer Spending Limits
     // =========================================================================
 
@@ -6075,8 +6098,106 @@ impl AhjoorPaymentsContract {
 
 }
 
-#[cfg(test)]
-mod test;
+    /// Admin sets global referral terms.
+    pub fn set_referral_config(env: Env, admin: Address, commission_bps: u32, window_ledgers: u32) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin { panic!("Only admin can set referral config"); }
+        env.storage().instance().set(&DataKey::ReferralCommissionBps, &commission_bps);
+        env.storage().instance().set(&DataKey::ReferralWindowLedgers, &window_ledgers);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Existing merchant registers a referral for a new merchant.
+    /// Fails if the referred address already has a merchant record.
+    pub fn register_referral(env: Env, referrer: Address, referred_merchant: Address) {
+        Self::require_not_paused(&env);
+        referrer.require_auth();
+
+        // Referrer must be an approved merchant
+        let referrer_approved: bool = env.storage().persistent().get(&DataKey::MerchantApproved(referrer.clone())).unwrap_or(false);
+        if !referrer_approved { panic!("Referrer is not an approved merchant"); }
+
+        // Referred must not already have a merchant record
+        let already_exists: bool = env.storage().persistent().get(&DataKey::MerchantApproved(referred_merchant.clone())).unwrap_or(false);
+        if already_exists { panic_with_error!(&env, Error::ReferralAlreadyExists); }
+
+        let window_ledgers: u32 = env.storage().instance().get(&DataKey::ReferralWindowLedgers).unwrap_or(0);
+        let record = ReferralRecord {
+            referrer: referrer.clone(),
+            registered_at_ledger: env.ledger().sequence(),
+            window_ledgers,
+        };
+        let key = DataKey::ReferralRecord(referred_merchant.clone());
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        events::emit_referral_registered(&env, referrer, referred_merchant);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Referrer withdraws accumulated commission to their address.
+    pub fn claim_referral_commission(env: Env, referrer: Address, token: Address) {
+        Self::require_not_paused(&env);
+        referrer.require_auth();
+
+        let key = DataKey::PendingCommission(referrer.clone());
+        let pending: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if pending <= 0 { panic_with_error!(&env, Error::NoCommissionToClaim); }
+
+        env.storage().persistent().set(&key, &0i128);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &referrer, &pending);
+
+        events::emit_commission_claimed(&env, referrer, pending);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get pending commission balance for a referrer.
+    pub fn get_pending_commission(env: Env, referrer: Address) -> i128 {
+        env.storage().persistent().get(&DataKey::PendingCommission(referrer)).unwrap_or(0)
+    }
+
+    /// Get the referral record for a referred merchant.
+    pub fn get_referral_record(env: Env, referred_merchant: Address) -> Option<ReferralRecord> {
+        env.storage().persistent().get(&DataKey::ReferralRecord(referred_merchant))
+    }
+
+    /// Internal: accrue referral commission when a referred merchant's payment is finalized.
+    fn accrue_referral_commission(env: &Env, merchant: &Address, payment_id: u32, fee_amount: i128) {
+        if fee_amount <= 0 { return; }
+
+        let record_opt: Option<ReferralRecord> = env.storage().persistent().get(&DataKey::ReferralRecord(merchant.clone()));
+        let record = match record_opt {
+            Some(r) => r,
+            None => return,
+        };
+
+        // Check window has not expired
+        let current_ledger = env.ledger().sequence();
+        if record.window_ledgers > 0 && current_ledger > record.registered_at_ledger.saturating_add(record.window_ledgers) {
+            return;
+        }
+
+        let commission_bps: u32 = env.storage().instance().get(&DataKey::ReferralCommissionBps).unwrap_or(0);
+        if commission_bps == 0 { return; }
+
+        let commission = (fee_amount * commission_bps as i128) / 10_000;
+        if commission <= 0 { return; }
+
+        let pending_key = DataKey::PendingCommission(record.referrer.clone());
+        let current: i128 = env.storage().persistent().get(&pending_key).unwrap_or(0);
+        let new_total = current.saturating_add(commission);
+        env.storage().persistent().set(&pending_key, &new_total);
+        env.storage().persistent().extend_ttl(&pending_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        events::emit_commission_accrued(env, record.referrer, merchant.clone(), payment_id, commission);
+    }
+
+}
 
 #[cfg(test)]
 mod test_token_whitelist;
@@ -6094,6 +6215,7 @@ mod test_external_id_multisig_voucher;
 mod test_merchant_ban;
 
 #[cfg(test)]
+mod test_referral;
 mod test_dynamic_settlement;
 mod test_spending_limit;
 

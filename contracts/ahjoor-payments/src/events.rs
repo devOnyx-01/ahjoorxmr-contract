@@ -1093,6 +1093,43 @@ pub fn emit_withdrawal_rate_limit_exceeded(e: &Env, merchant: Address, attempted
     e.events().publish((soroban_sdk::Symbol::new(e, "WdrlLimitExceeded"),), (merchant, attempted, cap));
 }
 
+// #242: Merchant Referral Commission Events
+/// Event: Referral registered
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ReferralRegistered {
+    pub referrer: Address,
+    pub referred_merchant: Address,
+}
+
+/// Event: Commission accrued on referred merchant payment
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CommissionAccrued {
+    pub referrer: Address,
+    pub referred_merchant: Address,
+    pub payment_id: u32,
+    pub amount: i128,
+}
+
+/// Event: Referrer claimed accumulated commission
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CommissionClaimed {
+    pub referrer: Address,
+    pub amount: i128,
+}
+
+pub fn emit_referral_registered(e: &Env, referrer: Address, referred_merchant: Address) {
+    ReferralRegistered { referrer, referred_merchant }.publish(e);
+}
+
+pub fn emit_commission_accrued(e: &Env, referrer: Address, referred_merchant: Address, payment_id: u32, amount: i128) {
+    CommissionAccrued { referrer, referred_merchant, payment_id, amount }.publish(e);
+}
+
+pub fn emit_commission_claimed(e: &Env, referrer: Address, amount: i128) {
+    CommissionClaimed { referrer, amount }.publish(e);
 // #246: Dynamic Settlement Events
 /// Event: Dynamic payment created with oracle price feed
 #[contractevent]
