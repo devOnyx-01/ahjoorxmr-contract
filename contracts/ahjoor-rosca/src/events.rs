@@ -1444,3 +1444,66 @@ pub fn emit_migration_requested(e: &Env, member: Address, from_group: Address, t
 pub fn emit_migration_executed(e: &Env, member: Address, from_group: Address, to_group: Address, slot_index: u32) {
     MigrationExecuted { member, from_group, to_group, slot_index }.publish(e);
 }
+
+
+/// Event: Group treasury enabled (#314)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TreasuryEnabled {
+    pub group_id: u32,
+    pub treasury_admin: Address,
+}
+
+/// Event: Treasury round proposed (#314)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TreasuryRoundProposed {
+    pub group_id: u32,
+    pub round_index: u32,
+}
+
+/// Event: Treasury round confirmed by majority vote (#314)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TreasuryRoundConfirmed {
+    pub group_id: u32,
+    pub round_index: u32,
+}
+
+/// Event: Treasury payment executed (#314)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TreasuryPaymentExecuted {
+    pub group_id: u32,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
+
+pub fn emit_treasury_enabled(env: &Env, treasury_admin: Address) {
+    env.events().publish(
+        ("ahjoor", "treasury_enabled"),
+        TreasuryEnabled { group_id: 0, treasury_admin },
+    );
+}
+
+pub fn emit_treasury_round_proposed(env: &Env, round_index: u32) {
+    env.events().publish(
+        ("ahjoor", "treasury_round_proposed"),
+        TreasuryRoundProposed { group_id: 0, round_index },
+    );
+}
+
+pub fn emit_treasury_round_confirmed(env: &Env, round_index: u32) {
+    env.events().publish(
+        ("ahjoor", "treasury_round_confirmed"),
+        TreasuryRoundConfirmed { group_id: 0, round_index },
+    );
+}
+
+pub fn emit_treasury_payment_executed(env: &Env, recipient: Address, amount: i128) {
+    env.events().publish(
+        ("ahjoor", "treasury_payment_executed"),
+        TreasuryPaymentExecuted { group_id: 0, recipient, amount },
+    );
+}

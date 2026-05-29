@@ -310,6 +310,14 @@ pub enum DataKey3 {
     IncomingMigrations,      // Map<Address, IncomingMigration> — member → pending inbound migration
     MigratedMembers,         // Map<Address, MigratedMemberRecord> — member → migration annotation
     VacantSlots,             // Vec<u32> — slot indices freed by migrated-out members
+    /// #314: Group treasury configuration
+    TreasuryConfig,          // TreasuryConfig
+    /// #314: Group treasury balance
+    TreasuryBalance,         // i128
+    /// #314: Treasury round proposals per round
+    TreasuryRoundProposal(u32), // (round_index) → TreasuryRoundProposal
+    /// #314: Treasury round votes per member
+    TreasuryRoundVotes(u32, Address), // (round_index, member) → bool
 }
 
 /// Persistent storage keys — kept separate because DataKey was hitting
@@ -612,4 +620,22 @@ pub struct IncomingMigration {
     pub dest_approved: bool,
 }
 
+/// Group treasury configuration (#314)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryConfig {
+    pub treasury_admin: Address,
+    pub enabled: bool,
+}
 
+/// Treasury round proposal (#314)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryRoundProposal {
+    pub round_index: u32,
+    pub purpose_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub confirmed: bool,
+}
