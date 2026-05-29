@@ -1136,3 +1136,54 @@ pub fn emit_amendment_cancelled(e: &Env, escrow_id: u32, nonce: u32, cancelled_b
     }
     .publish(e);
 }
+
+// --- Inspector Events (#316) ---
+
+/// Event: Inspection result submitted
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InspectionResultSubmitted {
+    pub escrow_id: u32,
+    pub inspector: Address,
+    pub approved: bool,
+    pub report_hash: BytesN<32>,
+}
+
+/// Event: Inspector updated
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InspectorUpdated {
+    pub escrow_id: u32,
+    pub old_inspector: Address,
+    pub new_inspector: Address,
+}
+
+pub fn emit_inspection_result_submitted(
+    e: &Env,
+    escrow_id: u32,
+    inspector: Address,
+    approved: bool,
+    report_hash: BytesN<32>,
+) {
+    InspectionResultSubmitted {
+        escrow_id,
+        inspector,
+        approved,
+        report_hash,
+    }
+    .publish(e);
+}
+
+pub fn emit_inspector_updated(
+    e: &Env,
+    escrow_id: u32,
+    old_inspector: Address,
+    new_inspector: Address,
+) {
+    InspectorUpdated {
+        escrow_id,
+        old_inspector,
+        new_inspector,
+    }
+    .publish(e);
+}

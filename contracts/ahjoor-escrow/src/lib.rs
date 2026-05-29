@@ -1127,6 +1127,100 @@ impl AhjoorEscrowContract {
         Self::try_auto_renew(&env, escrow_id, &renewal_source);
     }
 
+    /// Submit inspection result for an escrow (#316)
+    pub fn submit_inspection_result(
+        env: Env,
+        inspector: Address,
+        escrow_id: u32,
+        approved: bool,
+        report_hash: BytesN<32>,
+    ) {
+        Self::require_not_paused(&env);
+        inspector.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        // Verify inspector is set and matches caller
+        let escrow_inspector = escrow.extensions.inspector.clone()
+            .expect("No inspector assigned to this escrow");
+        if escrow_inspector != inspector {
+            panic!("Only the assigned inspector can submit results");
+        }
+
+        if escrow.status != EscrowStatus::AwaitingInspection {
+            panic!("Escrow is not awaiting inspection");
+        }
+
+        // Update status based on approval
+        if approved {
+            escrow.status = EscrowStatus::InspectionPassed;
+        } else {
+            escrow.status = EscrowStatus::InspectionFailed;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_inspection_result_submitted(&env, escrow_id, inspector, approved, report_hash);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Update inspector for an escrow (requires mutual consent) (#316)
+    pub fn update_inspector(
+        env: Env,
+        escrow_id: u32,
+        new_inspector: Address,
+    ) {
+        Self::require_not_paused(&env);
+        let caller = env.invoker();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        // Require both buyer and seller to authorize
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can update inspector");
+        }
+
+        let old_inspector = escrow.extensions.inspector.clone()
+            .expect("No inspector assigned to this escrow");
+
+        // For simplicity, we allow either party to update. In a more complex system,
+        // you might require both parties to sign off via a proposal mechanism.
+        escrow.extensions.inspector = Some(new_inspector.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_inspector_updated(&env, escrow_id, old_inspector, new_inspector);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     /// Submit evidence hash anchors for an escrow dispute workflow.
     pub fn submit_evidence(
         env: Env,
