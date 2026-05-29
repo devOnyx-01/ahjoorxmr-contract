@@ -1137,6 +1137,20 @@ pub fn emit_amendment_cancelled(e: &Env, escrow_id: u32, nonce: u32, cancelled_b
     .publish(e);
 }
 
+// ── #332: Milestone BPS Events ────────────────────────────────────────────────
+
+pub fn emit_milestone_submitted(e: &Env, escrow_id: u32, milestone_index: u32, delivery_hash: BytesN<32>) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "MilestoneSubmitted"),),
+        (escrow_id, milestone_index, delivery_hash),
+    );
+}
+
+pub fn emit_milestone_rejected(e: &Env, escrow_id: u32, milestone_index: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "MilestoneRejected"),),
+        (escrow_id, milestone_index),
+    );
 /// Event: Escrow topped up by buyer
 #[contractevent]
 #[derive(Clone, Debug)]

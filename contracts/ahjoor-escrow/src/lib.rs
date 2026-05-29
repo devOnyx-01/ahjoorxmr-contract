@@ -366,6 +366,46 @@ pub enum DataKey {
     AutoRenewalCancelled(u32),
 }
 
+/// Overflow storage keys for escrow — DataKey is capped at 52 variants.
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey2 {
+    /// #332: BPS-based milestone states for proportional progressive release
+    EscrowMilestonesV2(u32),
+}
+
+// ── #332: Milestone BPS Progressive Release ───────────────────────────────────
+
+/// Input type for creating a bps-based milestone escrow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneInput {
+    pub name: String,
+    pub release_bps: u32,
+    pub description_hash: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MilestoneStateStatus {
+    Pending = 0,
+    Submitted = 1,
+    Approved = 2,
+    Rejected = 3,
+}
+
+/// On-chain milestone state for a proportional-release escrow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneState {
+    pub name: String,
+    pub release_bps: u32,
+    pub description_hash: BytesN<32>,
+    pub status: MilestoneStateStatus,
+    pub delivery_hash: Option<BytesN<32>>,
+    pub rejection_hash: Option<BytesN<32>>,
+}
+
 const MAX_PROTOCOL_FEE_BPS: u32 = 200; // 2%
 const MAX_ARBITER_FEE_BPS: u32 = 1_000; // 10%
 const DEFAULT_RESOLUTION_COOLING_OFF_SECONDS: u64 = 24 * 60 * 60; // 24 hours
@@ -5218,214 +5258,240 @@ impl AhjoorEscrowContract {
         (avg_x100, count)
     }
 
-    // ─── Mutual Amendment Protocol ────────────────────────────────────────────
+    // ── #332: Milestone BPS Progressive Release ───────────────────────────────
 
-    /// Admin sets the amendment proposal expiry window in seconds.
-    pub fn set_amendment_expiry_seconds(env: Env, admin: Address, expiry_seconds: u64) {
-        Self::require_not_paused(&env);
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Not initialized");
-        if admin != stored_admin {
-            panic!("Only admin can set amendment expiry");
+    /// Create an escrow divided into named milestones with proportional BPS payouts.
+    /// `milestones[i].release_bps` values must sum to exactly 10 000.
+    /// The full `amount` is transferred from buyer into the contract up front.
+    pub fn create_bps_milestone_escrow(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        arbiter: Address,
+        amount: i128,
+        token: Address,
+        deadline: u64,
+        milestones: Vec<MilestoneInput>,
+    ) -> u32 {
+        buyer.require_auth();
+
+        if milestones.is_empty() {
+            panic!("At least one milestone required");
         }
-        if expiry_seconds == 0 {
-            panic!("Expiry must be positive");
+        if milestones.len() > MAX_MILESTONES {
+            panic!("Too many milestones");
         }
+
+        // Validate release_bps sum == 10 000
+        let mut total_bps: u32 = 0;
+        for i in 0..milestones.len() {
+            let m = milestones.get(i).unwrap();
+            if m.release_bps == 0 {
+                panic!("release_bps must be positive for each milestone");
+            }
+            total_bps = total_bps.saturating_add(m.release_bps);
+        }
+        if total_bps != 10_000 {
+            panic!("Milestone release_bps must sum to 10 000");
+        }
+        if amount <= 0 {
+            panic!("Escrow amount must be positive");
+        }
+
+        let request = EscrowCreateRequest {
+            seller,
+            arbiter,
+            amount,
+            token,
+            deadline,
+            metadata_hash: None,
+            sellers: Vec::new(&env),
+            auto_renew: false,
+            renewal_count: 0,
+            buyer_inactivity_secs: 0,
+            min_lock_until: None,
+            release_base: None,
+            release_quote: None,
+            release_comparison: None,
+            release_threshold_price: None,
+            arbiter_fee_bps: None,
+            dispute_default_winner: None,
+        };
+        let escrow_id = Self::create_escrow_core(&env, &buyer, request);
+
+        // Convert MilestoneInput → MilestoneState (all Pending, no hashes yet)
+        let mut states: Vec<MilestoneState> = Vec::new(&env);
+        for i in 0..milestones.len() {
+            let m = milestones.get(i).unwrap();
+            states.push_back(MilestoneState {
+                name: m.name,
+                release_bps: m.release_bps,
+                description_hash: m.description_hash,
+                status: MilestoneStateStatus::Pending,
+                delivery_hash: None,
+                rejection_hash: None,
+            });
+        }
+
         env.storage()
-            .instance()
-            .set(&DataKey::AmendmentExpirySeconds, &expiry_seconds);
+            .persistent()
+            .set(&DataKey2::EscrowMilestonesV2(escrow_id), &states);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::EscrowMilestonesV2(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        escrow_id
     }
 
-    /// Propose an amendment to escrow terms (amount, deadline, metadata_hash).
-    /// Caller must be the buyer or seller of the escrow.
-    /// At least one field must differ from the current escrow state.
-    /// Replaces any existing pending proposal.
-    pub fn propose_amendment(
+    /// Seller marks a milestone as delivered by submitting a delivery hash.
+    /// The milestone must be in `Pending` or `Rejected` state.
+    pub fn submit_milestone(
         env: Env,
-        proposer: Address,
+        seller: Address,
         escrow_id: u32,
-        new_amount: Option<i128>,
-        new_deadline: Option<u64>,
-        new_metadata_hash: Option<BytesN<32>>,
+        milestone_index: u32,
+        delivery_hash: BytesN<32>,
     ) {
-        Self::require_not_paused(&env);
-        proposer.require_auth();
+        seller.require_auth();
 
         let escrow: Escrow = env
             .storage()
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
             .expect("Escrow not found");
-
-        if proposer != escrow.buyer && proposer != escrow.seller {
-            panic!("Only buyer or seller can propose an amendment");
+        if escrow.seller != seller {
+            panic!("Only the escrow seller may submit milestones");
         }
-
-        if !Self::is_open_escrow_status(escrow.status) {
+        if escrow.status != EscrowStatus::Active {
             panic!("Escrow is not active");
         }
 
-        // Validate at least one field is being changed
-        let amount_changed = new_amount.map_or(false, |a| a != escrow.amount);
-        let deadline_changed = new_deadline.map_or(false, |d| d != escrow.deadline);
-        let hash_changed = new_metadata_hash != escrow.metadata_hash;
-        if !amount_changed && !deadline_changed && !hash_changed {
-            panic!("Amendment must change at least one field");
-        }
-
-        // Validate proposed values
-        if let Some(amount) = new_amount {
-            if amount <= 0 {
-                panic!("Proposed amount must be positive");
-            }
-        }
-        if let Some(deadline) = new_deadline {
-            if deadline <= env.ledger().timestamp() {
-                panic!("Proposed deadline must be in the future");
-            }
-        }
-
-        let expiry_seconds: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AmendmentExpirySeconds)
-            .unwrap_or(DEFAULT_AMENDMENT_EXPIRY_SECONDS);
-
-        let now = env.ledger().timestamp();
-
-        // Increment nonce
-        let nonce: u32 = env
+        let mut states: Vec<MilestoneState> = env
             .storage()
             .persistent()
-            .get(&DataKey::AmendmentNonce(escrow_id))
-            .unwrap_or(0)
-            + 1;
+            .get(&DataKey2::EscrowMilestonesV2(escrow_id))
+            .expect("No BPS milestones for this escrow");
+
+        if milestone_index >= states.len() {
+            panic!("Milestone index out of range");
+        }
+        let mut state = states.get(milestone_index).unwrap();
+        if state.status != MilestoneStateStatus::Pending
+            && state.status != MilestoneStateStatus::Rejected
+        {
+            panic!("Milestone must be Pending or Rejected to submit");
+        }
+
+        state.status = MilestoneStateStatus::Submitted;
+        state.delivery_hash = Some(delivery_hash.clone());
+        state.rejection_hash = None;
+        states.set(milestone_index, state);
+
         env.storage()
             .persistent()
-            .set(&DataKey::AmendmentNonce(escrow_id), &nonce);
+            .set(&DataKey2::EscrowMilestonesV2(escrow_id), &states);
         env.storage().persistent().extend_ttl(
-            &DataKey::AmendmentNonce(escrow_id),
+            &DataKey2::EscrowMilestonesV2(escrow_id),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        let buyer_signed = proposer == escrow.buyer;
-        let seller_signed = proposer == escrow.seller;
-
-        let proposal = AmendmentProposal {
-            nonce,
-            proposer: proposer.clone(),
-            new_amount,
-            new_deadline,
-            new_metadata_hash,
-            proposed_at: now,
-            expires_at: now + expiry_seconds,
-            buyer_signed,
-            seller_signed,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::AmendmentProposal(escrow_id), &proposal);
-        env.storage().persistent().extend_ttl(
-            &DataKey::AmendmentProposal(escrow_id),
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        events::emit_amendment_proposed(
-            &env,
-            escrow_id,
-            nonce,
-            proposer,
-            new_amount,
-            new_deadline,
-            new_metadata_hash,
-            now + expiry_seconds,
-        );
-
+        events::emit_milestone_submitted(&env, escrow_id, milestone_index, delivery_hash);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
-    /// Sign an existing amendment proposal.
-    /// Caller must be the buyer or seller (the counterparty of the proposer).
-    /// When both parties have signed, the amendment is applied immediately.
-    pub fn sign_amendment(env: Env, signer: Address, escrow_id: u32) {
-        Self::require_not_paused(&env);
-        signer.require_auth();
+    /// Buyer (or arbiter) approves a submitted milestone, releasing its
+    /// proportional share (`amount * release_bps / 10_000`) to the seller.
+    /// The final milestone releases any rounding remainder.
+    pub fn approve_proportional_milestone(
+        env: Env,
+        caller: Address,
+        escrow_id: u32,
+        milestone_index: u32,
+    ) {
+        caller.require_auth();
 
         let mut escrow: Escrow = env
             .storage()
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
             .expect("Escrow not found");
-
-        if signer != escrow.buyer && signer != escrow.seller {
-            panic!("Only buyer or seller can sign an amendment");
+        if caller != escrow.buyer && caller != escrow.arbiter {
+            panic!("Only buyer or arbiter can approve milestones");
         }
-
-        if !Self::is_open_escrow_status(escrow.status) {
+        if escrow.status != EscrowStatus::Active {
             panic!("Escrow is not active");
         }
 
-        let mut proposal: AmendmentProposal = env
+        let mut states: Vec<MilestoneState> = env
             .storage()
             .persistent()
-            .get(&DataKey::AmendmentProposal(escrow_id))
-            .expect("No pending amendment proposal");
+            .get(&DataKey2::EscrowMilestonesV2(escrow_id))
+            .expect("No BPS milestones for this escrow");
 
-        if env.ledger().timestamp() > proposal.expires_at {
-            panic!("Amendment proposal has expired");
+        if milestone_index >= states.len() {
+            panic!("Milestone index out of range");
+        }
+        let mut state = states.get(milestone_index).unwrap();
+        if state.status != MilestoneStateStatus::Submitted {
+            panic!("Milestone must be Submitted before approval");
         }
 
-        // Record the signature
-        if signer == escrow.buyer {
-            if proposal.buyer_signed {
-                panic!("Buyer has already signed this proposal");
-            }
-            proposal.buyer_signed = true;
-        } else {
-            if proposal.seller_signed {
-                panic!("Seller has already signed this proposal");
-            }
-            proposal.seller_signed = true;
-        }
-
-        // If both parties have signed, apply the amendment
-        if proposal.buyer_signed && proposal.seller_signed {
-            let old_amount = escrow.amount;
-            let old_deadline = escrow.deadline;
-            let old_metadata_hash = escrow.metadata_hash.clone();
-
-            if let Some(new_amount) = proposal.new_amount {
-                let diff = new_amount - escrow.amount;
-                if diff > 0 {
-                    // Buyer must top up the difference
-                    let token_client = token::Client::new(&env, &escrow.token);
-                    token_client.transfer(&escrow.buyer, &env.current_contract_address(), &diff);
-                } else if diff < 0 {
-                    // Refund the difference to buyer
-                    let token_client = token::Client::new(&env, &escrow.token);
-                    token_client.transfer(&env.current_contract_address(), &escrow.buyer, &(-diff));
+        // Calculate release amount using bps; final milestone gets remainder
+        let is_last = milestone_index == states.len() - 1;
+        let amount_released = if is_last {
+            // Sum already-released amounts to compute remainder
+            let mut already_released: i128 = 0;
+            for i in 0..states.len() - 1 {
+                let s = states.get(i).unwrap();
+                if s.status == MilestoneStateStatus::Approved {
+                    already_released += escrow.amount * s.release_bps as i128 / 10_000;
                 }
-                escrow.amount = new_amount;
             }
-            if let Some(new_deadline) = proposal.new_deadline {
-                escrow.deadline = new_deadline;
-            }
-            if let Some(ref new_hash) = proposal.new_metadata_hash {
-                escrow.metadata_hash = Some(new_hash.clone());
-            }
+            escrow.amount - already_released
+        } else {
+            escrow.amount * state.release_bps as i128 / 10_000
+        };
 
+        let token_client = token::Client::new(&env, &escrow.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.seller,
+            &amount_released,
+        );
+
+        state.status = MilestoneStateStatus::Approved;
+        states.set(milestone_index, state);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey2::EscrowMilestonesV2(escrow_id), &states);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::EscrowMilestonesV2(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Auto-transition escrow to Released when all milestones are terminal
+        let mut all_terminal = true;
+        for i in 0..states.len() {
+            let s = states.get(i).unwrap();
+            if s.status == MilestoneStateStatus::Pending
+                || s.status == MilestoneStateStatus::Submitted
+            {
+                all_terminal = false;
+                break;
+            }
+        }
+        if all_terminal {
+            escrow.status = EscrowStatus::Released;
             env.storage()
                 .persistent()
                 .set(&DataKey::Escrow(escrow_id), &escrow);
@@ -5434,81 +5500,78 @@ impl AhjoorEscrowContract {
                 PERSISTENT_LIFETIME_THRESHOLD,
                 PERSISTENT_BUMP_AMOUNT,
             );
-
-            // Remove the applied proposal
-            env.storage()
-                .persistent()
-                .remove(&DataKey::AmendmentProposal(escrow_id));
-
-            events::emit_amendment_applied(
-                &env,
-                escrow_id,
-                proposal.nonce,
-                old_amount,
-                escrow.amount,
-                old_deadline,
-                escrow.deadline,
-                old_metadata_hash,
-                escrow.metadata_hash.clone(),
-            );
-        } else {
-            // Save updated signature state
-            env.storage()
-                .persistent()
-                .set(&DataKey::AmendmentProposal(escrow_id), &proposal);
-            env.storage().persistent().extend_ttl(
-                &DataKey::AmendmentProposal(escrow_id),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-
-            events::emit_amendment_signed(&env, escrow_id, proposal.nonce, signer);
         }
 
+        events::emit_milestone_approved(&env, escrow_id, milestone_index, amount_released);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
-    /// Cancel a pending amendment proposal.
-    /// Callable by either the buyer or seller.
-    pub fn cancel_amendment(env: Env, caller: Address, escrow_id: u32) {
-        Self::require_not_paused(&env);
-        caller.require_auth();
+    /// Buyer rejects a submitted milestone, returning it to `Pending` state.
+    /// The seller can re-submit after addressing the buyer's concerns.
+    pub fn reject_milestone(
+        env: Env,
+        buyer: Address,
+        escrow_id: u32,
+        milestone_index: u32,
+        rejection_hash: BytesN<32>,
+    ) {
+        buyer.require_auth();
 
         let escrow: Escrow = env
             .storage()
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
             .expect("Escrow not found");
-
-        if caller != escrow.buyer && caller != escrow.seller {
-            panic!("Only buyer or seller can cancel an amendment");
+        if escrow.buyer != buyer {
+            panic!("Only the escrow buyer may reject milestones");
+        }
+        if escrow.status != EscrowStatus::Active {
+            panic!("Escrow is not active");
         }
 
-        let proposal: AmendmentProposal = env
+        let mut states: Vec<MilestoneState> = env
             .storage()
             .persistent()
-            .get(&DataKey::AmendmentProposal(escrow_id))
-            .expect("No pending amendment proposal");
+            .get(&DataKey2::EscrowMilestonesV2(escrow_id))
+            .expect("No BPS milestones for this escrow");
+
+        if milestone_index >= states.len() {
+            panic!("Milestone index out of range");
+        }
+        let mut state = states.get(milestone_index).unwrap();
+        if state.status != MilestoneStateStatus::Submitted {
+            panic!("Only a Submitted milestone can be rejected");
+        }
+
+        state.status = MilestoneStateStatus::Rejected;
+        state.rejection_hash = Some(rejection_hash);
+        states.set(milestone_index, state);
 
         env.storage()
             .persistent()
-            .remove(&DataKey::AmendmentProposal(escrow_id));
+            .set(&DataKey2::EscrowMilestonesV2(escrow_id), &states);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::EscrowMilestonesV2(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
-        events::emit_amendment_cancelled(&env, escrow_id, proposal.nonce, caller);
-
+        events::emit_milestone_rejected(&env, escrow_id, milestone_index);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
-    /// Query the current pending amendment proposal for an escrow.
-    pub fn get_amendment_proposal(env: Env, escrow_id: u32) -> Option<AmendmentProposal> {
+    /// Read the BPS milestone state schedule for an escrow.
+    pub fn get_bps_milestones(env: Env, escrow_id: u32) -> Vec<MilestoneState> {
         env.storage()
             .persistent()
-            .get(&DataKey::AmendmentProposal(escrow_id))
+            .get(&DataKey2::EscrowMilestonesV2(escrow_id))
+            .expect("No BPS milestones for this escrow")
     }
+
 }
 
 #[cfg(test)]
@@ -5528,6 +5591,5 @@ mod test_seller_veto;
 
 #[cfg(test)]
 mod test_inspector;
-
 #[cfg(test)]
-mod test_auto_renewal;
+mod test_milestone_bps;

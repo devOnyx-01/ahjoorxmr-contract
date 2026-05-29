@@ -299,17 +299,46 @@ pub enum DataKey3 {
     // #269: On-Chain Member Credit Score
     ScoreWeights,            // ScoreWeights — admin-configurable scoring formula weights
     MinCreditScore,          // i128 — minimum score required to join this group
-    // Slot Auction
-    AuctionEnabled,          // bool — auction feature flag
-    AuctionWindowLedgers,    // u64 — bidding window duration in seconds
-    AuctionOpenUntil,        // u64 — timestamp when current auction window closes (0 = no open auction)
-    AuctionBids,             // Vec<SlotBid> — bids placed in the current auction
-    AuctionRound,            // u32 — the round for which the current auction was opened
-    // Cross-Group Migration
-    MigrationRequests,       // Map<Address, MigrationRequest> — member → pending outbound migration
-    IncomingMigrations,      // Map<Address, IncomingMigration> — member → pending inbound migration
-    MigratedMembers,         // Map<Address, MigratedMemberRecord> — member → migration annotation
-    VacantSlots,             // Vec<u32> — slot indices freed by migrated-out members
+    // #330: Contribution Delegation
+    ContribDelegations,      // Map<Address, ContribDelegationRecord> — member → delegation
+    // #331: Group Split
+    SplitProposalCounter,    // u32
+    SplitProposals,          // Map<u32, SplitProposal>
+    SplitConfirmationWindow, // u32 — ledgers members have to confirm
+}
+
+// ── #330: Contribution Delegation ────────────────────────────────────────────
+
+/// Delegation record granting a proxy the right to act for a member.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContribDelegationRecord {
+    pub proxy: Address,
+    pub expiry_ledger: u64,
+}
+
+// ── #331: Group Split ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum SplitProposalStatus {
+    Pending = 0,
+    Executed = 1,
+    Expired = 2,
+}
+
+/// Proposal to divide one ROSCA group into two independent sub-groups.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitProposal {
+    pub id: u32,
+    pub group_a_members: Vec<Address>,
+    pub group_b_members: Vec<Address>,
+    pub split_reason_hash: BytesN<32>,
+    pub confirmations: Vec<Address>,
+    pub status: SplitProposalStatus,
+    pub created_at_ledger: u32,
+    pub expiry_ledger: u32,
 }
 
 /// Persistent storage keys — kept separate because DataKey was hitting
@@ -431,6 +460,8 @@ pub enum GroupStatus {
     Dissolved = 1,
     /// Group was merged into another group; all further interactions are rejected.
     Merged = 2,
+    /// Group was split into two sub-groups; no further operations permitted.
+    Split = 3,
 }
 
 #[contracttype]
