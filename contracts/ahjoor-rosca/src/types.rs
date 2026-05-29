@@ -58,6 +58,10 @@ pub struct RoscaConfig {
     /// Number of ledger timestamps (seconds) the bidding window stays open.
     /// Ignored when auction_enabled = false.
     pub auction_window_ledgers: u64,
+    /// Enable emergency reserve for this group (#313)
+    pub reserve_enabled: bool,
+    /// Surcharge percentage (bps) on each contribution routed to emergency reserve (#313)
+    pub reserve_contribution_bps: u32,
 }
 
 #[contracttype]
@@ -310,6 +314,11 @@ pub enum DataKey3 {
     IncomingMigrations,      // Map<Address, IncomingMigration> — member → pending inbound migration
     MigratedMembers,         // Map<Address, MigratedMemberRecord> — member → migration annotation
     VacantSlots,             // Vec<u32> — slot indices freed by migrated-out members
+    // #313: Emergency Liquidity Reserve
+    EmergencyReserveBalance, // i128 — total balance in emergency reserve
+    EmergencyLoanCounter,    // u32 — counter for loan IDs
+    EmergencyLoan,           // Map<u32, EmergencyLoan> — loan_id → loan record
+    MemberOutstandingLoan,   // Map<Address, u32> — member → active loan_id (0 = none)
 }
 
 /// Persistent storage keys — kept separate because DataKey was hitting
@@ -422,6 +431,20 @@ pub struct EmergencyPayoutConfig {
     pub emergency_quorum_bps: u32,      // e.g., 6667 = 66.67%
     pub vote_window_seconds: u64,       // how long voting lasts
     pub max_emergency_per_cycle: u32,   // max emergency payouts per cycle
+}
+
+// --- Emergency Liquidity Reserve Types (#313) ---
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyLoan {
+    pub loan_id: u32,
+    pub borrower: Address,
+    pub amount: i128,
+    pub created_at_ledger: u32,
+    pub repayment_deadline_ledger: u32,
+    pub repaid_amount: i128,
+    pub defaulted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

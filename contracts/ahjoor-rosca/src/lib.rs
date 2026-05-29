@@ -7315,6 +7315,242 @@ impl AhjoorContract {
         }
     }
 
+    // --- Emergency Liquidity Reserve (#313) ---
+
+    /// Request an emergency loan from the group reserve
+    pub fn request_emergency_loan(
+        env: Env,
+        member: Address,
+        amount: i128,
+        repayment_window_ledgers: u32,
+    ) -> u32 {
+        member.require_auth();
+
+        if amount <= 0 {
+            panic!("Loan amount must be positive");
+        }
+
+        // Check if reserve is enabled
+        let reserve_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey2::ReserveEnabled)
+            .unwrap_or(false);
+        if !reserve_enabled {
+            panic!("Emergency reserve is not enabled for this group");
+        }
+
+        // Check if member already has an outstanding loan
+        let existing_loan_id: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::MemberOutstandingLoan(member.clone()))
+            .unwrap_or(0);
+        if existing_loan_id > 0 {
+            panic!("ExistingLoanOutstanding: member already has an active loan");
+        }
+
+        // Get reserve balance
+        let reserve_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::EmergencyReserveBalance)
+            .unwrap_or(0);
+
+        if reserve_balance < amount {
+            panic!("Insufficient reserve balance for loan");
+        }
+
+        // Check MAX_LOAN_FRACTION_BPS (default 50% of reserve)
+        const MAX_LOAN_FRACTION_BPS: u32 = 5_000; // 50%
+        let max_loan = (reserve_balance * MAX_LOAN_FRACTION_BPS as i128) / 10_000;
+        if amount > max_loan {
+            panic!("Loan amount exceeds maximum allowed fraction of reserve");
+        }
+
+        // Create loan record
+        let loan_id = Self::next_emergency_loan_id(&env);
+        let current_ledger = env.ledger().sequence();
+        let repayment_deadline = current_ledger + repayment_window_ledgers;
+
+        let loan = EmergencyLoan {
+            loan_id,
+            borrower: member.clone(),
+            amount,
+            created_at_ledger: current_ledger,
+            repayment_deadline_ledger: repayment_deadline,
+            repaid_amount: 0,
+            defaulted: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey3::EmergencyLoan(loan_id), &loan);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::EmergencyLoan(loan_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Track member's active loan
+        env.storage()
+            .persistent()
+            .set(&DataKey3::MemberOutstandingLoan(member.clone()), &loan_id);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::MemberOutstandingLoan(member.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Deduct from reserve and transfer to member
+        let new_reserve = reserve_balance - amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey3::EmergencyReserveBalance, &new_reserve);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::EmergencyReserveBalance,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not configured");
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &member, &amount);
+
+        events::emit_emergency_loan_granted(&env, 0, member, loan_id, amount, repayment_deadline);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        loan_id
+    }
+
+    /// Repay an emergency loan (partial or full)
+    pub fn repay_emergency_loan(env: Env, member: Address, loan_id: u32, amount: i128) {
+        member.require_auth();
+
+        if amount <= 0 {
+            panic!("Repayment amount must be positive");
+        }
+
+        let mut loan: EmergencyLoan = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::EmergencyLoan(loan_id))
+            .expect("Loan not found");
+
+        if loan.borrower != member {
+            panic!("Only the borrower can repay this loan");
+        }
+
+        if loan.defaulted {
+            panic!("Loan has defaulted and cannot be repaid");
+        }
+
+        let remaining_owed = loan.amount - loan.repaid_amount;
+        if amount > remaining_owed {
+            panic!("Repayment amount exceeds remaining balance");
+        }
+
+        loan.repaid_amount += amount;
+
+        // If fully repaid, clear member's outstanding loan
+        if loan.repaid_amount >= loan.amount {
+            env.storage()
+                .persistent()
+                .remove(&DataKey3::MemberOutstandingLoan(member.clone()));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey3::EmergencyLoan(loan_id), &loan);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::EmergencyLoan(loan_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Transfer repayment to reserve
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not configured");
+        let client = token::Client::new(&env, &token);
+        client.transfer(&member, &env.current_contract_address(), &amount);
+
+        // Add to reserve balance
+        let reserve_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::EmergencyReserveBalance)
+            .unwrap_or(0);
+        let new_reserve = reserve_balance + amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey3::EmergencyReserveBalance, &new_reserve);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::EmergencyReserveBalance,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let new_remaining = loan.amount - loan.repaid_amount;
+        events::emit_emergency_loan_repaid(&env, 0, loan_id, amount, new_remaining);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get emergency loan details
+    pub fn get_emergency_loan(env: Env, loan_id: u32) -> EmergencyLoan {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::EmergencyLoan(loan_id))
+            .expect("Loan not found")
+    }
+
+    /// Get member's active loan ID (0 if none)
+    pub fn get_member_active_loan(env: Env, member: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::MemberOutstandingLoan(member))
+            .unwrap_or(0)
+    }
+
+    /// Get emergency reserve balance
+    pub fn get_emergency_reserve_balance(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::EmergencyReserveBalance)
+            .unwrap_or(0)
+    }
+
+    /// Internal: Get next emergency loan ID
+    fn next_emergency_loan_id(env: &Env) -> u32 {
+        let counter: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::EmergencyLoanCounter)
+            .unwrap_or(0);
+        let next_id = counter + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey3::EmergencyLoanCounter, &next_id);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::EmergencyLoanCounter,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        next_id
+    }
+
 }
 
 mod test;
