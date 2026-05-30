@@ -1,10 +1,10 @@
 #![no_std]
+use ahjoor_token_whitelist::TokenWhitelistClient;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     BytesN, Env, Map, String, Symbol, Vec,
 };
-use ahjoor_token_whitelist::TokenWhitelistClient;
 
 pub mod multi_token_invoice;
 pub mod multi_token_invoice_impl;
@@ -43,6 +43,16 @@ mod oracle {
     #[contractclient(name = "OracleClient")]
     pub trait OracleInterface {
         fn lastprice(env: Env, base: Address, quote: Address) -> Option<PriceData>;
+    }
+}
+
+mod refund_reserve {
+    use soroban_sdk::{contractclient, Address, Env};
+
+    #[allow(dead_code)]
+    #[contractclient(name = "RefundReserveClient")]
+    pub trait RefundReserveInterface {
+        fn check_merchant_reserve(env: Env, merchant: Address) -> bool;
     }
 }
 
@@ -168,6 +178,12 @@ pub enum Error {
     MaxExtensionsReached = 26,
     /// Additional ledgers exceed the maximum allowed per extension
     MaxExtensionLedgersExceeded = 27,
+    /// Subscription pause count exceeded (#327)
+    PauseCountExceeded = 30,
+    /// Unauthorized to pause subscription (#327)
+    UnauthorizedPause = 31,
+    /// Merchant refund reserve is below the configured minimum (#334)
+    InsufficientMerchantReserve = 32,
 }
 
 /// Per-merchant withdrawal rate limit config (#231).
@@ -481,6 +497,9 @@ const DEFAULT_MAX_PAYMENT_EXPIRY: u64 = 30 * 24 * 60 * 60;
 /// Maximum allowed `page_size` for `get_customer_payments_page` (#132).
 pub const MAX_CUSTOMER_PAYMENTS_PAGE_SIZE: u32 = 50;
 
+/// Max pauses per subscription before denial (#327)
+const MAX_SUBSCRIPTION_PAUSES: u32 = 3;
+
 /// Paginated view over a customer's payment IDs (#132).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -510,6 +529,10 @@ pub struct Subscription {
     /// Ledger timestamp at which the trial ends and the first charge becomes
     /// available. 0 = no trial (immediate first charge). (#133)
     pub trial_ends_at: u64,
+    /// Who can authorize pause (#327)
+    pub pause_authority: PauseAuthority,
+    /// Count of times this subscription has been paused (#327)
+    pub pause_count: u32,
 }
 
 #[contracttype]
@@ -605,6 +628,15 @@ pub struct CustomerRateLimit {
 pub enum DiscountType {
     Percentage,
     Fixed,
+}
+
+/// Who is authorized to pause a subscription (#327)
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PauseAuthority {
+    Subscriber = 0,
+    Merchant = 1,
+    Both = 2,
 }
 
 /// Per-merchant multi-sig approval policy.
@@ -855,6 +887,8 @@ pub enum DataKey2 {
     MaxExtensionLedgers,
     /// Instance: maximum number of extensions per payment
     MaxExtensions,
+    /// Instance: refund contract used for merchant reserve enforcement (#334)
+    RefundContract,
     /// Persistent: installment payment plan
     PaymentPlan(u32),
 }
@@ -965,9 +999,10 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .set(&DataKey::FeeTiers, &Vec::<FeeTier>::new(&env));
-        env.storage()
-            .instance()
-            .set(&DataKey2::MaxExtensionLedgers, &DEFAULT_MAX_EXTENSION_LEDGERS);
+        env.storage().instance().set(
+            &DataKey2::MaxExtensionLedgers,
+            &DEFAULT_MAX_EXTENSION_LEDGERS,
+        );
         env.storage()
             .instance()
             .set(&DataKey2::MaxExtensions, &DEFAULT_MAX_EXTENSIONS);
@@ -1134,6 +1169,7 @@ impl AhjoorPaymentsContract {
 
         // Merchant allowlist check (#58)
         Self::require_merchant_approved(&env, &merchant);
+        Self::require_merchant_reserve(&env, &merchant);
 
         // Blocklist lazy-expiry check: if customer is blocked, reject unless entry expired
         if env
@@ -1714,19 +1750,12 @@ impl AhjoorPaymentsContract {
             // For simplicity we slash collateral equal to the full disputed amount
             // only when the payment token is the collateral token (USDC), so the
             // slash covers the exact economic loss.
-            let usdc_token: Option<Address> = env
-                .storage()
-                .instance()
-                .get(&DataKey::UsdcToken);
+            let usdc_token: Option<Address> = env.storage().instance().get(&DataKey::UsdcToken);
             if let Some(ref usdc) = usdc_token {
                 if payment.token == *usdc && owed_to_customer > 0 {
-                    let collateral_key =
-                        DataKey::MerchantCollateral(payment.merchant.clone());
-                    let collateral: i128 = env
-                        .storage()
-                        .persistent()
-                        .get(&collateral_key)
-                        .unwrap_or(0);
+                    let collateral_key = DataKey::MerchantCollateral(payment.merchant.clone());
+                    let collateral: i128 =
+                        env.storage().persistent().get(&collateral_key).unwrap_or(0);
 
                     if collateral > 0 {
                         // Slash up to the full owed amount, capped by available collateral.
@@ -1824,7 +1853,8 @@ impl AhjoorPaymentsContract {
                 payment_id,
                 customer_evidence: Vec::new(&env),
                 merchant_evidence: Vec::new(&env),
-                evidence_window_close_ledger: env.ledger().sequence() + Self::get_evidence_window_ledgers(&env),
+                evidence_window_close_ledger: env.ledger().sequence()
+                    + Self::get_evidence_window_ledgers(&env),
                 resolution_note_hash: None,
             });
 
@@ -1840,12 +1870,16 @@ impl AhjoorPaymentsContract {
             if evidence_record.customer_evidence.len() >= max_submissions as usize {
                 panic_with_error!(&env, Error::EvidenceLimitReached);
             }
-            evidence_record.customer_evidence.push_back((evidence_hash, current_ledger as u64));
+            evidence_record
+                .customer_evidence
+                .push_back((evidence_hash, current_ledger as u64));
         } else {
             if evidence_record.merchant_evidence.len() >= max_submissions as usize {
                 panic_with_error!(&env, Error::EvidenceLimitReached);
             }
-            evidence_record.merchant_evidence.push_back((evidence_hash, current_ledger as u64));
+            evidence_record
+                .merchant_evidence
+                .push_back((evidence_hash, current_ledger as u64));
         }
 
         env.storage()
@@ -1857,7 +1891,13 @@ impl AhjoorPaymentsContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_dispute_evidence_submitted(&env, payment_id, caller, evidence_hash, evidence_type);
+        events::emit_dispute_evidence_submitted(
+            &env,
+            payment_id,
+            caller,
+            evidence_hash,
+            evidence_type,
+        );
 
         env.storage()
             .instance()
@@ -1958,7 +1998,8 @@ impl AhjoorPaymentsContract {
         }
 
         // Create payment normally
-        let payment_id = Self::create_payment(env.clone(), customer.clone(), merchant, amount, token);
+        let payment_id =
+            Self::create_payment(env.clone(), customer.clone(), merchant, amount, token);
 
         // Store cooling-off config if enabled
         if cooling_off_ledgers > 0 {
@@ -2010,11 +2051,7 @@ impl AhjoorPaymentsContract {
 
         // Refund full amount to customer
         let client = token::Client::new(&env, &payment.token);
-        client.transfer(
-            &env.current_contract_address(),
-            &customer,
-            &payment.amount,
-        );
+        client.transfer(&env.current_contract_address(), &customer, &payment.amount);
 
         payment.status = PaymentStatus::CancelledInCoolingOff;
         payment.refunded_amount = payment.amount;
@@ -2632,9 +2669,14 @@ impl AhjoorPaymentsContract {
         if default_bps < min_bps || default_bps > max_bps {
             panic!("default_bps must be within [min_bps, max_bps]");
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::SlippageConfig, &SlippageConfig { default_bps, min_bps, max_bps });
+        env.storage().instance().set(
+            &DataKey::SlippageConfig,
+            &SlippageConfig {
+                default_bps,
+                min_bps,
+                max_bps,
+            },
+        );
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -2692,7 +2734,12 @@ impl AhjoorPaymentsContract {
     /// Merchant extends a pending payment's expiry by additional_ledgers.
     /// additional_ledgers must not exceed max_extension_ledgers.
     /// A payment can be extended up to max_extensions times.
-    pub fn extend_payment_expiry(env: Env, merchant: Address, payment_id: u32, additional_ledgers: u32) {
+    pub fn extend_payment_expiry(
+        env: Env,
+        merchant: Address,
+        payment_id: u32,
+        additional_ledgers: u32,
+    ) {
         Self::require_not_paused(&env);
         merchant.require_auth();
 
@@ -2738,7 +2785,10 @@ impl AhjoorPaymentsContract {
 
         // Okay, so expires_at is a timestamp in seconds! So how do we handle additional_ledgers? Let's check if the codebase has a way to convert ledgers to time, or if maybe we should just treat additional_ledgers as seconds? Wait let's check the DEFAULT_MAX_EXTENSION_LEDGERS we set earlier: we set it to 30 days in seconds divided by 5, assuming 5s per ledger! So let's multiply additional_ledgers by 5 seconds to get the additional time!
         let additional_seconds = additional_ledgers as u64 * 5;
-        payment.expires_at = payment.expires_at.checked_add(additional_seconds).expect("Expiry overflow");
+        payment.expires_at = payment
+            .expires_at
+            .checked_add(additional_seconds)
+            .expect("Expiry overflow");
         payment.extension_count += 1;
 
         env.storage()
@@ -2750,7 +2800,12 @@ impl AhjoorPaymentsContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_payment_expiry_extended(&env, payment_id, payment.expires_at, payment.extension_count);
+        events::emit_payment_expiry_extended(
+            &env,
+            payment_id,
+            payment.expires_at,
+            payment.extension_count,
+        );
 
         env.storage()
             .instance()
@@ -2792,7 +2847,13 @@ impl AhjoorPaymentsContract {
         if cap_amount == 0 {
             env.storage().persistent().remove(&key);
         } else {
-            env.storage().persistent().set(&key, &VolumeCap { cap_amount, window_seconds });
+            env.storage().persistent().set(
+                &key,
+                &VolumeCap {
+                    cap_amount,
+                    window_seconds,
+                },
+            );
             env.storage().persistent().extend_ttl(
                 &key,
                 PERSISTENT_LIFETIME_THRESHOLD,
@@ -3121,7 +3182,12 @@ impl AhjoorPaymentsContract {
                 PERSISTENT_BUMP_AMOUNT,
             );
             events::emit_payment_approval_expired(&env, payment_id);
-            events::emit_payment_status_changed(&env, payment_id, old_status, PaymentStatus::Refunded);
+            events::emit_payment_status_changed(
+                &env,
+                payment_id,
+                old_status,
+                PaymentStatus::Refunded,
+            );
             env.storage()
                 .instance()
                 .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -3150,7 +3216,12 @@ impl AhjoorPaymentsContract {
                 PERSISTENT_LIFETIME_THRESHOLD,
                 PERSISTENT_BUMP_AMOUNT,
             );
-            events::emit_payment_status_changed(&env, payment_id, old_status, PaymentStatus::Pending);
+            events::emit_payment_status_changed(
+                &env,
+                payment_id,
+                old_status,
+                PaymentStatus::Pending,
+            );
         } else {
             env.storage()
                 .persistent()
@@ -3275,7 +3346,15 @@ impl AhjoorPaymentsContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_voucher_issued(&env, merchant, code_hash, voucher.discount_type.clone(), discount_value, max_uses, expiry);
+        events::emit_voucher_issued(
+            &env,
+            merchant,
+            code_hash,
+            voucher.discount_type.clone(),
+            discount_value,
+            max_uses,
+            expiry,
+        );
 
         env.storage()
             .instance()
@@ -3412,7 +3491,13 @@ impl AhjoorPaymentsContract {
                 PERSISTENT_BUMP_AMOUNT,
             );
 
-            events::emit_voucher_redeemed(&env, merchant.clone(), code_hash.clone(), customer.clone(), discount);
+            events::emit_voucher_redeemed(
+                &env,
+                merchant.clone(),
+                code_hash.clone(),
+                customer.clone(),
+                discount,
+            );
             if exhausted {
                 events::emit_voucher_exhausted(&env, merchant.clone(), code_hash.clone());
             }
@@ -3427,7 +3512,11 @@ impl AhjoorPaymentsContract {
         }
 
         let client = token::Client::new(&env, &token);
-        client.transfer(&customer, &env.current_contract_address(), &effective_amount);
+        client.transfer(
+            &customer,
+            &env.current_contract_address(),
+            &effective_amount,
+        );
 
         let timeout: u64 = env
             .storage()
@@ -3532,7 +3621,14 @@ impl AhjoorPaymentsContract {
         Self::inc_global_created(&env);
         Self::inc_merchant_created(&env, &merchant);
 
-        events::emit_payment_created(&env, payment_id, customer, merchant, effective_amount, token);
+        events::emit_payment_created(
+            &env,
+            payment_id,
+            customer,
+            merchant,
+            effective_amount,
+            token,
+        );
 
         env.storage()
             .instance()
@@ -3612,9 +3708,7 @@ impl AhjoorPaymentsContract {
 
         let total_count = all.len();
         let start = page.saturating_mul(page_size);
-        let end = start
-            .saturating_add(page_size)
-            .min(total_count);
+        let end = start.saturating_add(page_size).min(total_count);
 
         let mut slice = Vec::new(&env);
         if start < end {
@@ -3714,6 +3808,14 @@ impl AhjoorPaymentsContract {
             .instance()
             .get(&DataKey::PaymentTimeout)
             .unwrap_or(DEFAULT_PAYMENT_TIMEOUT)
+    }
+
+    pub fn set_refund_contract(env: Env, admin: Address, refund_contract: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey2::RefundContract, &refund_contract);
     }
 
     // --- Per-payment expiry bounds (#130) ---
@@ -4212,9 +4314,7 @@ impl AhjoorPaymentsContract {
             panic!("Only admin can set swap router");
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::SwapRouter, &router);
+        env.storage().instance().set(&DataKey::SwapRouter, &router);
 
         events::emit_swap_router_set(&env, router);
 
@@ -4225,9 +4325,7 @@ impl AhjoorPaymentsContract {
 
     /// Get the configured swap router address.
     pub fn get_swap_router(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::SwapRouter)
+        env.storage().instance().get(&DataKey::SwapRouter)
     }
 
     // --- Token Whitelist Integration ---
@@ -4342,7 +4440,11 @@ impl AhjoorPaymentsContract {
 
         let now = env.ledger().timestamp();
         let trial_seconds = trial_period_seconds.unwrap_or(0);
-        let trial_ends_at = if trial_seconds > 0 { now + trial_seconds } else { 0 };
+        let trial_ends_at = if trial_seconds > 0 {
+            now + trial_seconds
+        } else {
+            0
+        };
 
         let sub = Subscription {
             id: sub_id,
@@ -4358,6 +4460,8 @@ impl AhjoorPaymentsContract {
             paused: false,
             paused_at: 0,
             trial_ends_at,
+            pause_authority: PauseAuthority::Subscriber, // Default to subscriber only
+            pause_count: 0,
         };
 
         env.storage()
@@ -4581,6 +4685,146 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// #327: Pause subscription with authority enforcement and pause count tracking.
+    pub fn pause_subscription_v2(env: Env, caller: Address, sub_id: u32, reason_hash: BytesN<32>) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Subscription(sub_id))
+            .expect("Subscription not found");
+
+        // Check pause authority
+        let is_subscriber = sub.subscriber == caller;
+        let is_merchant = sub.merchant == caller;
+        match sub.pause_authority {
+            PauseAuthority::Subscriber if !is_subscriber => {
+                panic_with_error!(&env, Error::UnauthorizedPause)
+            }
+            PauseAuthority::Merchant if !is_merchant => {
+                panic_with_error!(&env, Error::UnauthorizedPause)
+            }
+            PauseAuthority::Both if !is_subscriber && !is_merchant => {
+                panic_with_error!(&env, Error::UnauthorizedPause)
+            }
+            _ => {}
+        }
+
+        if !sub.active || sub.paused {
+            panic!("Invalid subscription state");
+        }
+
+        // Check pause count limit
+        if sub.pause_count >= MAX_SUBSCRIPTION_PAUSES {
+            panic_with_error!(&env, Error::PauseCountExceeded);
+        }
+
+        sub.paused = true;
+        sub.paused_at = env.ledger().sequence() as u64;
+        sub.pause_count += 1;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(sub_id), &sub);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Subscription(sub_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_subscription_paused_v2(&env, sub_id, caller, env.ledger().sequence());
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// #327: Resume subscription with prorated billing recalculation.
+    pub fn resume_subscription_v2(env: Env, caller: Address, sub_id: u32) -> u32 {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Subscription(sub_id))
+            .expect("Subscription not found");
+
+        // Only subscriber or merchant can resume
+        let is_subscriber = sub.subscriber == caller;
+        let is_merchant = sub.merchant == caller;
+        if !is_subscriber && !is_merchant {
+            panic!("Unauthorized resume");
+        }
+
+        if !sub.active || !sub.paused {
+            panic!("Invalid subscription state");
+        }
+
+        sub.paused = false;
+        sub.paused_at = 0;
+
+        // Prorated billing: next_due_ledger = current_ledger + interval_ledgers
+        // Convert interval_seconds to approximate ledgers (~5s per ledger)
+        let interval_ledgers = ((sub.interval_seconds + 4) / 5) as u32; // Round up
+        let next_due_ledger = env.ledger().sequence() + interval_ledgers;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(sub_id), &sub);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Subscription(sub_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_subscription_resumed_v2(&env, sub_id, caller, next_due_ledger);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        next_due_ledger
+    }
+
+    /// #327: Admin force resume a paused subscription.
+    pub fn admin_resume_subscription(env: Env, admin: Address, sub_id: u32) -> u32 {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Subscription(sub_id))
+            .expect("Subscription not found");
+
+        if !sub.active || !sub.paused {
+            panic!("Invalid subscription state");
+        }
+
+        sub.paused = false;
+        sub.paused_at = 0;
+
+        let interval_ledgers = ((sub.interval_seconds + 4) / 5) as u32;
+        let next_due_ledger = env.ledger().sequence() + interval_ledgers;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(sub_id), &sub);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Subscription(sub_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_subscription_resumed_v2(&env, sub_id, admin, next_due_ledger);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        next_due_ledger
     }
 
     // --- Payment Categories (#122) ---
@@ -5040,7 +5284,10 @@ impl AhjoorPaymentsContract {
         if cap <= 0 {
             panic!("Cap must be positive");
         }
-        let limit = WithdrawalLimit { window_seconds, cap };
+        let limit = WithdrawalLimit {
+            window_seconds,
+            cap,
+        };
         env.storage()
             .persistent()
             .set(&DataKey2::MerchantWithdrawalLimit(merchant.clone()), &limit);
@@ -5082,7 +5329,10 @@ impl AhjoorPaymentsContract {
                     .get(&DataKey2::WithdrawalWindowSeconds)
                     .unwrap_or(24 * 60 * 60)
             });
-        let limit = WithdrawalLimit { window_seconds, cap };
+        let limit = WithdrawalLimit {
+            window_seconds,
+            cap,
+        };
         env.storage()
             .persistent()
             .set(&DataKey2::MerchantWithdrawalLimit(merchant.clone()), &limit);
@@ -5101,25 +5351,24 @@ impl AhjoorPaymentsContract {
     /// Panics with WithdrawalRateLimitExceeded if the cap would be exceeded.
     fn check_and_update_withdrawal_rate_limit(env: &Env, merchant: &Address, amount: i128) {
         // Determine effective limit: merchant-specific > global default > no limit
-        let (window_seconds, cap) = if let Some(limit) = env
-            .storage()
-            .persistent()
-            .get::<DataKey2, WithdrawalLimit>(&DataKey2::MerchantWithdrawalLimit(merchant.clone()))
-        {
-            (limit.window_seconds, limit.cap)
-        } else if let (Some(w), Some(c)) = (
-            env.storage()
-                .instance()
-                .get::<DataKey2, u64>(&DataKey2::WithdrawalWindowSeconds),
-            env.storage()
-                .instance()
-                .get::<DataKey2, i128>(&DataKey2::WithdrawalWindowCap),
-        ) {
-            (w, c)
-        } else {
-            // No rate limit configured — allow
-            return;
-        };
+        let (window_seconds, cap) =
+            if let Some(limit) = env.storage().persistent().get::<DataKey2, WithdrawalLimit>(
+                &DataKey2::MerchantWithdrawalLimit(merchant.clone()),
+            ) {
+                (limit.window_seconds, limit.cap)
+            } else if let (Some(w), Some(c)) = (
+                env.storage()
+                    .instance()
+                    .get::<DataKey2, u64>(&DataKey2::WithdrawalWindowSeconds),
+                env.storage()
+                    .instance()
+                    .get::<DataKey2, i128>(&DataKey2::WithdrawalWindowCap),
+            ) {
+                (w, c)
+            } else {
+                // No rate limit configured — allow
+                return;
+            };
 
         let now = env.ledger().timestamp();
         let state_key = DataKey2::MerchantWithdrawalWindow(merchant.clone());
@@ -5206,7 +5455,12 @@ impl AhjoorPaymentsContract {
         // #246: Recompute token amount at current oracle rate for dynamic payments
         Self::settle_dynamic_payment_if_needed(env, &mut payment);
         // #235: Check customer spend limit before finalizing
-        Self::check_and_update_customer_spend_limit(env, &payment.merchant, &payment.customer, payment.amount);
+        Self::check_and_update_customer_spend_limit(
+            env,
+            &payment.merchant,
+            &payment.customer,
+            payment.amount,
+        );
 
         Self::finalize_payment(env, payment_id, &mut payment);
     }
@@ -5346,7 +5600,11 @@ impl AhjoorPaymentsContract {
         let refund_amount = payment.amount - payment.refunded_amount;
         if refund_amount > 0 {
             let client = token::Client::new(&env, &payment.token);
-            client.transfer(&env.current_contract_address(), &payment.customer, &refund_amount);
+            client.transfer(
+                &env.current_contract_address(),
+                &payment.customer,
+                &refund_amount,
+            );
         }
 
         let old_status = payment.status;
@@ -5413,11 +5671,11 @@ impl AhjoorPaymentsContract {
         // For now, we simulate a swap by checking if the router is set
         // In a real implementation, this would call the DEX router contract
         // to execute the swap and return the output amount
-        
+
         // Placeholder: In production, this would invoke the router contract
         // For now, we return the input amount as if swap happened 1:1
         // This is where you'd integrate with actual DEX contracts like Soroban AMM
-        
+
         // Simulate swap success with 1:1 rate (placeholder)
         // Real implementation would call router.swap() and handle slippage
         Ok(input_amount)
@@ -5476,7 +5734,12 @@ impl AhjoorPaymentsContract {
         */
 
         // --- Volume cap check (#131) ---
-        Self::check_and_update_merchant_volume_cap(env, payment_id, &payment.merchant, payment.amount);
+        Self::check_and_update_merchant_volume_cap(
+            env,
+            payment_id,
+            &payment.merchant,
+            payment.amount,
+        );
 
         // --- Token Swap: Convert payment token to merchant's preferred token ---
         let mut final_token = payment.token.clone();
@@ -5487,15 +5750,12 @@ impl AhjoorPaymentsContract {
             .storage()
             .instance()
             .get(&DataKey::PreferredToken(payment.merchant.clone()));
-        
+
         if let Some(preferred) = preferred_token {
             if payment.token != preferred {
                 // Swap is needed
-                let router: Option<Address> = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::SwapRouter);
-                
+                let router: Option<Address> = env.storage().instance().get(&DataKey::SwapRouter);
+
                 if let Some(router_addr) = router {
                     // Attempt swap
                     let swap_result = Self::execute_token_swap(
@@ -5506,7 +5766,7 @@ impl AhjoorPaymentsContract {
                         &preferred,
                         payment.amount,
                     );
-                    
+
                     match swap_result {
                         Ok(swapped_amount) => {
                             final_token = preferred.clone();
@@ -5530,7 +5790,7 @@ impl AhjoorPaymentsContract {
                                 &payment.customer,
                                 &payment.amount,
                             );
-                            
+
                             let old_status = payment.status;
                             payment.status = PaymentStatus::Refunded;
                             env.storage()
@@ -5541,11 +5801,16 @@ impl AhjoorPaymentsContract {
                                 PERSISTENT_LIFETIME_THRESHOLD,
                                 PERSISTENT_BUMP_AMOUNT,
                             );
-                            
+
                             Self::inc_global_refunded(env, &payment.token, payment.amount);
-                            Self::inc_merchant_refunded(env, &payment.merchant, &payment.token, payment.amount);
+                            Self::inc_merchant_refunded(
+                                env,
+                                &payment.merchant,
+                                &payment.token,
+                                payment.amount,
+                            );
                             Self::inc_merchant_failed(env, &payment.merchant); // #226
-                            
+
                             events::emit_payment_swap_failed(
                                 env,
                                 payment_id,
@@ -5554,8 +5819,13 @@ impl AhjoorPaymentsContract {
                                 payment.amount,
                                 reason,
                             );
-                            events::emit_payment_status_changed(env, payment_id, old_status, PaymentStatus::Refunded);
-                            
+                            events::emit_payment_status_changed(
+                                env,
+                                payment_id,
+                                old_status,
+                                PaymentStatus::Refunded,
+                            );
+
                             env.storage()
                                 .instance()
                                 .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -5603,18 +5873,19 @@ impl AhjoorPaymentsContract {
         }
 
         let old_status = payment.status;
-        
+
         // Check if cooling-off is enabled for this payment (#309)
         let cooling_off_config: Option<CoolingOffConfig> = env
             .storage()
             .persistent()
             .get(&DataKey2::CoolingOffConfig(payment_id));
-        
+
         if let Some(mut config) = cooling_off_config {
             if config.cooling_off_ledgers > 0 {
                 // Set status to CoolingOff instead of Completed
                 payment.status = PaymentStatus::CoolingOff;
-                config.cooling_off_expiry_ledger = env.ledger().sequence() + config.cooling_off_ledgers;
+                config.cooling_off_expiry_ledger =
+                    env.ledger().sequence() + config.cooling_off_ledgers;
                 env.storage()
                     .persistent()
                     .set(&DataKey2::CoolingOffConfig(payment_id), &config);
@@ -5989,6 +6260,20 @@ impl AhjoorPaymentsContract {
         }
     }
 
+    fn require_merchant_reserve(env: &Env, merchant: &Address) {
+        if let Some(addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey2, Address>(&DataKey2::RefundContract)
+        {
+            if !refund_reserve::RefundReserveClient::new(env, &addr)
+                .check_merchant_reserve(merchant)
+            {
+                panic_with_error!(env, Error::InsufficientMerchantReserve);
+            }
+        }
+    }
+
     /// Validate optional reference string: max 64 bytes (#67).
     fn validate_reference(env: &Env, reference: &Option<String>) {
         if let Some(r) = reference {
@@ -6153,20 +6438,24 @@ impl AhjoorPaymentsContract {
 
         // #226: Track pending count in MerchantSummary
         let key = DataKey2::MerchantSummary(merchant.clone());
-        let mut summary: MerchantSummary = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(MerchantSummary {
-                total_volume: 0,
-                completed_count: 0,
-                failed_count: 0,
-                pending_count: 0,
-                volume_by_token: Map::new(env),
-            });
+        let mut summary: MerchantSummary =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantSummary {
+                    total_volume: 0,
+                    completed_count: 0,
+                    failed_count: 0,
+                    pending_count: 0,
+                    volume_by_token: Map::new(env),
+                });
         summary.pending_count += 1;
         env.storage().persistent().set(&key, &summary);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     fn inc_merchant_completed(env: &Env, merchant: &Address, token: &Address, amount: i128) {
@@ -6178,43 +6467,57 @@ impl AhjoorPaymentsContract {
 
         // #226: Update MerchantSummary
         let key = DataKey2::MerchantSummary(merchant.clone());
-        let mut summary: MerchantSummary = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(MerchantSummary {
-                total_volume: 0,
-                completed_count: 0,
-                failed_count: 0,
-                pending_count: 0,
-                volume_by_token: Map::new(env),
-            });
+        let mut summary: MerchantSummary =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantSummary {
+                    total_volume: 0,
+                    completed_count: 0,
+                    failed_count: 0,
+                    pending_count: 0,
+                    volume_by_token: Map::new(env),
+                });
         summary.completed_count += 1;
-        if summary.pending_count > 0 { summary.pending_count -= 1; }
+        if summary.pending_count > 0 {
+            summary.pending_count -= 1;
+        }
         summary.total_volume += amount;
         let prev_token = summary.volume_by_token.get(token.clone()).unwrap_or(0);
-        summary.volume_by_token.set(token.clone(), prev_token + amount);
+        summary
+            .volume_by_token
+            .set(token.clone(), prev_token + amount);
         env.storage().persistent().set(&key, &summary);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     fn inc_merchant_failed(env: &Env, merchant: &Address) {
         let key = DataKey2::MerchantSummary(merchant.clone());
-        let mut summary: MerchantSummary = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(MerchantSummary {
-                total_volume: 0,
-                completed_count: 0,
-                failed_count: 0,
-                pending_count: 0,
-                volume_by_token: Map::new(env),
-            });
+        let mut summary: MerchantSummary =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantSummary {
+                    total_volume: 0,
+                    completed_count: 0,
+                    failed_count: 0,
+                    pending_count: 0,
+                    volume_by_token: Map::new(env),
+                });
         summary.failed_count += 1;
-        if summary.pending_count > 0 { summary.pending_count -= 1; }
+        if summary.pending_count > 0 {
+            summary.pending_count -= 1;
+        }
         env.storage().persistent().set(&key, &summary);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     fn inc_merchant_refunded(env: &Env, merchant: &Address, token: &Address, amount: i128) {
@@ -6383,12 +6686,16 @@ impl AhjoorPaymentsContract {
         let bucket = now / cap.window_seconds;
         let vol_key = DataKey::MerchantWindowVolume(merchant.clone(), bucket);
         let current_volume: i128 = env.storage().persistent().get(&vol_key).unwrap_or(0);
-        let new_volume = current_volume
-            .checked_add(amount)
-            .expect("Volume overflow");
+        let new_volume = current_volume.checked_add(amount).expect("Volume overflow");
 
         if new_volume > cap.cap_amount {
-            events::emit_volume_capped(env, merchant.clone(), payment_id, current_volume, cap.cap_amount);
+            events::emit_volume_capped(
+                env,
+                merchant.clone(),
+                payment_id,
+                current_volume,
+                cap.cap_amount,
+            );
             panic_with_error!(env, Error::MerchantVolumeCapped);
         }
 
@@ -6423,7 +6730,13 @@ impl AhjoorPaymentsContract {
     }
 
     /// Admin suspends a merchant for a given duration (seconds). Payments are paused.
-    pub fn suspend_merchant(env: Env, admin: Address, merchant: Address, reason_hash: BytesN<32>, duration_seconds: u64) {
+    pub fn suspend_merchant(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        reason_hash: BytesN<32>,
+        duration_seconds: u64,
+    ) {
         Self::require_not_paused(&env);
         admin.require_auth();
         let stored_admin: Address = env
@@ -6439,12 +6752,14 @@ impl AhjoorPaymentsContract {
         }
 
         let expiry = env.ledger().timestamp() + duration_seconds;
-        env.storage()
-            .persistent()
-            .set(&DataKey2::MerchantStatus(merchant.clone()), &MerchantStatus::Suspended);
-        env.storage()
-            .persistent()
-            .set(&DataKey2::MerchantSuspensionExpiry(merchant.clone()), &expiry);
+        env.storage().persistent().set(
+            &DataKey2::MerchantStatus(merchant.clone()),
+            &MerchantStatus::Suspended,
+        );
+        env.storage().persistent().set(
+            &DataKey2::MerchantSuspensionExpiry(merchant.clone()),
+            &expiry,
+        );
         env.storage().persistent().extend_ttl(
             &DataKey2::MerchantStatus(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -6476,9 +6791,10 @@ impl AhjoorPaymentsContract {
             panic!("Only admin can ban merchants");
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey2::MerchantStatus(merchant.clone()), &MerchantStatus::Banned);
+        env.storage().persistent().set(
+            &DataKey2::MerchantStatus(merchant.clone()),
+            &MerchantStatus::Banned,
+        );
         env.storage()
             .persistent()
             .set(&DataKey::MerchantApproved(merchant.clone()), &false);
@@ -6508,9 +6824,10 @@ impl AhjoorPaymentsContract {
             panic!("Only admin can reinstate merchants");
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey2::MerchantStatus(merchant.clone()), &MerchantStatus::Active);
+        env.storage().persistent().set(
+            &DataKey2::MerchantStatus(merchant.clone()),
+            &MerchantStatus::Active,
+        );
         env.storage()
             .persistent()
             .set(&DataKey::MerchantApproved(merchant.clone()), &true);
@@ -6615,9 +6932,10 @@ impl AhjoorPaymentsContract {
             .set(&DataKey2::MerchantAppeal(merchant.clone()), &appeal);
 
         // Reinstate merchant
-        env.storage()
-            .persistent()
-            .set(&DataKey2::MerchantStatus(merchant.clone()), &MerchantStatus::Active);
+        env.storage().persistent().set(
+            &DataKey2::MerchantStatus(merchant.clone()),
+            &MerchantStatus::Active,
+        );
         env.storage()
             .persistent()
             .set(&DataKey::MerchantApproved(merchant.clone()), &true);
@@ -6671,9 +6989,10 @@ impl AhjoorPaymentsContract {
             .unwrap_or(0);
         if cooldown_seconds > 0 {
             let cooldown_until = env.ledger().timestamp() + cooldown_seconds;
-            env.storage()
-                .persistent()
-                .set(&DataKey2::AppealCooldownUntil(merchant.clone()), &cooldown_until);
+            env.storage().persistent().set(
+                &DataKey2::AppealCooldownUntil(merchant.clone()),
+                &cooldown_until,
+            );
             env.storage().persistent().extend_ttl(
                 &DataKey2::AppealCooldownUntil(merchant.clone()),
                 PERSISTENT_LIFETIME_THRESHOLD,
@@ -6748,7 +7067,11 @@ impl AhjoorPaymentsContract {
                 pending_count: 0,
                 volume_by_token: Map::new(&env),
             });
-        (summary.completed_count, summary.failed_count, summary.pending_count)
+        (
+            summary.completed_count,
+            summary.failed_count,
+            summary.pending_count,
+        )
     }
 
     /// Admin resets a merchant's dashboard counters.
@@ -6775,7 +7098,9 @@ impl AhjoorPaymentsContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     // ── #239: Customer Loyalty Points ─────────────────────────────────────────
@@ -6802,11 +7127,21 @@ impl AhjoorPaymentsContract {
         if admin != stored_admin {
             panic!("Only admin");
         }
-        env.storage().instance().set(&DataKey2::LoyaltyPointsPerUnit, &points_per_unit);
-        env.storage().instance().set(&DataKey2::LoyaltyRedemptionRateBps, &redemption_rate_bps);
-        env.storage().instance().set(&DataKey2::LoyaltyMinPaymentFloor, &min_payment_floor);
-        env.storage().instance().set(&DataKey2::LoyaltyExpiryLedgers, &expiry_ledgers);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .set(&DataKey2::LoyaltyPointsPerUnit, &points_per_unit);
+        env.storage()
+            .instance()
+            .set(&DataKey2::LoyaltyRedemptionRateBps, &redemption_rate_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey2::LoyaltyMinPaymentFloor, &min_payment_floor);
+        env.storage()
+            .instance()
+            .set(&DataKey2::LoyaltyExpiryLedgers, &expiry_ledgers);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Customer redeems loyalty points as a discount on a pending payment.
@@ -6858,14 +7193,18 @@ impl AhjoorPaymentsContract {
             points_to_redeem
         } else {
             // Recalculate points consumed when floor was hit
-            if redemption_rate_bps == 0 { points_to_redeem } else {
+            if redemption_rate_bps == 0 {
+                points_to_redeem
+            } else {
                 (actual_discount * 10_000) / redemption_rate_bps as i128
             }
         };
 
         // Burn points
         let new_balance = balance - actual_points_used;
-        env.storage().persistent().set(&DataKey2::LoyaltyBalance(customer.clone()), &new_balance);
+        env.storage()
+            .persistent()
+            .set(&DataKey2::LoyaltyBalance(customer.clone()), &new_balance);
         env.storage().persistent().extend_ttl(
             &DataKey2::LoyaltyBalance(customer.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -6874,14 +7213,24 @@ impl AhjoorPaymentsContract {
 
         // Apply discount to payment
         payment.amount = new_amount;
-        env.storage().persistent().set(&DataKey::Payment(payment_id), &payment);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id), &payment);
         env.storage().persistent().extend_ttl(
             &DataKey::Payment(payment_id),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        events::emit_points_redeemed(&env, customer, payment_id, actual_points_used, actual_discount);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_points_redeemed(
+            &env,
+            customer,
+            payment_id,
+            actual_points_used,
+            actual_discount,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     // =========================================================================
@@ -6907,11 +7256,20 @@ impl AhjoorPaymentsContract {
             panic!("Window seconds must be positive");
         }
         let key = DataKey2::CustomerSpendLimit(merchant.clone(), customer.clone());
-        let limit = SpendLimit { amount, window_seconds };
+        let limit = SpendLimit {
+            amount,
+            window_seconds,
+        };
         env.storage().persistent().set(&key, &limit);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         events::emit_customer_spend_limit_set(&env, merchant, customer, amount, window_seconds);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Merchant removes a per-customer spend cap.
@@ -6921,16 +7279,13 @@ impl AhjoorPaymentsContract {
         let key = DataKey2::CustomerSpendLimit(merchant.clone(), customer.clone());
         env.storage().persistent().remove(&key);
         events::emit_customer_spend_limit_removed(&env, merchant, customer);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Merchant sets a global default spend cap applied to all customers without an individual override.
-    pub fn set_default_spend_limit(
-        env: Env,
-        merchant: Address,
-        amount: i128,
-        window_seconds: u64,
-    ) {
+    pub fn set_default_spend_limit(env: Env, merchant: Address, amount: i128, window_seconds: u64) {
         Self::require_not_paused(&env);
         merchant.require_auth();
         if amount <= 0 {
@@ -6940,31 +7295,60 @@ impl AhjoorPaymentsContract {
             panic!("Window seconds must be positive");
         }
         let key = DataKey2::DefaultSpendLimit(merchant.clone());
-        let limit = SpendLimit { amount, window_seconds };
+        let limit = SpendLimit {
+            amount,
+            window_seconds,
+        };
         env.storage().persistent().set(&key, &limit);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         events::emit_default_spend_limit_set(&env, merchant, amount, window_seconds);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Get the per-customer spend limit for a merchant+customer pair.
-    pub fn get_customer_spend_limit(env: Env, merchant: Address, customer: Address) -> Option<SpendLimit> {
-        env.storage().persistent().get(&DataKey2::CustomerSpendLimit(merchant, customer))
+    pub fn get_customer_spend_limit(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+    ) -> Option<SpendLimit> {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::CustomerSpendLimit(merchant, customer))
     }
 
     /// Get the default spend limit for a merchant.
     pub fn get_default_spend_limit(env: Env, merchant: Address) -> Option<SpendLimit> {
-        env.storage().persistent().get(&DataKey2::DefaultSpendLimit(merchant))
+        env.storage()
+            .persistent()
+            .get(&DataKey2::DefaultSpendLimit(merchant))
     }
 
     /// Check and update the customer spend window. Panics with CustomerSpendLimitExceeded if cap would be breached.
-    fn check_and_update_customer_spend_limit(env: &Env, merchant: &Address, customer: &Address, amount: i128) {
+    fn check_and_update_customer_spend_limit(
+        env: &Env,
+        merchant: &Address,
+        customer: &Address,
+        amount: i128,
+    ) {
         // Individual override takes priority over default
         let limit_opt: Option<SpendLimit> = env
             .storage()
             .persistent()
-            .get(&DataKey2::CustomerSpendLimit(merchant.clone(), customer.clone()))
-            .or_else(|| env.storage().persistent().get(&DataKey2::DefaultSpendLimit(merchant.clone())));
+            .get(&DataKey2::CustomerSpendLimit(
+                merchant.clone(),
+                customer.clone(),
+            ))
+            .or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get(&DataKey2::DefaultSpendLimit(merchant.clone()))
+            });
 
         let limit = match limit_opt {
             Some(l) => l,
@@ -6974,26 +7358,42 @@ impl AhjoorPaymentsContract {
         let state_key = DataKey2::CustomerSpendWindowState(merchant.clone(), customer.clone());
         let now = env.ledger().timestamp();
 
-        let mut state: CustomerSpendWindow = env
-            .storage()
-            .persistent()
-            .get(&state_key)
-            .unwrap_or(CustomerSpendWindow { window_start: now, spent: 0 });
+        let mut state: CustomerSpendWindow =
+            env.storage()
+                .persistent()
+                .get(&state_key)
+                .unwrap_or(CustomerSpendWindow {
+                    window_start: now,
+                    spent: 0,
+                });
 
         // Reset window if expired
         if now >= state.window_start + limit.window_seconds {
-            state = CustomerSpendWindow { window_start: now, spent: 0 };
+            state = CustomerSpendWindow {
+                window_start: now,
+                spent: 0,
+            };
         }
 
         let new_total = state.spent.checked_add(amount).expect("Spend overflow");
         if new_total > limit.amount {
-            events::emit_customer_spend_limit_exceeded(env, merchant.clone(), customer.clone(), new_total, limit.amount);
+            events::emit_customer_spend_limit_exceeded(
+                env,
+                merchant.clone(),
+                customer.clone(),
+                new_total,
+                limit.amount,
+            );
             panic_with_error!(env, Error::CustomerSpendLimitExceeded);
         }
 
         state.spent = new_total;
         env.storage().persistent().set(&state_key, &state);
-        env.storage().persistent().extend_ttl(&state_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &state_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     // ─── #216: Recurring Invoice Scheduling ──────────────────────────────────
@@ -7124,8 +7524,15 @@ impl AhjoorPaymentsContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_invoice_cycle_triggered(&env, invoice_id, payment_id, invoice.cycles_triggered);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_invoice_cycle_triggered(
+            &env,
+            invoice_id,
+            payment_id,
+            invoice.cycles_triggered,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
         payment_id
     }
@@ -7168,7 +7575,9 @@ impl AhjoorPaymentsContract {
             .unwrap_or(0);
         let new_balance = old_balance + points_earned;
 
-        env.storage().persistent().set(&DataKey2::LoyaltyBalance(customer.clone()), &new_balance);
+        env.storage()
+            .persistent()
+            .set(&DataKey2::LoyaltyBalance(customer.clone()), &new_balance);
         env.storage().persistent().extend_ttl(
             &DataKey2::LoyaltyBalance(customer.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -7183,7 +7592,13 @@ impl AhjoorPaymentsContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        events::emit_points_accrued(env, customer.clone(), payment_id, points_earned, new_balance);
+        events::emit_points_accrued(
+            env,
+            customer.clone(),
+            payment_id,
+            points_earned,
+            new_balance,
+        );
     }
 
     /// Cancel a recurring invoice. Callable by merchant or customer.
@@ -7248,7 +7663,9 @@ impl AhjoorPaymentsContract {
                 .get(&DataKey2::LoyaltyBalance(customer.clone()))
                 .unwrap_or(0);
             if balance > 0 {
-                env.storage().persistent().set(&DataKey2::LoyaltyBalance(customer.clone()), &0i128);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey2::LoyaltyBalance(customer.clone()), &0i128);
                 events::emit_points_expired(env, customer.clone(), balance);
             }
         }
@@ -7266,11 +7683,23 @@ impl AhjoorPaymentsContract {
     pub fn set_referral_config(env: Env, admin: Address, commission_bps: u32, window_ledgers: u32) {
         Self::require_not_paused(&env);
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if admin != stored_admin { panic!("Only admin can set referral config"); }
-        env.storage().instance().set(&DataKey2::ReferralCommissionBps, &commission_bps);
-        env.storage().instance().set(&DataKey2::ReferralWindowLedgers, &window_ledgers);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set referral config");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey2::ReferralCommissionBps, &commission_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey2::ReferralWindowLedgers, &window_ledgers);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Existing merchant registers a referral for a new merchant.
@@ -7280,14 +7709,30 @@ impl AhjoorPaymentsContract {
         referrer.require_auth();
 
         // Referrer must be an approved merchant
-        let referrer_approved: bool = env.storage().persistent().get(&DataKey::MerchantApproved(referrer.clone())).unwrap_or(false);
-        if !referrer_approved { panic!("Referrer is not an approved merchant"); }
+        let referrer_approved: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantApproved(referrer.clone()))
+            .unwrap_or(false);
+        if !referrer_approved {
+            panic!("Referrer is not an approved merchant");
+        }
 
         // Referred must not already have a merchant record
-        let already_exists: bool = env.storage().persistent().get(&DataKey::MerchantApproved(referred_merchant.clone())).unwrap_or(false);
-        if already_exists { panic_with_error!(&env, Error::ReferralAlreadyExists); }
+        let already_exists: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantApproved(referred_merchant.clone()))
+            .unwrap_or(false);
+        if already_exists {
+            panic_with_error!(&env, Error::ReferralAlreadyExists);
+        }
 
-        let window_ledgers: u32 = env.storage().instance().get(&DataKey2::ReferralWindowLedgers).unwrap_or(0);
+        let window_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::ReferralWindowLedgers)
+            .unwrap_or(0);
         let record = ReferralRecord {
             referrer: referrer.clone(),
             registered_at_ledger: env.ledger().sequence(),
@@ -7295,10 +7740,16 @@ impl AhjoorPaymentsContract {
         };
         let key = DataKey2::ReferralRecord(referred_merchant.clone());
         env.storage().persistent().set(&key, &record);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         events::emit_referral_registered(&env, referrer, referred_merchant);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Referrer withdraws accumulated commission to their address.
@@ -7308,33 +7759,56 @@ impl AhjoorPaymentsContract {
 
         let key = DataKey2::PendingCommission(referrer.clone());
         let pending: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if pending <= 0 { panic_with_error!(&env, Error::NoCommissionToClaim); }
+        if pending <= 0 {
+            panic_with_error!(&env, Error::NoCommissionToClaim);
+        }
 
         env.storage().persistent().set(&key, &0i128);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &referrer, &pending);
 
         events::emit_commission_claimed(&env, referrer, pending);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Get pending commission balance for a referrer.
     pub fn get_pending_commission(env: Env, referrer: Address) -> i128 {
-        env.storage().persistent().get(&DataKey2::PendingCommission(referrer)).unwrap_or(0)
+        env.storage()
+            .persistent()
+            .get(&DataKey2::PendingCommission(referrer))
+            .unwrap_or(0)
     }
 
     /// Get the referral record for a referred merchant.
     pub fn get_referral_record(env: Env, referred_merchant: Address) -> Option<ReferralRecord> {
-        env.storage().persistent().get(&DataKey2::ReferralRecord(referred_merchant))
+        env.storage()
+            .persistent()
+            .get(&DataKey2::ReferralRecord(referred_merchant))
     }
 
     /// Internal: accrue referral commission when a referred merchant's payment is finalized.
-    fn accrue_referral_commission(env: &Env, merchant: &Address, payment_id: u32, fee_amount: i128) {
-        if fee_amount <= 0 { return; }
+    fn accrue_referral_commission(
+        env: &Env,
+        merchant: &Address,
+        payment_id: u32,
+        fee_amount: i128,
+    ) {
+        if fee_amount <= 0 {
+            return;
+        }
 
-        let record_opt: Option<ReferralRecord> = env.storage().persistent().get(&DataKey2::ReferralRecord(merchant.clone()));
+        let record_opt: Option<ReferralRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::ReferralRecord(merchant.clone()));
         let record = match record_opt {
             Some(r) => r,
             None => return,
@@ -7342,23 +7816,46 @@ impl AhjoorPaymentsContract {
 
         // Check window has not expired
         let current_ledger = env.ledger().sequence();
-        if record.window_ledgers > 0 && current_ledger > record.registered_at_ledger.saturating_add(record.window_ledgers) {
+        if record.window_ledgers > 0
+            && current_ledger
+                > record
+                    .registered_at_ledger
+                    .saturating_add(record.window_ledgers)
+        {
             return;
         }
 
-        let commission_bps: u32 = env.storage().instance().get(&DataKey2::ReferralCommissionBps).unwrap_or(0);
-        if commission_bps == 0 { return; }
+        let commission_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::ReferralCommissionBps)
+            .unwrap_or(0);
+        if commission_bps == 0 {
+            return;
+        }
 
         let commission = (fee_amount * commission_bps as i128) / 10_000;
-        if commission <= 0 { return; }
+        if commission <= 0 {
+            return;
+        }
 
         let pending_key = DataKey2::PendingCommission(record.referrer.clone());
         let current: i128 = env.storage().persistent().get(&pending_key).unwrap_or(0);
         let new_total = current.saturating_add(commission);
         env.storage().persistent().set(&pending_key, &new_total);
-        env.storage().persistent().extend_ttl(&pending_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &pending_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
-        events::emit_commission_accrued(env, record.referrer, merchant.clone(), payment_id, commission);
+        events::emit_commission_accrued(
+            env,
+            record.referrer,
+            merchant.clone(),
+            payment_id,
+            commission,
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -7458,7 +7955,13 @@ impl AhjoorPaymentsContract {
             customer.require_auth();
             let token_client = token::Client::new(&env, &payment.token);
             token_client.transfer(&customer, &payment.merchant, &tip_amount);
-            events::emit_tip_received(&env, payment_id, payment.merchant.clone(), tip_amount, payment.token.clone());
+            events::emit_tip_received(
+                &env,
+                payment_id,
+                payment.merchant.clone(),
+                tip_amount,
+                payment.token.clone(),
+            );
         }
 
         Self::complete_payment_internal(&env, payment_id, false);
@@ -7675,11 +8178,26 @@ impl AhjoorPaymentsContract {
         );
 
         // Extend TTL
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey2::ConsentRecord(consent_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::ConsentRecord(consent_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.storage().persistent().extend_ttl(
             &DataKey2::ConsentIndex(merchant.clone(), customer.clone(), terms_version.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_consent_record_created(
+            &env,
+            consent_id,
+            merchant,
+            customer,
+            terms_hash,
+            terms_version,
+        );
+        consent_id
+    }
     // ── #329: Failed Auto-Debit Retry Queue ───────────────────────────────────
 
     /// Admin configures the retry back-off schedule.
@@ -7780,10 +8298,47 @@ impl AhjoorPaymentsContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        // Emit event
-        events::emit_consent_record_created(&env, consent_id, merchant, customer, terms_hash, terms_version);
-
-        consent_id
+        if result.is_ok() {
+            let rec = FailedDebitRecord {
+                id: record_id,
+                plan_id,
+                merchant: merchant.clone(),
+                customer: customer.clone(),
+                token: token.clone(),
+                amount,
+                attempt_number: 1,
+                next_retry_ledger: 0,
+                status: FailedDebitStatus::Succeeded,
+                created_at: env.ledger().timestamp(),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey2::FailedDebit(record_id), &rec);
+        } else {
+            let next_retry_ledger = (env.ledger().sequence() as u64) + cfg.base_retry_interval;
+            let rec = FailedDebitRecord {
+                id: record_id,
+                plan_id,
+                merchant: merchant.clone(),
+                customer: customer.clone(),
+                token: token.clone(),
+                amount,
+                attempt_number: 1,
+                next_retry_ledger,
+                status: FailedDebitStatus::Pending,
+                created_at: env.ledger().timestamp(),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey2::FailedDebit(record_id), &rec);
+            events::emit_debit_failed(&env, record_id, plan_id, 1, next_retry_ledger);
+        }
+        env.storage().persistent().extend_ttl(
+            &DataKey2::FailedDebit(record_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        record_id
     }
 
     /// Customer signs a consent record, authenticating their acceptance.
@@ -7821,9 +8376,11 @@ impl AhjoorPaymentsContract {
         env.storage()
             .persistent()
             .set(&DataKey2::ConsentRecord(consent_id), &consent);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey2::ConsentRecord(consent_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::ConsentRecord(consent_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Emit event
         events::emit_consent_signed(&env, consent_id, customer, consent.signed_at);
@@ -7837,10 +8394,11 @@ impl AhjoorPaymentsContract {
         terms_version: String,
     ) -> bool {
         // Try to get consent ID from index
-        let consent_id_opt: Option<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey2::ConsentIndex(merchant, customer, terms_version));
+        let consent_id_opt: Option<u32> = env.storage().persistent().get(&DataKey2::ConsentIndex(
+            merchant,
+            customer,
+            terms_version,
+        ));
 
         if let Some(consent_id) = consent_id_opt {
             if let Some(consent) = env
@@ -7849,9 +8407,11 @@ impl AhjoorPaymentsContract {
                 .get::<_, ConsentRecord>(&DataKey2::ConsentRecord(consent_id))
             {
                 // Extend TTL on read
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&DataKey2::ConsentRecord(consent_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+                env.storage().persistent().extend_ttl(
+                    &DataKey2::ConsentRecord(consent_id),
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
 
                 // Check validity: signed, not expired, not revoked
                 return consent.is_signed
@@ -7893,9 +8453,11 @@ impl AhjoorPaymentsContract {
         env.storage()
             .persistent()
             .set(&DataKey2::ConsentRecord(consent_id), &consent);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey2::ConsentRecord(consent_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::ConsentRecord(consent_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Emit event
         events::emit_consent_revoked(&env, consent_id, caller, env.ledger().timestamp());
@@ -7909,9 +8471,11 @@ impl AhjoorPaymentsContract {
             .get(&DataKey2::ConsentRecord(consent_id))
             .expect("Consent record not found");
 
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey2::ConsentRecord(consent_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::ConsentRecord(consent_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         consent
     }
@@ -7928,6 +8492,7 @@ impl AhjoorPaymentsContract {
             .get(&DataKey2::ConsentIndex(merchant, customer, terms_version))
     }
 
+    #[cfg(any())]
     // Helper: Get next consent ID
     fn next_consent_id(env: &Env) -> u32 {
         let counter: u32 = env
@@ -7943,6 +8508,51 @@ impl AhjoorPaymentsContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         next_id
+    }
+
+    #[cfg(any())]
+    /// Retry a failed debit. Enforces the exponential back-off schedule.
+    /// Returns `RetryNotDue` if the back-off interval has not elapsed.
+    /// On max attempts the record is moved to `AbandonedDebit` status.
+    pub fn retry_failed_debit(env: Env, record_id: u32) {
+        Self::require_not_paused(&env);
+
+        let mut rec: FailedDebitRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::FailedDebit(record_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::DebitRecordNotFound));
+
+        if rec.status == FailedDebitStatus::Abandoned {
+            panic_with_error!(&env, Error::DebitAlreadyAbandoned);
+        }
+        if rec.status == FailedDebitStatus::Succeeded {
+            panic_with_error!(&env, Error::DebitAlreadySucceeded);
+        }
+
+        let current_ledger = env.ledger().sequence() as u64;
+        if current_ledger < rec.next_retry_ledger {
+            panic_with_error!(&env, Error::RetryNotDue);
+        }
+
+        let cfg: RetryConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::RetryConfig)
+            .unwrap_or(RetryConfig {
+                base_retry_interval: DEFAULT_BASE_RETRY_INTERVAL,
+                max_retry_interval: DEFAULT_MAX_RETRY_INTERVAL,
+                max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            });
+
+        let client = token::Client::new(&env, &rec.token);
+        let result = client.try_transfer_from(
+            &env.current_contract_address(),
+            &rec.customer,
+            &rec.merchant,
+            &rec.amount,
+        );
+
         if result.is_ok() {
             // Payment succeeded — store as a Succeeded record for auditing
             let rec = FailedDebitRecord {
@@ -7957,7 +8567,9 @@ impl AhjoorPaymentsContract {
                 status: FailedDebitStatus::Succeeded,
                 created_at: env.ledger().timestamp(),
             };
-            env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+            env.storage()
+                .persistent()
+                .set(&DataKey2::FailedDebit(record_id), &rec);
             env.storage().persistent().extend_ttl(
                 &DataKey2::FailedDebit(record_id),
                 PERSISTENT_LIFETIME_THRESHOLD,
@@ -7965,8 +8577,7 @@ impl AhjoorPaymentsContract {
             );
         } else {
             // Insufficient balance — store pending record and emit DebitFailed
-            let next_retry_ledger =
-                (env.ledger().sequence() as u64) + cfg.base_retry_interval;
+            let next_retry_ledger = (env.ledger().sequence() as u64) + cfg.base_retry_interval;
             let rec = FailedDebitRecord {
                 id: record_id,
                 plan_id,
@@ -7979,19 +8590,15 @@ impl AhjoorPaymentsContract {
                 status: FailedDebitStatus::Pending,
                 created_at: env.ledger().timestamp(),
             };
-            env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+            env.storage()
+                .persistent()
+                .set(&DataKey2::FailedDebit(record_id), &rec);
             env.storage().persistent().extend_ttl(
                 &DataKey2::FailedDebit(record_id),
                 PERSISTENT_LIFETIME_THRESHOLD,
                 PERSISTENT_BUMP_AMOUNT,
             );
-            events::emit_debit_failed(
-                &env,
-                record_id,
-                plan_id,
-                1,
-                next_retry_ledger,
-            );
+            events::emit_debit_failed(&env, record_id, plan_id, 1, next_retry_ledger);
         }
 
         env.storage()
@@ -8044,7 +8651,9 @@ impl AhjoorPaymentsContract {
 
         if result.is_ok() {
             rec.status = FailedDebitStatus::Succeeded;
-            env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+            env.storage()
+                .persistent()
+                .set(&DataKey2::FailedDebit(record_id), &rec);
             env.storage().persistent().extend_ttl(
                 &DataKey2::FailedDebit(record_id),
                 PERSISTENT_LIFETIME_THRESHOLD,
@@ -8055,7 +8664,9 @@ impl AhjoorPaymentsContract {
             rec.attempt_number += 1;
             if rec.attempt_number > cfg.max_retry_attempts {
                 rec.status = FailedDebitStatus::Abandoned;
-                env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey2::FailedDebit(record_id), &rec);
                 env.storage().persistent().extend_ttl(
                     &DataKey2::FailedDebit(record_id),
                     PERSISTENT_LIFETIME_THRESHOLD,
@@ -8064,12 +8675,15 @@ impl AhjoorPaymentsContract {
                 events::emit_debit_abandoned(&env, record_id, rec.plan_id);
             } else {
                 // Double the back-off, capped at max_retry_interval
-                let raw_interval =
-                    cfg.base_retry_interval
-                        .saturating_mul(1u64.checked_shl((rec.attempt_number - 1).min(63) as u32).unwrap_or(u64::MAX));
+                let raw_interval = cfg.base_retry_interval.saturating_mul(
+                    1u64.checked_shl((rec.attempt_number - 1).min(63) as u32)
+                        .unwrap_or(u64::MAX),
+                );
                 let interval = raw_interval.min(cfg.max_retry_interval);
                 rec.next_retry_ledger = current_ledger + interval;
-                env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey2::FailedDebit(record_id), &rec);
                 env.storage().persistent().extend_ttl(
                     &DataKey2::FailedDebit(record_id),
                     PERSISTENT_LIFETIME_THRESHOLD,
@@ -8132,7 +8746,9 @@ impl AhjoorPaymentsContract {
 
         if result.is_ok() {
             rec.status = FailedDebitStatus::Succeeded;
-            env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+            env.storage()
+                .persistent()
+                .set(&DataKey2::FailedDebit(record_id), &rec);
             env.storage().persistent().extend_ttl(
                 &DataKey2::FailedDebit(record_id),
                 PERSISTENT_LIFETIME_THRESHOLD,
@@ -8143,7 +8759,9 @@ impl AhjoorPaymentsContract {
             rec.attempt_number += 1;
             if rec.attempt_number > cfg.max_retry_attempts {
                 rec.status = FailedDebitStatus::Abandoned;
-                env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey2::FailedDebit(record_id), &rec);
                 env.storage().persistent().extend_ttl(
                     &DataKey2::FailedDebit(record_id),
                     PERSISTENT_LIFETIME_THRESHOLD,
@@ -8151,12 +8769,15 @@ impl AhjoorPaymentsContract {
                 );
                 events::emit_debit_abandoned(&env, record_id, rec.plan_id);
             } else {
-                let raw_interval =
-                    cfg.base_retry_interval
-                        .saturating_mul(1u64.checked_shl((rec.attempt_number - 1).min(63) as u32).unwrap_or(u64::MAX));
+                let raw_interval = cfg.base_retry_interval.saturating_mul(
+                    1u64.checked_shl((rec.attempt_number - 1).min(63) as u32)
+                        .unwrap_or(u64::MAX),
+                );
                 let interval = raw_interval.min(cfg.max_retry_interval);
                 rec.next_retry_ledger = (env.ledger().sequence() as u64) + interval;
-                env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey2::FailedDebit(record_id), &rec);
                 env.storage().persistent().extend_ttl(
                     &DataKey2::FailedDebit(record_id),
                     PERSISTENT_LIFETIME_THRESHOLD,
@@ -8196,7 +8817,6 @@ impl AhjoorPaymentsContract {
                 max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             })
     }
-
 }
 
 #[cfg(test)]
@@ -8221,14 +8841,14 @@ mod test_external_id_multisig_voucher;
 mod test_merchant_ban;
 
 #[cfg(test)]
+mod test_dynamic_settlement;
+#[cfg(test)]
 mod test_loyalty_points;
 #[cfg(test)]
 mod test_referral;
 #[cfg(test)]
-mod test_dynamic_settlement;
+mod test_retry_queue;
 #[cfg(test)]
 mod test_spending_limit;
-#[cfg(test)]
-mod test_retry_queue;
 
 pub use events::*;
