@@ -975,6 +975,15 @@ pub fn emit_collateral_returned(e: &Env, escrow_id: u32, seller: Address, amount
     CollateralReturned { escrow_id, seller, amount }.publish(e);
 }
 
+// --- Issue #361: Collateral Health Alert ---
+
+pub fn emit_collateral_health_alert(e: &Env, escrow_id: u32, current_ratio_bps: u32, required_ratio_bps: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "CollateralHealthAlert"),),
+        (escrow_id, current_ratio_bps, required_ratio_bps),
+    );
+}
+
 // --- Issue #241: Delivery Proof Hash ---
 
 /// Event: Seller submitted a delivery proof; auto_released indicates if escrow was released.

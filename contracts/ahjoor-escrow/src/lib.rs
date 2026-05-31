@@ -45,6 +45,8 @@ pub enum EscrowStatus {
     BountyUnclaimed = 14,
     /// #319: Bounty claimed by a solver; awaiting submission.
     BountyClaimed = 15,
+    /// #361: Collateral value dropped below required ratio; release blocked.
+    UnderCollateralized = 16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,6 +413,10 @@ pub enum DataKey2 {
     BountyData(u32),
     /// #319: Admin-configurable max rejection rounds for bounties
     MaxBountyRejectionRounds,
+    /// #361: min collateral ratio in bps per escrow (escrow_id → u32)
+    CollateralMinRatioBps(u32),
+    /// #361: oracle address for collateral health checks per escrow
+    CollateralOracle(u32),
     /// #350: ordered list of authorized approver addresses per escrow
     MultiPartyApprovers(u32),
     /// #350: required N-of-M approval threshold per escrow
@@ -5197,6 +5203,20 @@ impl AhjoorEscrowContract {
             .get(&DataKey2::BountyData(escrow_id))
     }
 
+    // ── #361: Collateral Top-Up Mechanism ────────────────────────────────────
+
+    /// Configure collateral health monitoring for an escrow.
+    /// Sets the minimum collateral ratio (bps of escrow amount) and the oracle to use.
+    /// Only the buyer can call this on an active escrow.
+    pub fn set_collateral_health_config(
+        env: Env,
+        buyer: Address,
+        escrow_id: u32,
+        min_collateral_ratio_bps: u32,
+        oracle: Address,
+    ) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
     // ── #350: Multi-Party N-of-M Release Approval ────────────────────────────
 
     /// Configure N-of-M approval for an existing escrow.
@@ -5218,6 +5238,28 @@ impl AhjoorEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
             .expect("Escrow not found");
+        if escrow.buyer != buyer {
+            panic!("Only buyer can configure collateral health");
+        }
+        if !Self::is_open_escrow_status(escrow.status) {
+            panic!("Escrow is not active");
+        }
+        if min_collateral_ratio_bps == 0 || min_collateral_ratio_bps > 10_000 {
+            panic!("min_collateral_ratio_bps must be 1-10000");
+        }
+        env.storage().persistent().set(&DataKey2::CollateralMinRatioBps(escrow_id), &min_collateral_ratio_bps);
+        env.storage().persistent().extend_ttl(&DataKey2::CollateralMinRatioBps(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().set(&DataKey2::CollateralOracle(escrow_id), &oracle);
+        env.storage().persistent().extend_ttl(&DataKey2::CollateralOracle(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Check collateral health via oracle. Returns current ratio in bps.
+    /// Flags escrow as UnderCollateralized if ratio drops below threshold.
+    /// Callable by anyone.
+    pub fn check_collateral_health(env: Env, escrow_id: u32) -> u32 {
+        Self::require_not_paused(&env);
+        let mut escrow: Escrow = env
 
         if escrow.buyer != buyer {
             panic!("Only buyer can configure multi-party approval");
@@ -5282,6 +5324,116 @@ impl AhjoorEscrowContract {
             .get(&DataKey::Escrow(escrow_id))
             .expect("Escrow not found");
 
+        let min_ratio_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::CollateralMinRatioBps(escrow_id))
+            .expect("Collateral health not configured for this escrow");
+
+        let oracle_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::CollateralOracle(escrow_id))
+            .expect("Collateral oracle not configured");
+
+        let collateral: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SellerCollateral(escrow_id))
+            .unwrap_or(0);
+
+        // Query oracle for collateral token price relative to escrow token
+        let oracle_client = oracle::OracleClient::new(&env, &oracle_addr);
+        let price_data = oracle_client
+            .lastprice(&escrow.token, &escrow.token)
+            .unwrap_or(PriceData { price: 10_000_000, timestamp: env.ledger().timestamp() });
+
+        // current_ratio_bps = (collateral * price * 10000) / (escrow.amount * 10^7)
+        let collateral_value = if price_data.price > 0 {
+            (collateral * price_data.price) / 10_000_000
+        } else {
+            collateral
+        };
+        let current_ratio_bps = if escrow.amount > 0 {
+            ((collateral_value * 10_000) / escrow.amount) as u32
+        } else {
+            10_000u32
+        };
+
+        if current_ratio_bps < min_ratio_bps {
+            // Flag as under-collateralized if currently active
+            if Self::is_open_escrow_status(escrow.status) {
+                escrow.status = EscrowStatus::UnderCollateralized;
+                env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+                env.storage().persistent().extend_ttl(&DataKey::Escrow(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            }
+            events::emit_collateral_health_alert(&env, escrow_id, current_ratio_bps, min_ratio_bps);
+        } else if escrow.status == EscrowStatus::UnderCollateralized {
+            // Restore to Active if health recovered
+            escrow.status = EscrowStatus::Active;
+            env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+            env.storage().persistent().extend_ttl(&DataKey::Escrow(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        }
+
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        current_ratio_bps
+    }
+
+    /// Collateral provider tops up collateral for an escrow.
+    /// Clears UnderCollateralized flag if ratio is restored above threshold.
+    pub fn top_up_collateral(env: Env, provider: Address, escrow_id: u32, amount: i128) {
+        Self::require_not_paused(&env);
+        provider.require_auth();
+
+        if amount <= 0 {
+            panic!("Top-up amount must be positive");
+        }
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::UnderCollateralized
+            && !Self::is_open_escrow_status(escrow.status)
+        {
+            panic!("Escrow is not active or under-collateralized");
+        }
+
+        let client = token::Client::new(&env, &escrow.token);
+        client.transfer(&provider, &env.current_contract_address(), &amount);
+
+        let key = DataKey::SellerCollateral(escrow_id);
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_collateral = current + amount;
+        env.storage().persistent().set(&key, &new_collateral);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        escrow.extensions.collateral_amount = new_collateral;
+
+        // Check if health is restored
+        if escrow.status == EscrowStatus::UnderCollateralized {
+            let min_ratio_bps: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey2::CollateralMinRatioBps(escrow_id))
+                .unwrap_or(0);
+            let current_ratio_bps = if escrow.amount > 0 {
+                ((new_collateral * 10_000) / escrow.amount) as u32
+            } else {
+                10_000u32
+            };
+            if current_ratio_bps >= min_ratio_bps {
+                escrow.status = EscrowStatus::Active;
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::Escrow(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        events::emit_collateral_deposited(&env, escrow_id, provider, amount);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         if !Self::is_open_escrow_status(escrow.status) {
             panic!("Escrow is not active");
         }

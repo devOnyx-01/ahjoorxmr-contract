@@ -125,6 +125,25 @@ pub struct RefundCounterRejected {
     pub customer: Address,
 }
 
+/// Event: Counter-offer expired and auto-settled (#360)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CounterOfferExpired {
+    pub refund_id: u32,
+    pub resolution: bool,
+    pub original_amount: i128,
+}
+
+/// Event: Counter-offer expired and auto-settled
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CounterOfferExpired {
+    pub refund_id: u32,
+    /// true = original refund accepted, false = rejected
+    pub resolution: bool,
+    pub original_amount: i128,
+}
+
 /// Event: Refund auto-approved after dispute window elapsed without merchant response
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -589,6 +608,33 @@ pub fn emit_refund_counter_rejected(e: &Env, refund_id: u32, customer: Address) 
     RefundCounterRejected {
         refund_id,
         customer,
+    }
+    .publish(e);
+}
+
+pub fn emit_counter_offer_expired(e: &Env, refund_id: u32, resolution: bool, original_amount: i128) {
+    CounterOfferExpired {
+        refund_id,
+        resolution,
+        original_amount,
+    }
+    .publish(e);
+}
+
+pub fn emit_counter_offer_expired(e: &Env, refund_id: u32, resolution: bool, original_amount: i128) {
+    CounterOfferExpired {
+        refund_id,
+        resolution,
+        original_amount,
+    }
+    .publish(e);
+}
+
+pub fn emit_counter_offer_expired(e: &Env, refund_id: u32, resolution: bool, original_amount: i128) {
+    CounterOfferExpired {
+        refund_id,
+        resolution,
+        original_amount,
     }
     .publish(e);
 }

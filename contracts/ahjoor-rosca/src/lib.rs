@@ -7565,6 +7565,9 @@ impl AhjoorContract {
         if !members.contains(&member) {
             panic_with_error!(&env, Error::NotAMember);
         }
+        if expiry_ledger == 0 {
+            panic!("expiry_ledger cannot be 0; infinite delegation is not allowed");
+        }
         if expiry_ledger <= (env.ledger().sequence() as u64) {
             panic!("expiry_ledger must be in the future");
         }
@@ -7653,6 +7656,15 @@ impl AhjoorContract {
             panic_with_error!(&env, ExtError::NotContribDelegate);
         }
         if (env.ledger().sequence() as u64) > rec.expiry_ledger {
+            // Auto-clear expired delegation to reclaim storage
+            let mut delegations_mut: Map<Address, ContribDelegationRecord> = env
+                .storage()
+                .instance()
+                .get(&DataKey3::ContribDelegations)
+                .unwrap_or(Map::new(&env));
+            delegations_mut.remove(member.clone());
+            env.storage().instance().set(&DataKey3::ContribDelegations, &delegations_mut);
+            events::emit_proxy_expired(&env, 0, member.clone(), proxy.clone(), rec.expiry_ledger);
             panic_with_error!(&env, ExtError::DelegationExpired);
         }
 
