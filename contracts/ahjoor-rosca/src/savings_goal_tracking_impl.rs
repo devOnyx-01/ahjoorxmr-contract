@@ -4,6 +4,7 @@ use soroban_sdk::{
     BytesN, Env, Map, String, Symbol, Vec,
 };
 use crate::savings_goal_tracking::*;
+use crate::types::{DataKey, DataKey3};
 
 // Storage keys
 const GOAL_COUNTER_KEY: &str = "goal_counter";
@@ -229,7 +230,90 @@ impl SavingsGoalTrackingImpl {
             .instance()
             .set(&Symbol::new(env, CONTRIBUTION_COUNTER_KEY), &next_contribution_id);
 
+        // #359: Check milestones with reward_bps > 0 and distribute rewards
+        Self::check_and_distribute_milestone_rewards(env, goal_id, &goal, amount);
+
         contribution
+    }
+
+    /// #359: Check whether any milestones have been newly crossed and transfer rewards.
+    /// Rewards are transferred from the SavingsRewardPool. Pool depletion skips reward transfer
+    /// without reverting.
+    pub fn check_and_distribute_milestone_rewards(
+        env: &Env,
+        goal_id: u32,
+        goal: &SavingsGoal,
+        contribution_amount: i128,
+    ) {
+        if goal.target_amount == 0 { return; }
+        let pct_now = ((goal.current_amount * 100) / goal.target_amount) as u32;
+
+        for milestone in goal.milestones.iter() {
+            if milestone.reward_bps == 0 { continue; }
+
+            // Skip milestones already claimed (bitmask check)
+            let bitmask_key = DataKey3::SavingsMilestonesClaimed(goal_id, goal.member.clone());
+            let bitmask: u64 = env
+                .storage()
+                .persistent()
+                .get(&bitmask_key)
+                .unwrap_or(0u64);
+
+            let bit = 1u64 << (milestone.milestone_id as u64 % 64);
+            if bitmask & bit != 0 { continue; }
+
+            // Check if threshold newly crossed
+            let pct_before = if contribution_amount >= goal.current_amount {
+                0u32
+            } else {
+                (((goal.current_amount - contribution_amount) * 100) / goal.target_amount) as u32
+            };
+
+            if pct_before < milestone.percentage && pct_now >= milestone.percentage {
+                let reward_amount = (contribution_amount * milestone.reward_bps as i128) / 10_000;
+                if reward_amount > 0 {
+                    // Transfer from reward pool if available
+                    let pool: i128 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::RewardPool)
+                        .unwrap_or(0i128);
+
+                    if pool >= reward_amount {
+                        let token_addr: Address = env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::Token)
+                            .expect("Token not set");
+                        let client = token::Client::new(env, &token_addr);
+                        client.transfer(
+                            &env.current_contract_address(),
+                            &goal.member,
+                            &reward_amount,
+                        );
+                        env.storage().instance().set(&DataKey::RewardPool, &(pool - reward_amount));
+
+                        crate::events::emit_milestone_reached(
+                            env,
+                            goal.group_id,
+                            goal.member.clone(),
+                            milestone.percentage,
+                            reward_amount,
+                        );
+                    }
+                    // If pool depleted: skip reward but mark milestone as claimed to avoid loops
+                }
+
+                // Mark milestone as claimed in bitmask
+                let new_bitmask = bitmask | bit;
+                env.storage().persistent().set(&bitmask_key, &new_bitmask);
+                env.storage().persistent().extend_ttl(
+                    &bitmask_key,
+                    crate::PERSISTENT_LIFETIME_THRESHOLD,
+                    crate::PERSISTENT_BUMP_AMOUNT,
+                );
+            }
+        }
     }
 
     /// Get goal details

@@ -1657,3 +1657,25 @@ pub fn emit_snapshot_created(e: &Env, group_id: u32, cycle_number: u32, snapshot
     SnapshotCreated { group_id, cycle_number, snapshot_hash }.publish(e);
 }
 
+// ── #359: Savings Goal Milestone Rewards ─────────────────────────────────────
+
+/// Event: Member reached a savings goal milestone and received a reward (#359)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MilestoneReached {
+    pub group_id: u32,
+    pub member: Address,
+    pub milestone_pct: u32,
+    pub reward_amount: i128,
+}
+
+pub fn emit_milestone_reached(
+    e: &Env,
+    group_id: u32,
+    member: Address,
+    milestone_pct: u32,
+    reward_amount: i128,
+) {
+    MilestoneReached { group_id, member, milestone_pct, reward_amount }.publish(e);
+}
+

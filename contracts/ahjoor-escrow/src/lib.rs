@@ -433,6 +433,22 @@ pub enum DataKey2 {
     VetoOverrideWindow,
     /// #366: immutable reason hash stored by admin when overriding a veto
     VetoReasonHash(u32),
+    /// #357: inspector reputation score (inspector → InspectorScore)
+    InspectorScore(Address),
+    /// #357: minimum inspector accuracy in bps required for high-value escrows (default 0 = disabled)
+    MinInspectorScoreBps,
+    /// #357: escrow amount above which inspector score threshold is enforced (default 0 = disabled)
+    InspectorScoreValueThreshold,
+    /// #357: tracks whether the inspector ruling for an escrow has been appealed (escrow_id → bool)
+    InspectorRulingAppealed(u32),
+}
+
+/// #357: On-chain reputation record for an inspector.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectorScore {
+    pub total_rulings: u32,
+    pub correct_rulings: u32,
 }
 
 /// #353: A single time-locked tranche in a staged release schedule.
@@ -841,6 +857,10 @@ impl AhjoorEscrowContract {
     ) -> u32 {
         Self::require_not_paused(&env);
         buyer.require_auth();
+        // #357: Enforce inspector score threshold for high-value escrows
+        if let Some(ref insp) = inspector {
+            Self::require_inspector_score_ok(&env, insp, request.amount);
+        }
         let escrow_id = Self::create_escrow_core(&env, &buyer, request);
         if let Some(ref insp) = inspector {
             let mut escrow: Escrow = env
@@ -956,6 +976,149 @@ impl AhjoorEscrowContract {
     /// Get the inspector report for an escrow.
     pub fn get_inspector_report(env: Env, escrow_id: u32) -> Option<InspectorReport> {
         env.storage().persistent().get(&DataKey::InspectorReport(escrow_id))
+    }
+
+    // ─── #357: Inspector Reputation Scoring ─────────────────────────────────
+
+    /// Admin-configurable minimum inspector accuracy (bps) and value threshold.
+    /// Inspectors below min_score_bps are blocked from escrows above value_threshold.
+    /// Set value_threshold to 0 to disable gating entirely.
+    pub fn set_inspector_score_threshold(
+        env: Env,
+        admin: Address,
+        min_score_bps: u32,
+        value_threshold: i128,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin { panic!("Only admin can set inspector score threshold"); }
+        if min_score_bps > 10_000 { panic!("min_score_bps must be <= 10000"); }
+        env.storage().instance().set(&DataKey2::MinInspectorScoreBps, &min_score_bps);
+        env.storage().instance().set(&DataKey2::InspectorScoreValueThreshold, &value_threshold);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the inspector's on-chain reputation score.
+    /// Returns (total_rulings, correct_rulings, accuracy_bps).
+    /// New inspectors with no rulings return (0, 0, 10_000) — neutral/full trust.
+    pub fn get_inspector_score(env: Env, inspector: Address) -> (u32, u32, u32) {
+        let score: InspectorScore = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::InspectorScore(inspector))
+            .unwrap_or(InspectorScore { total_rulings: 0, correct_rulings: 0 });
+        let accuracy_bps = if score.total_rulings == 0 {
+            10_000
+        } else {
+            (score.correct_rulings as u32 * 10_000) / score.total_rulings
+        };
+        (score.total_rulings, score.correct_rulings, accuracy_bps)
+    }
+
+    /// Admin-only: reverse a previous inspector ruling (e.g. overturned on appeal).
+    /// Decrements the inspector's correct_rulings and emits InspectorScoreUpdated.
+    /// Panics if the ruling was already appealed or no inspector was on the escrow.
+    pub fn appeal_inspector_ruling(env: Env, admin: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin { panic!("Only admin can appeal inspector ruling"); }
+
+        // Ensure an inspector was involved
+        let escrow: Escrow = env
+            .storage().persistent().get(&DataKey::Escrow(escrow_id)).expect("Escrow not found");
+        let inspector = escrow.extensions.inspector.clone().expect("No inspector on this escrow");
+
+        // Prevent double-appeal
+        let already_appealed: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::InspectorRulingAppealed(escrow_id))
+            .unwrap_or(false);
+        if already_appealed { panic!("Inspector ruling already appealed for this escrow"); }
+
+        // Decrement correct_rulings (floor at 0)
+        let key = DataKey2::InspectorScore(inspector.clone());
+        let mut score: InspectorScore = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(InspectorScore { total_rulings: 1, correct_rulings: 1 });
+        if score.correct_rulings > 0 {
+            score.correct_rulings -= 1;
+        }
+        env.storage().persistent().set(&key, &score);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        // Mark as appealed
+        env.storage().persistent().set(&DataKey2::InspectorRulingAppealed(escrow_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::InspectorRulingAppealed(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let accuracy_bps = if score.total_rulings == 0 {
+            10_000
+        } else {
+            (score.correct_rulings * 10_000) / score.total_rulings
+        };
+        events::emit_inspector_score_updated(&env, inspector, score.total_rulings, score.correct_rulings, accuracy_bps);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Internal: record a ruling for an inspector (increment total + correct).
+    /// Initializes to (1, 1) on first ruling for a neutral starting score.
+    fn record_inspector_ruling(env: &Env, inspector: &Address, correct: bool) {
+        let key = DataKey2::InspectorScore(inspector.clone());
+        let mut score: InspectorScore = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(InspectorScore { total_rulings: 0, correct_rulings: 0 });
+
+        if score.total_rulings == 0 {
+            // First ruling: initialize to neutral (1 total, 1 correct)
+            score.total_rulings = 1;
+            score.correct_rulings = 1;
+        } else {
+            score.total_rulings = score.total_rulings.saturating_add(1);
+            if correct {
+                score.correct_rulings = score.correct_rulings.saturating_add(1);
+            }
+        }
+
+        env.storage().persistent().set(&key, &score);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        let accuracy_bps = (score.correct_rulings * 10_000) / score.total_rulings;
+        events::emit_inspector_score_updated(env, inspector.clone(), score.total_rulings, score.correct_rulings, accuracy_bps);
+    }
+
+    /// Internal: check that the inspector meets the score threshold for a high-value escrow.
+    fn require_inspector_score_ok(env: &Env, inspector: &Address, amount: i128) {
+        let value_threshold: i128 = env
+            .storage().instance().get(&DataKey2::InspectorScoreValueThreshold).unwrap_or(0);
+        if value_threshold == 0 || amount <= value_threshold { return; }
+
+        let min_score_bps: u32 = env
+            .storage().instance().get(&DataKey2::MinInspectorScoreBps).unwrap_or(0);
+        if min_score_bps == 0 { return; }
+
+        let score: InspectorScore = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::InspectorScore(inspector.clone()))
+            .unwrap_or(InspectorScore { total_rulings: 0, correct_rulings: 0 });
+
+        // New inspectors (0 rulings) pass — they have not been disqualified yet
+        if score.total_rulings == 0 { return; }
+
+        let accuracy_bps = (score.correct_rulings * 10_000) / score.total_rulings;
+        if accuracy_bps < min_score_bps {
+            panic!("Inspector score below minimum threshold for high-value escrow");
+        }
     }
 
     fn create_escrow_core(env: &Env, buyer: &Address, request: EscrowCreateRequest) -> u32 {
@@ -2393,6 +2556,11 @@ impl AhjoorEscrowContract {
         let release_to_seller = buyer_percent == 0;
         events::emit_dispute_resolved(env, escrow_id, release_to_seller, arbiter.clone());
         events::emit_resolution_finalized(env, escrow_id, buyer_percent, arbiter);
+
+        // #357: Update inspector reputation score on each ruling
+        if let Some(inspector) = escrow.extensions.inspector.clone() {
+            Self::record_inspector_ruling(env, &inspector, true);
+        }
     }
 
     /// Returns true when an unresolved dispute has exceeded its timeout window.

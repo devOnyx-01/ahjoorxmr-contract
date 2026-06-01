@@ -345,6 +345,10 @@ pub enum DataKey3 {
     LateContributionCount,   // Map<Address, u32> — consecutive late payment count per member
     LateContribThreshold,    // u32 — late payments before demotion is triggered (default: 3)
     GracePeriodSeconds,      // u64 — seconds after deadline during which late payments are accepted
+    // #359: Savings goal milestone reward pool
+    SavingsRewardPool,       // i128 — token balance held for savings goal milestone rewards
+    // #359: Per-member milestone claim bitmask (goal_id, member) → u64 bitmask
+    SavingsMilestonesClaimed(u32, Address), // (goal_id, member) → u64
 }
 
 // ── #330: Contribution Delegation ────────────────────────────────────────────

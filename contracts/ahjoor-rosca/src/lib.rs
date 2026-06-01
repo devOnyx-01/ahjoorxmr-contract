@@ -5,13 +5,13 @@ use soroban_sdk::{
 use ahjoor_token_whitelist::TokenWhitelistClient;
 
 // Instance storage: config, counters, and active round state (bounded, shared TTL)
-const INSTANCE_LIFETIME_THRESHOLD: u32 = 100_000;
-const INSTANCE_BUMP_AMOUNT: u32 = 120_000;
+pub(crate) const INSTANCE_LIFETIME_THRESHOLD: u32 = 100_000;
+pub(crate) const INSTANCE_BUMP_AMOUNT: u32 = 120_000;
 
 // Persistent storage: RoundHistory (grows by one record per round — unbounded)
 // Each write extends its own TTL independently of the instance.
-const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100_000;
-const PERSISTENT_BUMP_AMOUNT: u32 = 120_000;
+pub(crate) const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100_000;
+pub(crate) const PERSISTENT_BUMP_AMOUNT: u32 = 120_000;
 
 // Temporary storage: ExitRequests (in-progress, pending admin approval — short-lived)
 // Auto-expires if not acted upon; no long-term retention needed.
@@ -8692,6 +8692,83 @@ impl AhjoorContract {
             .unwrap_or(Map::new(&env))
     }
 
+    // ── #359: Savings Goal Milestone Reward Distribution ─────────────────────
+
+    /// Admin funds the savings goal reward pool. Tokens are transferred from admin
+    /// to the contract and credited to the shared reward pool.
+    pub fn fund_savings_reward_pool(env: Env, admin: Address, amount: i128) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin { panic!("Only admin can fund the savings reward pool"); }
+        if amount <= 0 { panic!("Amount must be positive"); }
+
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&admin, &env.current_contract_address(), &amount);
+
+        let pool: i128 = env.storage().instance().get(&DataKey::RewardPool).unwrap_or(0);
+        env.storage().instance().set(&DataKey::RewardPool, &(pool + amount));
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Create a new savings goal for a group member.
+    pub fn create_savings_goal(
+        env: Env,
+        member: Address,
+        group_id: u32,
+        name: String,
+        description: String,
+        target_amount: i128,
+        token: Address,
+        target_date: u64,
+        priority: u32,
+        category: String,
+        metadata: Map<String, String>,
+    ) -> u32 {
+        savings_goal_tracking_impl::SavingsGoalTrackingImpl::create_goal(
+            &env, member, group_id, name, description, target_amount, token,
+            target_date, priority, category, metadata,
+        )
+    }
+
+    /// Add milestones (with optional reward_bps) to a savings goal.
+    pub fn add_savings_goal_milestones(
+        env: Env,
+        goal_id: u32,
+        milestones: Vec<savings_goal_tracking::Milestone>,
+    ) {
+        savings_goal_tracking_impl::SavingsGoalTrackingImpl::add_milestones(&env, goal_id, milestones);
+    }
+
+    /// Contribute to a savings goal. Milestone thresholds are checked and token rewards
+    /// distributed from the reward pool if any reward_bps milestones are newly crossed.
+    pub fn contribute_to_savings_goal(
+        env: Env,
+        goal_id: u32,
+        member: Address,
+        amount: i128,
+        source: String,
+    ) -> savings_goal_tracking::GoalContribution {
+        savings_goal_tracking_impl::SavingsGoalTrackingImpl::contribute_to_goal(
+            &env, goal_id, member, amount, source,
+        )
+    }
+
+    /// Returns the savings goal reward pool balance.
+    pub fn get_savings_reward_pool(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::RewardPool).unwrap_or(0)
+    }
+
+    /// Returns the bitmask of claimed milestones for a (goal_id, member) pair.
+    pub fn get_savings_milestones_claimed(env: Env, goal_id: u32, member: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::SavingsMilestonesClaimed(goal_id, member))
+            .unwrap_or(0u64)
+    }
+
 }
 
 mod test;
@@ -8705,4 +8782,6 @@ mod test_cosigner_guarantee;
 mod test_proxy;
 mod test_group_freeze;
 mod test_snapshot;
+#[cfg(test)]
+mod test_savings_milestone_rewards;
 pub use events::*;

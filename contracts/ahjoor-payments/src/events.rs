@@ -1885,6 +1885,28 @@ pub fn emit_recurring_payment_cancelled(e: &soroban_sdk::Env, schedule_id: u32, 
     );
 }
 
+// ── #358: Buyer Trust Tier Events ────────────────────────────────────────────
+
+/// Event: Merchant updated a buyer's trust tier (#358)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct BuyerTierUpdated {
+    pub merchant: Address,
+    pub buyer: Address,
+    pub old_tier: u32,
+    pub new_tier: u32,
+}
+
+pub fn emit_buyer_tier_updated(
+    e: &Env,
+    merchant: Address,
+    buyer: Address,
+    old_tier: u32,
+    new_tier: u32,
+) {
+    BuyerTierUpdated { merchant, buyer, old_tier, new_tier }.publish(e);
+}
+
 // ── #367: Dynamic Settlement Fee Tiers ───────────────────────────────────────
 
 /// Event: Fee tier applied during merchant settlement (#367)

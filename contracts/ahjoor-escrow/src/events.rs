@@ -1318,6 +1318,73 @@ pub fn emit_release_condition_waived(env: &Env, escrow_id: u32) {
     );
 }
 
+// --- #272/#357: Inspector Events ---
+
+/// Event: Seller marked work complete; awaiting inspector (#272)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SellerMarkedComplete {
+    pub escrow_id: u32,
+    pub seller: Address,
+}
+
+/// Event: Inspector replaced by mutual agreement (#272)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InspectorReplaced {
+    pub escrow_id: u32,
+    pub old_inspector: Address,
+    pub new_inspector: Address,
+}
+
+/// Event: Inspection report submitted by inspector (#272)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InspectionReportSubmitted {
+    pub escrow_id: u32,
+    pub inspector: Address,
+    pub approved: bool,
+    pub report_hash: BytesN<32>,
+}
+
+/// Event: Inspector reputation score updated (#357)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InspectorScoreUpdated {
+    pub inspector: Address,
+    pub total_rulings: u32,
+    pub correct_rulings: u32,
+    pub accuracy_bps: u32,
+}
+
+pub fn emit_seller_marked_complete(e: &Env, escrow_id: u32, seller: Address) {
+    SellerMarkedComplete { escrow_id, seller }.publish(e);
+}
+
+pub fn emit_inspector_replaced(e: &Env, escrow_id: u32, old_inspector: Address, new_inspector: Address) {
+    InspectorReplaced { escrow_id, old_inspector, new_inspector }.publish(e);
+}
+
+pub fn emit_inspection_report_submitted(
+    e: &Env,
+    escrow_id: u32,
+    inspector: Address,
+    approved: bool,
+    report_hash: BytesN<32>,
+) {
+    InspectionReportSubmitted { escrow_id, inspector, approved, report_hash }.publish(e);
+}
+
+pub fn emit_inspector_score_updated(
+    e: &Env,
+    inspector: Address,
+    total_rulings: u32,
+    correct_rulings: u32,
+    accuracy_bps: u32,
+) {
+    InspectorScoreUpdated { inspector, total_rulings, correct_rulings, accuracy_bps }.publish(e);
+}
+
 // ── #332: Milestone BPS Events ────────────────────────────────────────────────
 
 pub fn emit_milestone_submitted(e: &Env, escrow_id: u32, milestone_index: u32, delivery_hash: BytesN<32>) {
