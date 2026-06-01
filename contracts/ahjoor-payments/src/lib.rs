@@ -219,6 +219,16 @@ pub struct SpendLimit {
     pub window_seconds: u64,
 }
 
+/// #358: Trust tier for a buyer as assigned by the merchant.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuyerTrustTierLevel {
+    New = 0,
+    Standard = 1,
+    Trusted = 2,
+    VIP = 3,
+}
+
 /// Tracks cumulative spend within the current rolling window (#235).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -917,6 +927,10 @@ pub enum DataKey2 {
     RecurringSchedule(u32),
     /// #367: 30-day rolling settled volume record per merchant
     MerchantSettlementVolume(Address),
+    /// #358: buyer trust tier assigned by merchant (merchant, buyer) → BuyerTrustTierLevel
+    BuyerTrustTier(Address, Address),
+    /// #358: per-tier spending limit (merchant, tier_value as u32) → SpendLimit
+    TierSpendingLimit(Address, u32),
 }
 
 mod events;
@@ -7463,6 +7477,68 @@ impl AhjoorPaymentsContract {
             .get(&DataKey2::DefaultSpendLimit(merchant))
     }
 
+    // ─── #358: Buyer Trust Tier System ───────────────────────────────────────
+
+    /// Merchant assigns a trust tier to a buyer (New/Standard/Trusted/VIP).
+    /// Only the merchant may call this.
+    pub fn set_buyer_tier(
+        env: Env,
+        merchant: Address,
+        buyer: Address,
+        tier: BuyerTrustTierLevel,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        let key = DataKey2::BuyerTrustTier(merchant.clone(), buyer.clone());
+        let old_tier: u32 = env
+            .storage()
+            .persistent()
+            .get::<_, BuyerTrustTierLevel>(&key)
+            .map(|t| t as u32)
+            .unwrap_or(BuyerTrustTierLevel::New as u32);
+        env.storage().persistent().set(&key, &tier);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_buyer_tier_updated(&env, merchant, buyer, old_tier, tier as u32);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the trust tier assigned to a buyer by a specific merchant.
+    pub fn get_buyer_tier(env: Env, merchant: Address, buyer: Address) -> BuyerTrustTierLevel {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::BuyerTrustTier(merchant, buyer))
+            .unwrap_or(BuyerTrustTierLevel::New)
+    }
+
+    /// Merchant sets the spending limit for a specific trust tier.
+    /// tier_value: 0=New, 1=Standard, 2=Trusted, 3=VIP.
+    pub fn set_tier_spending_limit(
+        env: Env,
+        merchant: Address,
+        tier: BuyerTrustTierLevel,
+        amount: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if amount <= 0 { panic!("Tier spend limit amount must be positive"); }
+        if window_seconds == 0 { panic!("Window seconds must be positive"); }
+        let key = DataKey2::TierSpendingLimit(merchant.clone(), tier as u32);
+        let limit = SpendLimit { amount, window_seconds };
+        env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the spending limit configured for a trust tier by a merchant, if any.
+    pub fn get_tier_spending_limit(
+        env: Env,
+        merchant: Address,
+        tier: BuyerTrustTierLevel,
+    ) -> Option<SpendLimit> {
+        env.storage().persistent().get(&DataKey2::TierSpendingLimit(merchant, tier as u32))
+    }
+
     /// Check and update the customer spend window. Panics with CustomerSpendLimitExceeded if cap would be breached.
     fn check_and_update_customer_spend_limit(
         env: &Env,
@@ -7470,14 +7546,22 @@ impl AhjoorPaymentsContract {
         customer: &Address,
         amount: i128,
     ) {
-        // Individual override takes priority over default
+        // Priority: per-customer override → tier-based limit → global default (#358)
         let limit_opt: Option<SpendLimit> = env
             .storage()
             .persistent()
-            .get(&DataKey2::CustomerSpendLimit(
-                merchant.clone(),
-                customer.clone(),
-            ))
+            .get(&DataKey2::CustomerSpendLimit(merchant.clone(), customer.clone()))
+            .or_else(|| {
+                // #358: check tier-based limit
+                let tier: BuyerTrustTierLevel = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey2::BuyerTrustTier(merchant.clone(), customer.clone()))
+                    .unwrap_or(BuyerTrustTierLevel::New);
+                env.storage()
+                    .persistent()
+                    .get(&DataKey2::TierSpendingLimit(merchant.clone(), tier as u32))
+            })
             .or_else(|| {
                 env.storage()
                     .persistent()
@@ -9159,5 +9243,7 @@ mod test_referral;
 mod test_retry_queue;
 #[cfg(test)]
 mod test_spending_limit;
+#[cfg(test)]
+mod test_buyer_trust_tier;
 
 pub use events::*;
