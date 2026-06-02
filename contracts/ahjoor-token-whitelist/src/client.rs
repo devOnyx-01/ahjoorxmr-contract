@@ -9,7 +9,30 @@ use crate::TokenQuota;
 pub trait TokenWhitelistInterface {
     /// Check if a token is allowed
     fn is_token_allowed(env: Env, token: Address) -> bool;
-    
+
+    /// Check if a token is allowed for a specific contract (contract-level allowlist takes precedence)
+    fn is_token_allowed_for_contract(env: Env, contract_id: Address, token: Address) -> bool;
+
+    /// Set a contract-level token allowlist entry (admin only)
+    fn set_contract_token(
+        env: Env,
+        admin: Address,
+        contract_id: Address,
+        token: Address,
+        expiry_ledger: Option<u32>,
+    );
+
+    /// Remove a token from a contract-level allowlist (admin only)
+    fn remove_contract_token(env: Env, admin: Address, contract_id: Address, token: Address);
+
+    /// Query a contract-level allowlist entry.
+    /// Returns None if no entry exists; Some(None) = permanent; Some(Some(n)) = expires at ledger n.
+    fn get_contract_token_entry(
+        env: Env,
+        contract_id: Address,
+        token: Address,
+    ) -> Option<Option<u32>>;
+
     /// Add a token to the whitelist (admin only)
     fn add_token(env: Env, admin: Address, token: Address);
     

@@ -2898,7 +2898,8 @@ impl AhjoorRefundContract {
             .get(&DataKey::TokenWhitelistContract)
     }
 
-    /// Check if a token is allowed via the whitelist contract
+    /// Check if a token is allowed via the whitelist contract.
+    /// Delegates to contract-level allowlist first, then global whitelist.
     pub fn is_token_allowed(env: Env, token: Address) -> bool {
         if let Some(whitelist_contract) = env
             .storage()
@@ -2906,9 +2907,8 @@ impl AhjoorRefundContract {
             .get::<DataKey, Address>(&DataKey::TokenWhitelistContract)
         {
             let client = TokenWhitelistClient::new(&env, &whitelist_contract);
-            client.is_token_allowed(&token)
+            client.is_token_allowed_for_contract(&env.current_contract_address(), &token)
         } else {
-            // If no whitelist contract is set, allow all tokens (backward compatibility)
             true
         }
     }
@@ -2986,11 +2986,10 @@ impl AhjoorRefundContract {
             .get::<DataKey, Address>(&DataKey::TokenWhitelistContract)
         {
             let client = TokenWhitelistClient::new(env, &whitelist_contract);
-            if !client.is_token_allowed(token) {
+            if !client.is_token_allowed_for_contract(&env.current_contract_address(), token) {
                 panic!("TokenNotAllowed");
             }
         }
-        // If no whitelist contract is set, allow all tokens (backward compatibility)
     }
 
     fn append_index(env: &Env, key: &DataKey, refund_id: u32) {

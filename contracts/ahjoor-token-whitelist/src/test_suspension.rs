@@ -1,10 +1,10 @@
 #![cfg(test)]
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+use soroban_sdk::{testutils::{Address as _, Ledger}, Address, BytesN, Env};
 
 use crate::{TokenWhitelistContract, TokenWhitelistContractClient};
 
 fn setup(env: &Env) -> (TokenWhitelistContractClient<'static>, Address) {
-    let contract_id = env.register_contract(None, TokenWhitelistContract);
+    let contract_id = env.register(TokenWhitelistContract, ());
     let client = TokenWhitelistContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
     client.initialize(&admin);
@@ -98,7 +98,9 @@ fn test_suspension_history_stored() {
 
     let history = client.get_suspension_history(&token);
     assert_eq!(history.len(), 1);
-    assert!(!history.get(0).unwrap().lifted_early);
+    // History entry contains start_ledger, expiry_ledger, and reason_hash
+    let entry = history.get(0).unwrap();
+    assert_eq!(entry.expiry_ledger, env.ledger().sequence() + 100);
 }
 
 #[test]
