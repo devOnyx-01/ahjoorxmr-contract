@@ -78,6 +78,8 @@ pub enum DataKey {
     WhitelistedTokens,
     /// Persistent: Active suspension record per token
     SuspensionRecord(Address),
+    /// Persistent: Contract-level token allowlist entry; value = Option<expiry_ledger>
+    ContractTokenAllowlist(Address, Address),
     /// Persistent: Suspension history per token (last 10 entries)
     SuspensionHistory(Address),
     /// Persistent: Token quota configuration per token
@@ -344,23 +346,24 @@ impl TokenWhitelistContract {
     /// Update decimals for a token metadata entry
     pub fn update_token_decimals(env: Env, admin: Address, token: Address, decimals: u32) {
         admin.require_auth(); Self::require_admin(&env, &admin);
-        let mut md: TokenMetadata = env.storage().persistent().get(&DataKey::TokenMetadata(token)).expect("Metadata not set");
+        let mut md: TokenMetadata = env.storage().persistent().get(&DataKey::TokenMetadata(token.clone())).expect("Metadata not set");
         md.decimals = decimals;
-        env.storage().persistent().set(&DataKey::TokenMetadata(token), &md);
-        env.storage().persistent().extend_ttl(&DataKey::TokenMetadata(token), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().set(&DataKey::TokenMetadata(token.clone()), &md);
+        env.storage().persistent().extend_ttl(&DataKey::TokenMetadata(token.clone()), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         events::emit_token_metadata_set(&env, token, md.symbol.clone(), md.decimals);
     }
 
     /// Paginated listing of token metadata (max 50)
     pub fn get_all_token_metadata(env: Env, offset: u32, limit: u32) -> Vec<TokenMetadata> {
         let whitelist: Vec<Address> = env.storage().persistent().get(&DataKey::WhitelistedTokens).unwrap_or_else(|| Vec::new(&env));
+        let wlen = whitelist.len() as usize;
         let start = offset as usize;
         let mut l = limit.min(50) as usize;
-        if start >= whitelist.len() { return Vec::new(&env); }
-        if start + l > whitelist.len() { l = whitelist.len() - start; }
+        if start >= wlen { return Vec::new(&env); }
+        if start + l > wlen { l = wlen - start; }
         let mut res = Vec::new(&env);
         for i in start..start + l {
-            let t = whitelist.get(i).unwrap();
+            let t = whitelist.get(i as u32).unwrap();
             if let Some(md) = env.storage().persistent().get::<_, TokenMetadata>(&DataKey::TokenMetadata(t.clone())) {
                 res.push_back(md);
             }
@@ -692,6 +695,76 @@ impl TokenWhitelistContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    // --- Contract-Level Token Allowlist ---
+
+    /// Set or update a contract-level token allowlist entry (admin only).
+    /// `expiry_ledger`: None = permanent, Some(n) = expires at ledger n.
+    pub fn set_contract_token(
+        env: Env,
+        admin: Address,
+        contract_id: Address,
+        token: Address,
+        expiry_ledger: Option<u32>,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let key = DataKey::ContractTokenAllowlist(contract_id.clone(), token.clone());
+        env.storage().persistent().set(&key, &expiry_ledger);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_contract_token_allowlist_updated(&env, contract_id, token, true, expiry_ledger);
+    }
+
+    /// Remove a token from a contract-level allowlist (admin only).
+    pub fn remove_contract_token(env: Env, admin: Address, contract_id: Address, token: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let key = DataKey::ContractTokenAllowlist(contract_id.clone(), token.clone());
+        env.storage().persistent().remove(&key);
+
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_contract_token_allowlist_updated(&env, contract_id, token, false, None);
+    }
+
+    /// Query a contract-level allowlist entry.
+    /// Returns `None` if no entry exists, or `Some(Option<expiry_ledger>)` if one does
+    /// (where `None` inner means permanent and `Some(n)` means expires at ledger n).
+    pub fn get_contract_token_entry(
+        env: Env,
+        contract_id: Address,
+        token: Address,
+    ) -> Option<Option<u32>> {
+        let key = DataKey::ContractTokenAllowlist(contract_id, token);
+        env.storage().persistent().get::<_, Option<u32>>(&key)
+    }
+
+    /// Check if a token is allowed for a specific calling contract.
+    /// Contract-level allowlist takes precedence over the global whitelist.
+    /// Expired contract-level entries fall back to the global whitelist.
+    pub fn is_token_allowed_for_contract(env: Env, contract_id: Address, token: Address) -> bool {
+        let key = DataKey::ContractTokenAllowlist(contract_id, token.clone());
+        if let Some(expiry) = env.storage().persistent().get::<_, Option<u32>>(&key) {
+            match expiry {
+                None => return true, // permanent contract-level approval
+                Some(exp) => {
+                    if env.ledger().sequence() < exp {
+                        return true; // still valid
+                    }
+                    // expired — fall through to global
+                }
+            }
+        }
+        // No contract-level entry (or expired) — fall back to global whitelist
+        Self::is_token_allowed(env, token)
     }
 
     // --- Token Quota Functions ---
@@ -1246,3 +1319,6 @@ mod test_suspension;
 
 #[cfg(test)]
 mod test_governance;
+
+#[cfg(test)]
+mod test_contract_allowlist;

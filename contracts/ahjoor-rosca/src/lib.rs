@@ -556,7 +556,8 @@ impl AhjoorContract {
             .get(&DataKey2::TokenWhitelistContract)
     }
 
-    /// Check if a token is allowed via the whitelist contract
+    /// Check if a token is allowed via the whitelist contract.
+    /// Delegates to contract-level allowlist first, then global whitelist.
     pub fn is_token_allowed(env: Env, token: Address) -> bool {
         if let Some(whitelist_contract) = env
             .storage()
@@ -564,7 +565,7 @@ impl AhjoorContract {
             .get::<DataKey2, Address>(&DataKey2::TokenWhitelistContract)
         {
             let client = TokenWhitelistClient::new(&env, &whitelist_contract);
-            client.is_token_allowed(&token)
+            client.is_token_allowed_for_contract(&env.current_contract_address(), &token)
         } else {
             // If no whitelist contract is set, allow all tokens (backward compatibility)
             true
@@ -703,7 +704,8 @@ impl AhjoorContract {
         }
     }
 
-    /// Validates that a token is allowed via the whitelist contract
+    /// Validates that a token is allowed via the whitelist contract.
+    /// Delegates to contract-level allowlist first, then global whitelist.
     fn require_token_allowed(env: &Env, token: &Address) {
         if let Some(whitelist_contract) = env
             .storage()
@@ -711,7 +713,7 @@ impl AhjoorContract {
             .get::<DataKey2, Address>(&DataKey2::TokenWhitelistContract)
         {
             let client = TokenWhitelistClient::new(env, &whitelist_contract);
-            if !client.is_token_allowed(token) {
+            if !client.is_token_allowed_for_contract(&env.current_contract_address(), token) {
                 panic_with_error!(env, Error::TokenNotApproved);
             }
         }

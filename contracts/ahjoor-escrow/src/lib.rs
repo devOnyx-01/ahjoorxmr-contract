@@ -4067,9 +4067,8 @@ impl AhjoorEscrowContract {
             .get::<DataKey, Address>(&DataKey::TokenWhitelistContract)
         {
             let client = TokenWhitelistClient::new(&env, &whitelist_contract);
-            client.is_token_allowed(&token)
+            client.is_token_allowed_for_contract(&env.current_contract_address(), &token)
         } else {
-            // If no whitelist contract is set, allow all tokens (backward compatibility)
             true
         }
     }
@@ -5991,19 +5990,7 @@ impl AhjoorEscrowContract {
     }
 
     /// Validates that a token is allowed via the whitelist contract
-    fn require_token_allowed(env: &Env, token: &Address) {
-        if let Some(whitelist_contract) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::TokenWhitelistContract)
-        {
-            let client = TokenWhitelistClient::new(env, &whitelist_contract);
-            if !client.is_token_allowed(token) {
-                panic!("TokenNotAllowed");
-            }
-        }
-        // If no whitelist contract is set, allow all tokens (backward compatibility)
-    }
+    fn require_token_allowed(env: &Env, token: &Address) {`r`n        if let Some(whitelist_contract) = env`r`n            .storage()`r`n            .instance()`r`n            .get::<DataKey, Address>(&DataKey::TokenWhitelistContract)`r`n        {`r`n            let client = TokenWhitelistClient::new(env, &whitelist_contract);`r`n            if !client.is_token_allowed_for_contract(&env.current_contract_address(), token) {`r`n                panic!("TokenNotAllowed");`r`n            }`r`n        }`r`n    }
 
     fn require_unlocked(env: &Env, escrow: &Escrow) {
         if let Some(lock_until) = escrow.extensions.min_lock_until {

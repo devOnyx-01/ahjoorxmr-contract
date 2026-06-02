@@ -211,6 +211,27 @@ pub fn emit_token_quota_exceeded(e: &Env, token: Address, attempted_amount: i128
     .publish(e);
 }
 
+// ─── Feature: Contract-Level Token Allowlist ─────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ContractTokenAllowlistUpdated {
+    pub contract_id: Address,
+    pub token: Address,
+    pub action: bool, // true = added/updated, false = removed
+    pub expiry: Option<u32>,
+}
+
+pub fn emit_contract_token_allowlist_updated(
+    e: &Env,
+    contract_id: Address,
+    token: Address,
+    action: bool,
+    expiry: Option<u32>,
+) {
+    ContractTokenAllowlistUpdated { contract_id, token, action, expiry }.publish(e);
+}
+
 // ─── Feature: Community Governance Voting ────────────────────────────────────
 
 #[contractevent]
