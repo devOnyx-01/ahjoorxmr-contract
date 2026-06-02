@@ -61,6 +61,8 @@ pub struct Milestone {
     pub reward_value: i128,
     /// Celebration event
     pub celebration_event: String,
+    /// #359: On-chain token reward as basis points of contribution amount (0 = no token reward)
+    pub reward_bps: u32,
 }
 
 #[contracttype]

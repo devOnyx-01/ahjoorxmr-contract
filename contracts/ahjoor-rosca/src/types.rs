@@ -293,6 +293,8 @@ pub enum DataKey2 {
     RandomizePayoutOrder,    // bool — enable randomization for this group
     PayoutOrderSeed,         // BytesN<32> — seed for Fisher-Yates shuffle
     PayoutOrderFinalized,    // bool — track if order has been finalized
+    // #352: Contribution Rebalancing
+    BasePoolTarget,          // i128 — immutable payout target per cycle (initial_members × contribution_amount)
 }
 
 /// Overflow key enum — DataKey2 is capped at 50 variants by the soroban XDR limit.
@@ -339,6 +341,19 @@ pub enum DataKey3 {
     SplitProposalCounter,    // u32
     SplitProposals,          // Map<u32, SplitProposal>
     SplitConfirmationWindow, // u32 — ledgers members have to confirm
+    // #356: Penalty-Based Slot Demotion
+    LateContributionCount,   // Map<Address, u32> — consecutive late payment count per member
+    LateContribThreshold,    // u32 — late payments before demotion is triggered (default: 3)
+    GracePeriodSeconds,      // u64 — seconds after deadline during which late payments are accepted
+    // #359: Savings goal milestone reward pool
+    SavingsRewardPool,       // i128 — token balance held for savings goal milestone rewards
+    // #359: Per-member milestone claim bitmask (goal_id, member) → u64 bitmask
+    SavingsMilestonesClaimed(u32, Address), // (goal_id, member) → u64
+    // #375: Sealed-bid (commit-reveal) slot auction
+    SealedAuction,             // SealedAuctionState — config + current phase state
+    SlotBidCommit(u32, Address), // (round, bidder) → SealedCommit
+    SealedCommitters(u32),     // (round) → Vec<Address> — everyone who committed this round
+    SealedRevealedBids(u32),   // (round) → Vec<SlotBid> — valid revealed bids this round
 }
 
 // ── #330: Contribution Delegation ────────────────────────────────────────────
@@ -387,6 +402,21 @@ pub enum PersistentKey {
     LastSnapshotLedger,        // u32 — last snapshot ledger for spam guard (#243)
     MinSnapshotIntervalLedgers, // u32 — min interval between snapshots (#243)
     MemberCreditScores,        // Map<Address, MemberScore> — per-member credit score (#269)
+    /// #364: Point-in-time cycle snapshot keyed by cycle number
+    CycleSnapshot(u32),        // cycle_number → CycleSnapshotData
+}
+
+/// #364: Immutable point-in-time snapshot of group state at cycle end.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CycleSnapshotData {
+    pub cycle_number: u32,
+    pub members: Vec<Address>,
+    pub contribution_amounts: Map<Address, i128>,
+    pub payout_queue: Vec<Address>,
+    pub pool_balance: i128,
+    pub timestamp: u64,
+    pub snapshot_hash: BytesN<32>,
 }
 
 /// Record of a single freeze/unfreeze cycle for a group.
@@ -624,6 +654,45 @@ pub struct SlotBid {
     pub amount: i128,
     /// Ledger timestamp at which the bid was placed (used for tie-breaking).
     pub placed_at: u64,
+}
+
+// ── #375: Sealed-Bid (Commit-Reveal) Slot Auction ─────────────────────────────
+
+/// #375: Configuration and live phase state for a commit-reveal sealed-bid
+/// slot auction. A single struct keeps the auction's tunables and the current
+/// phase deadlines together under one storage key.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedAuctionState {
+    /// Whether sealed-bid auctions are enabled for this group.
+    pub enabled: bool,
+    /// Duration (seconds) of the commit phase once an auction is opened.
+    pub commit_duration: u64,
+    /// Duration (seconds) of the reveal phase that follows the commit phase.
+    pub reveal_duration: u64,
+    /// Minimum reserve price; the winning bid must strictly exceed this.
+    pub min_reserve: i128,
+    /// Round this auction targets (meaningful only while `open`).
+    pub round: u32,
+    /// Timestamp at which the commit phase closes.
+    pub commit_until: u64,
+    /// Timestamp at which the reveal phase closes.
+    pub reveal_until: u64,
+    /// Whether an auction is currently open (awaiting settlement).
+    pub open: bool,
+}
+
+/// #375: A stored commitment for a single sealed bid.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedCommit {
+    /// sha256(bid_amount.to_be_bytes() || salt) committed during the commit phase.
+    pub commit_hash: BytesN<32>,
+    /// Collateral deposited at commit time; also the upper bound on the bid the
+    /// bidder may later reveal.
+    pub deposit: i128,
+    /// Whether this commitment has already been revealed.
+    pub revealed: bool,
 }
 
 // ── Cross-Group Member Migration ───────────────────────────────────────────────
