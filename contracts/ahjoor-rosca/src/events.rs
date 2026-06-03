@@ -1489,31 +1489,19 @@ pub struct TreasuryPaymentExecuted {
 
 
 pub fn emit_treasury_enabled(env: &Env, treasury_admin: Address) {
-    env.events().publish(
-        ("ahjoor", "treasury_enabled"),
-        TreasuryEnabled { group_id: 0, treasury_admin },
-    );
+    TreasuryEnabled { group_id: 0, treasury_admin }.publish(env);
 }
 
 pub fn emit_treasury_round_proposed(env: &Env, round_index: u32) {
-    env.events().publish(
-        ("ahjoor", "treasury_round_proposed"),
-        TreasuryRoundProposed { group_id: 0, round_index },
-    );
+    TreasuryRoundProposed { group_id: 0, round_index }.publish(env);
 }
 
 pub fn emit_treasury_round_confirmed(env: &Env, round_index: u32) {
-    env.events().publish(
-        ("ahjoor", "treasury_round_confirmed"),
-        TreasuryRoundConfirmed { group_id: 0, round_index },
-    );
+    TreasuryRoundConfirmed { group_id: 0, round_index }.publish(env);
 }
 
 pub fn emit_treasury_payment_executed(env: &Env, recipient: Address, amount: i128) {
-    env.events().publish(
-        ("ahjoor", "treasury_payment_executed"),
-        TreasuryPaymentExecuted { group_id: 0, recipient, amount },
-    );
+    TreasuryPaymentExecuted { group_id: 0, recipient, amount }.publish(env);
 }
 
 // --- Emergency Liquidity Reserve Events (#313) ---
@@ -1655,5 +1643,40 @@ pub struct SnapshotCreated {
 
 pub fn emit_snapshot_created(e: &Env, group_id: u32, cycle_number: u32, snapshot_hash: BytesN<32>) {
     SnapshotCreated { group_id, cycle_number, snapshot_hash }.publish(e);
+}
+
+pub fn emit_slot_bid_placed(e: &Env, group_id: u32, bidder: Address, desired_slot: u32, bid_amount: i128) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "SlotBidPlaced"),),
+        (group_id, bidder, desired_slot, bid_amount),
+    );
+}
+
+pub fn emit_slot_auction_resolved(e: &Env, group_id: u32, winner: Address, slot: u32, winning_bid: i128, bonus_per_member: i128) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "SlotAuctionResolved"),),
+        (group_id, winner, slot, winning_bid, bonus_per_member),
+    );
+}
+
+pub fn emit_migration_requested(e: &Env, member: Address, src_contract: Address, to_group: Address) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "MigrationRequested"),),
+        (member, src_contract, to_group),
+    );
+}
+
+pub fn emit_migration_executed(e: &Env, member: Address, from_group: Address, dest_contract: Address, target_slot: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "MigrationExecuted"),),
+        (member, from_group, dest_contract, target_slot),
+    );
+}
+
+pub fn emit_proxy_expired(e: &Env, group_id: u32, member: Address, proxy: Address, expiry_ledger: u64) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "ProxyExpired"),),
+        (group_id, member, proxy, expiry_ledger),
+    );
 }
 

@@ -1269,13 +1269,7 @@ pub fn emit_multi_seller_escrow_released(
     escrow_id: u32,
     distributions: Vec<(Address, i128)>,
 ) {
-    env.events().publish(
-        ("ahjoor", "multi_seller_escrow_released"),
-        MultiSellerEscrowReleased {
-            escrow_id,
-            distributions,
-        },
-    );
+    MultiSellerEscrowReleased { escrow_id, distributions }.publish(env);
 }
 
 pub fn emit_seller_share_delegated(
@@ -1284,14 +1278,7 @@ pub fn emit_seller_share_delegated(
     original_seller: Address,
     delegate: Address,
 ) {
-    env.events().publish(
-        ("ahjoor", "seller_share_delegated"),
-        SellerShareDelegated {
-            escrow_id,
-            original_seller,
-            delegate,
-        },
-    );
+    SellerShareDelegated { escrow_id, original_seller, delegate }.publish(env);
 }
 
 
@@ -1301,21 +1288,11 @@ pub fn emit_conditional_release_triggered(
     oracle_contract: Address,
     condition_value: i128,
 ) {
-    env.events().publish(
-        ("ahjoor", "conditional_release_triggered"),
-        ConditionalReleaseTriggered {
-            escrow_id,
-            oracle_contract,
-            condition_value,
-        },
-    );
+    ConditionalReleaseTriggered { escrow_id, oracle_contract, condition_value }.publish(env);
 }
 
 pub fn emit_release_condition_waived(env: &Env, escrow_id: u32) {
-    env.events().publish(
-        ("ahjoor", "release_condition_waived"),
-        ReleaseConditionWaived { escrow_id },
-    );
+    ReleaseConditionWaived { escrow_id }.publish(env);
 }
 
 // ── #332: Milestone BPS Events ────────────────────────────────────────────────

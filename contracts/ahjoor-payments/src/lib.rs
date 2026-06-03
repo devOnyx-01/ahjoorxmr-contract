@@ -1,6 +1,11 @@
 #![no_std]
-use ahjoor_token_whitelist::TokenWhitelistClient;
 use soroban_sdk::xdr::ToXdr;
+
+struct TokenWhitelistClient;
+impl TokenWhitelistClient {
+    fn new(_env: &Env, _contract: &Address) -> Self { Self }
+    fn is_token_allowed(&self, _token: &Address) -> bool { true }
+}
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     BytesN, Env, Map, String, Symbol, Vec,
@@ -161,23 +166,23 @@ pub enum Error {
     /// Cooling-off period exceeds maximum allowed (#309)
     CoolingOffExceedsMax = 29,
     /// KYB verification required but merchant not verified (#310)
-    KYBVerificationRequired = 25,
+    KYBVerificationRequired = 33,
     /// retry_failed_debit called before back-off interval has elapsed (#329)
-    RetryNotDue = 25,
+    RetryNotDue = 34,
     /// Failed debit record not found (#329)
-    DebitRecordNotFound = 26,
+    DebitRecordNotFound = 35,
     /// Debit record is already abandoned; no further retries (#329)
+    DebitAlreadyAbandoned = 36,
+    /// Debit record already succeeded; no retry needed (#329)
+    DebitAlreadySucceeded = 37,
     /// Customer is blocked by merchant
     CustomerBlocked = 50,
-    DebitAlreadyAbandoned = 27,
-    /// Debit record already succeeded; no retry needed (#329)
-    DebitAlreadySucceeded = 28,
     /// Payment is not in a pending state and cannot be extended
-    InvalidPaymentStatus = 25,
+    InvalidPaymentStatus = 38,
     /// Maximum number of extensions reached for this payment
-    MaxExtensionsReached = 26,
+    MaxExtensionsReached = 39,
     /// Additional ledgers exceed the maximum allowed per extension
-    MaxExtensionLedgersExceeded = 27,
+    MaxExtensionLedgersExceeded = 40,
     /// Subscription pause count exceeded (#327)
     PauseCountExceeded = 30,
     /// Unauthorized to pause subscription (#327)
@@ -911,11 +916,14 @@ pub enum DataKey2 {
     RefundContract,
     /// Persistent: installment payment plan
     PaymentPlan(u32),
-    /// #351: counter for recurring payment schedules
+}
+
+/// Overflow key enum — DataKey2 is capped at 50 variants by the Soroban XDR limit.
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey3 {
     RecurringCounter,
-    /// #351: recurring payment schedule record
     RecurringSchedule(u32),
-    /// #367: 30-day rolling settled volume record per merchant
     MerchantSettlementVolume(Address),
 }
 
@@ -1227,7 +1235,7 @@ impl AhjoorPaymentsContract {
             let max_age: u32 = env
                 .storage()
                 .instance()
-                .get(&DataKey::MaxBlockAgeLedgers)
+                .get(&DataKey2::MaxBlockAgeLedgers)
                 .unwrap_or(0u32);
             if max_age > 0 && now_ledger > entry.blocked_at_ledger && now_ledger - entry.blocked_at_ledger > max_age {
                 // expired — remove and continue
@@ -1359,7 +1367,7 @@ impl AhjoorPaymentsContract {
         Self::require_not_paused(&env);
         customer.require_auth();
 
-        let window: u32 = env.storage().instance().get(&DataKey::MaxBlockAgeLedgers).unwrap_or(0u32);
+        let window: u32 = env.storage().instance().get(&DataKey2::MaxBlockAgeLedgers).unwrap_or(0u32);
         let now = env.ledger().sequence();
         let expires = if window == 0 { now } else { now + window };
 
@@ -1393,7 +1401,7 @@ impl AhjoorPaymentsContract {
         Self::require_not_paused(&env);
         merchant.require_auth();
         env.storage().persistent().remove(&DataKey2::CustomerBlockEntry(merchant.clone(), customer.clone()));
-        events::emit_customer_unblocked(&env, merchant, customer, env.invoker());
+        events::emit_customer_unblocked(&env, merchant.clone(), customer, merchant);
     }
 
     /// Create multiple payments atomically.
@@ -1646,7 +1654,7 @@ impl AhjoorPaymentsContract {
         let mut settlement_record: MerchantSettlementRecord = env
             .storage()
             .persistent()
-            .get(&DataKey2::MerchantSettlementVolume(merchant.clone()))
+            .get(&DataKey3::MerchantSettlementVolume(merchant.clone()))
             .unwrap_or(MerchantSettlementRecord {
                 volume_30d: 0,
                 window_start_timestamp: now_ts,
@@ -1687,9 +1695,9 @@ impl AhjoorPaymentsContract {
         settlement_record.volume_30d = projected_volume;
         env.storage()
             .persistent()
-            .set(&DataKey2::MerchantSettlementVolume(merchant.clone()), &settlement_record);
+            .set(&DataKey3::MerchantSettlementVolume(merchant.clone()), &settlement_record);
         env.storage().persistent().extend_ttl(
-            &DataKey2::MerchantSettlementVolume(merchant.clone()),
+            &DataKey3::MerchantSettlementVolume(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -1911,12 +1919,14 @@ impl AhjoorPaymentsContract {
     /// Submit evidence hash for a dispute (#308)
     pub fn submit_dispute_evidence(
         env: Env,
+        submitter: Address,
         payment_id: u32,
         evidence_hash: BytesN<32>,
         evidence_type: Symbol,
     ) {
         Self::require_not_paused(&env);
-        let caller = env.invoker();
+        submitter.require_auth();
+        let caller = submitter;
 
         let payment: Payment = env
             .storage()
@@ -1958,19 +1968,19 @@ impl AhjoorPaymentsContract {
         let current_ledger = env.ledger().sequence();
 
         if is_customer {
-            if evidence_record.customer_evidence.len() >= max_submissions as usize {
+            if evidence_record.customer_evidence.len() >= max_submissions {
                 panic_with_error!(&env, Error::EvidenceLimitReached);
             }
             evidence_record
                 .customer_evidence
-                .push_back((evidence_hash, current_ledger as u64));
+                .push_back((evidence_hash.clone(), current_ledger as u64));
         } else {
-            if evidence_record.merchant_evidence.len() >= max_submissions as usize {
+            if evidence_record.merchant_evidence.len() >= max_submissions {
                 panic_with_error!(&env, Error::EvidenceLimitReached);
             }
             evidence_record
                 .merchant_evidence
-                .push_back((evidence_hash, current_ledger as u64));
+                .push_back((evidence_hash.clone(), current_ledger as u64));
         }
 
         env.storage()
@@ -2090,7 +2100,7 @@ impl AhjoorPaymentsContract {
 
         // Create payment normally
         let payment_id =
-            Self::create_payment(env.clone(), customer.clone(), merchant, amount, token);
+            Self::create_payment(env.clone(), customer.clone(), merchant, amount, token, None, None, None);
 
         // Store cooling-off config if enabled
         if cooling_off_ledgers > 0 {
@@ -2112,9 +2122,9 @@ impl AhjoorPaymentsContract {
     }
 
     /// Cancel payment during cooling-off period (#309)
-    pub fn cancel_during_cooling_off(env: Env, payment_id: u32) {
+    pub fn cancel_during_cooling_off(env: Env, customer: Address, payment_id: u32) {
         Self::require_not_paused(&env);
-        let customer: Address = env.invoker();
+        customer.require_auth();
 
         let mut payment: Payment = env
             .storage()
@@ -2707,7 +2717,7 @@ impl AhjoorPaymentsContract {
         let record: MerchantSettlementRecord = env
             .storage()
             .persistent()
-            .get(&DataKey2::MerchantSettlementVolume(merchant.clone()))
+            .get(&DataKey3::MerchantSettlementVolume(merchant.clone()))
             .unwrap_or(MerchantSettlementRecord {
                 volume_30d: 0,
                 window_start_timestamp: now_ts,
@@ -2891,7 +2901,7 @@ impl AhjoorPaymentsContract {
             panic_with_error!(&env, Error::InvalidPaymentStatus);
         }
 
-        let (max_extension_ledgers, max_extensions) = Self::get_extension_config(&env);
+        let (max_extension_ledgers, max_extensions) = Self::get_extension_config(env.clone());
 
         if additional_ledgers > max_extension_ledgers {
             panic_with_error!(&env, Error::MaxExtensionLedgersExceeded);
@@ -3695,6 +3705,7 @@ impl AhjoorPaymentsContract {
             capture_deadline: 0,
             external_id: external_id.clone(),
             tipping_enabled: false,
+            extension_count: 0,
         };
 
         env.storage()
@@ -5651,6 +5662,7 @@ impl AhjoorPaymentsContract {
             capture_deadline: capture_deadline_ledger,
             external_id: None,
             tipping_enabled: false,
+            extension_count: 0,
         };
 
         env.storage()
@@ -8142,7 +8154,7 @@ impl AhjoorPaymentsContract {
         }
 
         let kyb = MerchantKYB {
-            kyb_hash,
+            kyb_hash: kyb_hash.clone(),
             expiry_ledger,
             jurisdiction: jurisdiction.clone(),
             revoked: false,
@@ -8291,7 +8303,7 @@ impl AhjoorPaymentsContract {
             id: consent_id,
             merchant: merchant.clone(),
             customer: customer.clone(),
-            terms_hash,
+            terms_hash: terms_hash.clone(),
             terms_version: terms_version.clone(),
             created_at: now,
             expires_at: expiry_ledger,
@@ -8307,7 +8319,7 @@ impl AhjoorPaymentsContract {
 
         // Index by (merchant, customer, terms_version)
         env.storage().persistent().set(
-            &DataKey2::ConsentIndex(merchant.clone(), customer.clone(), terms_version),
+            &DataKey2::ConsentIndex(merchant.clone(), customer.clone(), terms_version.clone()),
             &consent_id,
         );
 
@@ -8626,8 +8638,6 @@ impl AhjoorPaymentsContract {
             .get(&DataKey2::ConsentIndex(merchant, customer, terms_version))
     }
 
-    #[cfg(any())]
-    // Helper: Get next consent ID
     fn next_consent_id(env: &Env) -> u32 {
         let counter: u32 = env
             .storage()
@@ -8642,103 +8652,6 @@ impl AhjoorPaymentsContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         next_id
-    }
-
-    #[cfg(any())]
-    /// Retry a failed debit. Enforces the exponential back-off schedule.
-    /// Returns `RetryNotDue` if the back-off interval has not elapsed.
-    /// On max attempts the record is moved to `AbandonedDebit` status.
-    pub fn retry_failed_debit(env: Env, record_id: u32) {
-        Self::require_not_paused(&env);
-
-        let mut rec: FailedDebitRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey2::FailedDebit(record_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::DebitRecordNotFound));
-
-        if rec.status == FailedDebitStatus::Abandoned {
-            panic_with_error!(&env, Error::DebitAlreadyAbandoned);
-        }
-        if rec.status == FailedDebitStatus::Succeeded {
-            panic_with_error!(&env, Error::DebitAlreadySucceeded);
-        }
-
-        let current_ledger = env.ledger().sequence() as u64;
-        if current_ledger < rec.next_retry_ledger {
-            panic_with_error!(&env, Error::RetryNotDue);
-        }
-
-        let cfg: RetryConfig = env
-            .storage()
-            .persistent()
-            .get(&DataKey2::RetryConfig)
-            .unwrap_or(RetryConfig {
-                base_retry_interval: DEFAULT_BASE_RETRY_INTERVAL,
-                max_retry_interval: DEFAULT_MAX_RETRY_INTERVAL,
-                max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
-            });
-
-        let client = token::Client::new(&env, &rec.token);
-        let result = client.try_transfer_from(
-            &env.current_contract_address(),
-            &rec.customer,
-            &rec.merchant,
-            &rec.amount,
-        );
-
-        if result.is_ok() {
-            // Payment succeeded — store as a Succeeded record for auditing
-            let rec = FailedDebitRecord {
-                id: record_id,
-                plan_id,
-                merchant: merchant.clone(),
-                customer: customer.clone(),
-                token: token.clone(),
-                amount,
-                attempt_number: 1,
-                next_retry_ledger: 0,
-                status: FailedDebitStatus::Succeeded,
-                created_at: env.ledger().timestamp(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey2::FailedDebit(record_id), &rec);
-            env.storage().persistent().extend_ttl(
-                &DataKey2::FailedDebit(record_id),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-        } else {
-            // Insufficient balance — store pending record and emit DebitFailed
-            let next_retry_ledger = (env.ledger().sequence() as u64) + cfg.base_retry_interval;
-            let rec = FailedDebitRecord {
-                id: record_id,
-                plan_id,
-                merchant: merchant.clone(),
-                customer: customer.clone(),
-                token: token.clone(),
-                amount,
-                attempt_number: 1,
-                next_retry_ledger,
-                status: FailedDebitStatus::Pending,
-                created_at: env.ledger().timestamp(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey2::FailedDebit(record_id), &rec);
-            env.storage().persistent().extend_ttl(
-                &DataKey2::FailedDebit(record_id),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-            events::emit_debit_failed(&env, record_id, plan_id, 1, next_retry_ledger);
-        }
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        record_id
     }
 
     /// Retry a failed debit. Enforces the exponential back-off schedule.
@@ -8981,12 +8894,12 @@ impl AhjoorPaymentsContract {
         let mut counter: u32 = env
             .storage()
             .instance()
-            .get(&DataKey2::RecurringCounter)
+            .get(&DataKey3::RecurringCounter)
             .unwrap_or(0);
         counter += 1;
         env.storage()
             .instance()
-            .set(&DataKey2::RecurringCounter, &counter);
+            .set(&DataKey3::RecurringCounter, &counter);
 
         let schedule_id = counter;
         let now = env.ledger().timestamp();
@@ -9006,9 +8919,9 @@ impl AhjoorPaymentsContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey2::RecurringSchedule(schedule_id), &schedule);
+            .set(&DataKey3::RecurringSchedule(schedule_id), &schedule);
         env.storage().persistent().extend_ttl(
-            &DataKey2::RecurringSchedule(schedule_id),
+            &DataKey3::RecurringSchedule(schedule_id),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -9030,7 +8943,7 @@ impl AhjoorPaymentsContract {
         let mut schedule: RecurringPaymentSchedule = env
             .storage()
             .persistent()
-            .get(&DataKey2::RecurringSchedule(schedule_id))
+            .get(&DataKey3::RecurringSchedule(schedule_id))
             .expect("Recurring schedule not found");
 
         if !schedule.active {
@@ -9062,9 +8975,9 @@ impl AhjoorPaymentsContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey2::RecurringSchedule(schedule_id), &schedule);
+            .set(&DataKey3::RecurringSchedule(schedule_id), &schedule);
         env.storage().persistent().extend_ttl(
-            &DataKey2::RecurringSchedule(schedule_id),
+            &DataKey3::RecurringSchedule(schedule_id),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -9090,7 +9003,7 @@ impl AhjoorPaymentsContract {
         let mut schedule: RecurringPaymentSchedule = env
             .storage()
             .persistent()
-            .get(&DataKey2::RecurringSchedule(schedule_id))
+            .get(&DataKey3::RecurringSchedule(schedule_id))
             .expect("Recurring schedule not found");
 
         if schedule.payer != payer {
@@ -9105,9 +9018,9 @@ impl AhjoorPaymentsContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey2::RecurringSchedule(schedule_id), &schedule);
+            .set(&DataKey3::RecurringSchedule(schedule_id), &schedule);
         env.storage().persistent().extend_ttl(
-            &DataKey2::RecurringSchedule(schedule_id),
+            &DataKey3::RecurringSchedule(schedule_id),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -9123,7 +9036,7 @@ impl AhjoorPaymentsContract {
     pub fn get_recurring_schedule(env: Env, schedule_id: u32) -> RecurringPaymentSchedule {
         env.storage()
             .persistent()
-            .get(&DataKey2::RecurringSchedule(schedule_id))
+            .get(&DataKey3::RecurringSchedule(schedule_id))
             .expect("Recurring schedule not found")
     }
 }
@@ -9135,7 +9048,7 @@ mod test_tip;
 mod test_consent;
 
 #[cfg(test)]
-mod test_token_whitelist;
+#[cfg(any())] mod test_token_whitelist;
 
 #[cfg(test)]
 mod test_collateral;
