@@ -344,10 +344,10 @@ impl TokenWhitelistContract {
     /// Update decimals for a token metadata entry
     pub fn update_token_decimals(env: Env, admin: Address, token: Address, decimals: u32) {
         admin.require_auth(); Self::require_admin(&env, &admin);
-        let mut md: TokenMetadata = env.storage().persistent().get(&DataKey::TokenMetadata(token)).expect("Metadata not set");
+        let mut md: TokenMetadata = env.storage().persistent().get(&DataKey::TokenMetadata(token.clone())).expect("Metadata not set");
         md.decimals = decimals;
-        env.storage().persistent().set(&DataKey::TokenMetadata(token), &md);
-        env.storage().persistent().extend_ttl(&DataKey::TokenMetadata(token), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().persistent().set(&DataKey::TokenMetadata(token.clone()), &md);
+        env.storage().persistent().extend_ttl(&DataKey::TokenMetadata(token.clone()), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         events::emit_token_metadata_set(&env, token, md.symbol.clone(), md.decimals);
     }
 
@@ -356,11 +356,11 @@ impl TokenWhitelistContract {
         let whitelist: Vec<Address> = env.storage().persistent().get(&DataKey::WhitelistedTokens).unwrap_or_else(|| Vec::new(&env));
         let start = offset as usize;
         let mut l = limit.min(50) as usize;
-        if start >= whitelist.len() { return Vec::new(&env); }
-        if start + l > whitelist.len() { l = whitelist.len() - start; }
+        if start >= whitelist.len() as usize { return Vec::new(&env); }
+        if start + l > whitelist.len() as usize { l = whitelist.len() as usize - start; }
         let mut res = Vec::new(&env);
         for i in start..start + l {
-            let t = whitelist.get(i).unwrap();
+            let t = whitelist.get(i as u32).unwrap();
             if let Some(md) = env.storage().persistent().get::<_, TokenMetadata>(&DataKey::TokenMetadata(t.clone())) {
                 res.push_back(md);
             }
