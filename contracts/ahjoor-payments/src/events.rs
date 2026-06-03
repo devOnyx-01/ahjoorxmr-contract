@@ -1028,12 +1028,38 @@ pub struct NotificationKeyRemoved {
     pub merchant: Address,
 }
 
+/// Event: Notification key rotated (#377)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct NotificationKeyRotated {
+    pub merchant: Address,
+    pub old_key_hash: BytesN<32>,
+    pub new_key_hash: BytesN<32>,
+    pub overlap_until: u64,
+}
+
 pub fn emit_notification_key_registered(e: &Env, merchant: Address, key: soroban_sdk::Bytes) {
     NotificationKeyRegistered { merchant, key }.publish(e);
 }
 
 pub fn emit_notification_key_removed(e: &Env, merchant: Address) {
     NotificationKeyRemoved { merchant }.publish(e);
+}
+
+pub fn emit_notification_key_rotated(
+    e: &Env,
+    merchant: Address,
+    old_key_hash: BytesN<32>,
+    new_key_hash: BytesN<32>,
+    overlap_until: u64,
+) {
+    NotificationKeyRotated {
+        merchant,
+        old_key_hash,
+        new_key_hash,
+        overlap_until,
+    }
+    .publish(e);
 }
 
 // --- Token Swap Events ---
@@ -1154,11 +1180,12 @@ pub struct AppealSubmitted {
     pub evidence_hash: BytesN<32>,
 }
 
-/// Event: Admin approved a merchant appeal
+/// Event: Admin approved a merchant appeal — cooling-off period begins
 #[contractevent]
 #[derive(Clone, Debug)]
 pub struct AppealApproved {
     pub merchant: Address,
+    pub cooling_off_until: u64,
 }
 
 /// Event: Admin rejected a merchant appeal
@@ -1168,18 +1195,16 @@ pub struct AppealRejected {
     pub merchant: Address,
 }
 
-pub fn emit_merchant_suspended(
-    e: &Env,
-    merchant: Address,
-    reason_hash: BytesN<32>,
-    suspension_expires_at: u64,
-) {
-    MerchantSuspended {
-        merchant,
-        reason_hash,
-        suspension_expires_at,
-    }
-    .publish(e);
+/// Event: Merchant fully reinstated after cooling-off period
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantReinstated {
+    pub merchant: Address,
+    pub reinstated_at: u64,
+}
+
+pub fn emit_merchant_suspended(e: &Env, merchant: Address, reason_hash: BytesN<32>, suspension_expires_at: u64) {
+    MerchantSuspended { merchant, reason_hash, suspension_expires_at }.publish(e);
 }
 
 pub fn emit_merchant_banned(e: &Env, merchant: Address, reason_hash: BytesN<32>) {
@@ -1198,8 +1223,12 @@ pub fn emit_appeal_submitted(e: &Env, merchant: Address, evidence_hash: BytesN<3
     .publish(e);
 }
 
-pub fn emit_appeal_approved(e: &Env, merchant: Address) {
-    AppealApproved { merchant }.publish(e);
+pub fn emit_appeal_approved(e: &Env, merchant: Address, cooling_off_until: u64) {
+    AppealApproved { merchant, cooling_off_until }.publish(e);
+}
+
+pub fn emit_merchant_reinstated(e: &Env, merchant: Address, reinstated_at: u64) {
+    MerchantReinstated { merchant, reinstated_at }.publish(e);
 }
 
 pub fn emit_appeal_rejected(e: &Env, merchant: Address) {
@@ -1566,6 +1595,16 @@ pub struct TipReceived {
     pub token: Address,
 }
 
+/// Event: Tip split to beneficiary (#370)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TipSplit {
+    pub payment_id: u32,
+    pub beneficiary: Address,
+    pub amount: i128,
+    pub token: Address,
+}
+
 pub fn emit_tip_received(
     e: &Env,
     payment_id: u32,
@@ -1577,6 +1616,22 @@ pub fn emit_tip_received(
         payment_id,
         merchant,
         tip_amount,
+        token,
+    }
+    .publish(e);
+}
+
+pub fn emit_tip_split(
+    e: &Env,
+    payment_id: u32,
+    beneficiary: Address,
+    amount: i128,
+    token: Address,
+) {
+    TipSplit {
+        payment_id,
+        beneficiary,
+        amount,
         token,
     }
     .publish(e);
@@ -1847,6 +1902,28 @@ pub fn emit_recurring_payment_cancelled(e: &soroban_sdk::Env, schedule_id: u32, 
         (soroban_sdk::Symbol::new(e, "RecurringCancel"),),
         (schedule_id, payer),
     );
+}
+
+// ── #358: Buyer Trust Tier Events ────────────────────────────────────────────
+
+/// Event: Merchant updated a buyer's trust tier (#358)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct BuyerTierUpdated {
+    pub merchant: Address,
+    pub buyer: Address,
+    pub old_tier: u32,
+    pub new_tier: u32,
+}
+
+pub fn emit_buyer_tier_updated(
+    e: &Env,
+    merchant: Address,
+    buyer: Address,
+    old_tier: u32,
+    new_tier: u32,
+) {
+    BuyerTierUpdated { merchant, buyer, old_tier, new_tier }.publish(e);
 }
 
 // ── #367: Dynamic Settlement Fee Tiers ───────────────────────────────────────

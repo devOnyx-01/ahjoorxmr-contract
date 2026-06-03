@@ -2,21 +2,17 @@
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
 };
-
-struct TokenWhitelistClient;
-impl TokenWhitelistClient {
-    fn new(_env: &Env, _contract: &Address) -> Self { Self }
-    fn is_token_allowed(&self, _token: &Address) -> bool { true }
-}
+use soroban_sdk::xdr::ToXdr;
+use ahjoor_token_whitelist::TokenWhitelistClient;
 
 // Instance storage: config, counters, and active round state (bounded, shared TTL)
-const INSTANCE_LIFETIME_THRESHOLD: u32 = 100_000;
-const INSTANCE_BUMP_AMOUNT: u32 = 120_000;
+pub(crate) const INSTANCE_LIFETIME_THRESHOLD: u32 = 100_000;
+pub(crate) const INSTANCE_BUMP_AMOUNT: u32 = 120_000;
 
 // Persistent storage: RoundHistory (grows by one record per round — unbounded)
 // Each write extends its own TTL independently of the instance.
-const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100_000;
-const PERSISTENT_BUMP_AMOUNT: u32 = 120_000;
+pub(crate) const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100_000;
+pub(crate) const PERSISTENT_BUMP_AMOUNT: u32 = 120_000;
 
 // Temporary storage: ExitRequests (in-progress, pending admin approval — short-lived)
 // Auto-expires if not acted upon; no long-term retention needed.
@@ -37,6 +33,7 @@ mod test_weighted_voting;
 mod test_reinvest;
 #[cfg(any())] mod test_token_whitelist;
 mod test_slot_auction;
+mod test_sealed_slot_auction;
 // mod test_migration;  // TODO: File not found - needs to be created
 mod migration_client;
 pub use migration_client::RoscaMigrationClient;
@@ -561,7 +558,8 @@ impl AhjoorContract {
             .get(&DataKey2::TokenWhitelistContract)
     }
 
-    /// Check if a token is allowed via the whitelist contract
+    /// Check if a token is allowed via the whitelist contract.
+    /// Delegates to contract-level allowlist first, then global whitelist.
     pub fn is_token_allowed(env: Env, token: Address) -> bool {
         if let Some(whitelist_contract) = env
             .storage()
@@ -569,7 +567,7 @@ impl AhjoorContract {
             .get::<DataKey2, Address>(&DataKey2::TokenWhitelistContract)
         {
             let client = TokenWhitelistClient::new(&env, &whitelist_contract);
-            client.is_token_allowed(&token)
+            client.is_token_allowed_for_contract(&env.current_contract_address(), &token)
         } else {
             // If no whitelist contract is set, allow all tokens (backward compatibility)
             true
@@ -708,7 +706,8 @@ impl AhjoorContract {
         }
     }
 
-    /// Validates that a token is allowed via the whitelist contract
+    /// Validates that a token is allowed via the whitelist contract.
+    /// Delegates to contract-level allowlist first, then global whitelist.
     fn require_token_allowed(env: &Env, token: &Address) {
         if let Some(whitelist_contract) = env
             .storage()
@@ -716,7 +715,7 @@ impl AhjoorContract {
             .get::<DataKey2, Address>(&DataKey2::TokenWhitelistContract)
         {
             let client = TokenWhitelistClient::new(env, &whitelist_contract);
-            if !client.is_token_allowed(token) {
+            if !client.is_token_allowed_for_contract(&env.current_contract_address(), token) {
                 panic_with_error!(env, Error::TokenNotApproved);
             }
         }
@@ -2018,6 +2017,477 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // ── #375: Sealed-Bid (Commit-Reveal) Slot Auction ────────────────────────
+    //
+    // A fairer alternative to the open-bid auction above: bids are hidden
+    // during a commit phase (only a hash of `amount || salt` is stored) and
+    // disclosed during a later reveal phase, preventing last-moment sniping.
+    // The winner is the highest valid revealed bid that strictly exceeds the
+    // configured minimum reserve. group_id is 0 (single-group contract).
+
+    /// #375 helper: lightweight pause guard kept self-contained for the sealed
+    /// auction entry points.
+    fn sealed_require_not_paused(env: &Env) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false);
+        if paused {
+            panic!("Contract is paused");
+        }
+    }
+
+    /// #375: Configure the commit-reveal sealed-bid slot auction — the commit
+    /// and reveal phase durations (seconds) and the minimum reserve price.
+    /// Admin only.
+    pub fn configure_sealed_slot_auction(
+        env: Env,
+        admin: Address,
+        commit_duration: u64,
+        reveal_duration: u64,
+        min_reserve: i128,
+    ) {
+        Self::sealed_require_not_paused(&env);
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can configure the sealed auction");
+        }
+        admin.require_auth();
+
+        if commit_duration == 0 || reveal_duration == 0 {
+            panic!("Commit and reveal durations must be positive");
+        }
+        if min_reserve < 0 {
+            panic!("Minimum reserve cannot be negative");
+        }
+
+        let state = SealedAuctionState {
+            enabled: true,
+            commit_duration,
+            reveal_duration,
+            min_reserve,
+            round: 0,
+            commit_until: 0,
+            reveal_until: 0,
+            open: false,
+        };
+        env.storage().instance().set(&DataKey3::SealedAuction, &state);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// #375: Open a sealed-bid auction for `round`. Sets the commit-phase and
+    /// reveal-phase deadlines from the configured durations and resets the
+    /// per-round bookkeeping. Admin only.
+    pub fn open_sealed_slot_auction(env: Env, admin: Address, round: u32) {
+        Self::sealed_require_not_paused(&env);
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can open the sealed auction");
+        }
+        admin.require_auth();
+
+        let mut state: SealedAuctionState = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SealedAuction)
+            .expect("Sealed auction not configured");
+        if !state.enabled {
+            panic!("Sealed auction is not enabled");
+        }
+        if state.open {
+            panic!("A sealed auction is already open");
+        }
+
+        let now = env.ledger().timestamp();
+        state.round = round;
+        state.commit_until = now + state.commit_duration;
+        state.reveal_until = state.commit_until + state.reveal_duration;
+        state.open = true;
+        env.storage().instance().set(&DataKey3::SealedAuction, &state);
+
+        // Fresh per-round bookkeeping.
+        env.storage()
+            .instance()
+            .set(&DataKey3::SealedCommitters(round), &Vec::<Address>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey3::SealedRevealedBids(round), &Vec::<SlotBid>::new(&env));
+
+        events::emit_sealed_auction_opened(&env, 0, round, state.commit_until, state.reveal_until);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// #375: Commit a sealed bid. `commit_hash` must equal
+    /// `sha256(bidder.to_xdr() || bid_amount.to_be_bytes() || salt)` — binding
+    /// the bidder's identity prevents anyone else from copying the published
+    /// hash and revealing it as their own. `deposit` is collateral taken
+    /// up front and is also the maximum amount the bidder may later reveal; it
+    /// keeps the bid amount hidden during the commit phase. One commit per bidder
+    /// per round. Only valid during the commit phase.
+    pub fn commit_slot_bid(
+        env: Env,
+        bidder: Address,
+        commit_hash: BytesN<32>,
+        deposit: i128,
+    ) {
+        Self::sealed_require_not_paused(&env);
+        bidder.require_auth();
+
+        let state: SealedAuctionState = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SealedAuction)
+            .expect("Sealed auction not configured");
+        if !state.enabled || !state.open {
+            panic!("Sealed auction is not open");
+        }
+        if env.ledger().timestamp() > state.commit_until {
+            panic!("Commit phase has closed");
+        }
+        if deposit <= 0 {
+            panic!("Commit deposit must be positive");
+        }
+
+        // Member guard.
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&bidder) {
+            panic!("Bidder is not a group member");
+        }
+
+        let round = state.round;
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey3::SlotBidCommit(round, bidder.clone()))
+        {
+            panic!("Bidder has already committed this round");
+        }
+
+        // Take the collateral deposit.
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&bidder, &env.current_contract_address(), &deposit);
+
+        env.storage().instance().set(
+            &DataKey3::SlotBidCommit(round, bidder.clone()),
+            &SealedCommit {
+                commit_hash,
+                deposit,
+                revealed: false,
+            },
+        );
+
+        let mut committers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SealedCommitters(round))
+            .unwrap_or(Vec::new(&env));
+        committers.push_back(bidder.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey3::SealedCommitters(round), &committers);
+
+        events::emit_slot_bid_committed(&env, 0, round, bidder);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// #375: Reveal a previously committed sealed bid. Valid only during the
+    /// reveal phase (after the commit phase closes). The `(bid_amount, salt)`
+    /// pair must hash to the stored commitment, and `bid_amount` may not exceed
+    /// the committed deposit.
+    pub fn reveal_slot_bid(
+        env: Env,
+        bidder: Address,
+        desired_slot: u32,
+        bid_amount: i128,
+        salt: BytesN<32>,
+    ) {
+        Self::sealed_require_not_paused(&env);
+        bidder.require_auth();
+
+        let state: SealedAuctionState = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SealedAuction)
+            .expect("Sealed auction not configured");
+        if !state.open {
+            panic!("Sealed auction is not open");
+        }
+        let now = env.ledger().timestamp();
+        // The reveal phase opens only once the commit phase has closed.
+        if now <= state.commit_until {
+            panic!("Reveal phase has not opened yet");
+        }
+        if now > state.reveal_until {
+            panic!("Reveal phase has closed");
+        }
+
+        let round = state.round;
+        let mut commit: SealedCommit = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SlotBidCommit(round, bidder.clone()))
+            .expect("No commitment found for this bidder");
+        if commit.revealed {
+            panic!("Commitment already revealed");
+        }
+
+        if bid_amount <= 0 {
+            panic!("Revealed bid must be positive");
+        }
+        if bid_amount > commit.deposit {
+            panic!("Revealed bid exceeds committed deposit");
+        }
+
+        // Verify the revealed (amount, salt) hashes to the stored commitment.
+        // The bidder's identity is bound into the preimage so a copied
+        // commit_hash cannot be revealed by anyone but its original author —
+        // this defeats commit-copying / front-running of revealed values.
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&bidder.clone().to_xdr(&env));
+        preimage.extend_from_array(&bid_amount.to_be_bytes());
+        preimage.extend_from_array(&salt.to_array());
+        let computed: BytesN<32> = env.crypto().sha256(&preimage).into();
+        if computed != commit.commit_hash {
+            panic!("Revealed values do not match commitment");
+        }
+
+        // Slot range guard.
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .expect("Not initialized");
+        if desired_slot >= payout_order.len() {
+            panic!("Desired slot index is out of range");
+        }
+
+        commit.revealed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey3::SlotBidCommit(round, bidder.clone()), &commit);
+
+        let mut revealed: Vec<SlotBid> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SealedRevealedBids(round))
+            .unwrap_or(Vec::new(&env));
+        revealed.push_back(SlotBid {
+            bidder: bidder.clone(),
+            desired_slot,
+            amount: bid_amount,
+            placed_at: now,
+        });
+        env.storage()
+            .instance()
+            .set(&DataKey3::SealedRevealedBids(round), &revealed);
+
+        events::emit_slot_bid_revealed(&env, 0, round, bidder, desired_slot, bid_amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// #375: Settle the sealed-bid auction after the reveal phase closes. The
+    /// winner is the highest revealed bid that strictly exceeds the minimum
+    /// reserve; if none qualifies the slot is left unallocated. Revealed bidders
+    /// are refunded (the winner's deposit minus the winning amount; losers in
+    /// full), while committers who never revealed forfeit their deposit. Admin
+    /// only.
+    pub fn settle_sealed_slot_auction(env: Env) {
+        Self::sealed_require_not_paused(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        let mut state: SealedAuctionState = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SealedAuction)
+            .expect("Sealed auction not configured");
+        if !state.open {
+            panic!("No open sealed auction to settle");
+        }
+        if env.ledger().timestamp() <= state.reveal_until {
+            panic!("Reveal phase is still open");
+        }
+
+        let round = state.round;
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token_addr);
+
+        let revealed: Vec<SlotBid> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SealedRevealedBids(round))
+            .unwrap_or(Vec::new(&env));
+
+        // Winner = highest revealed bid strictly above the reserve; earliest
+        // reveal breaks ties.
+        let mut winner_idx: Option<u32> = None;
+        let mut winner_amount: i128 = state.min_reserve;
+        let mut winner_placed_at: u64 = u64::MAX;
+        for (i, bid) in revealed.iter().enumerate() {
+            let better = bid.amount > winner_amount
+                || (winner_idx.is_some()
+                    && bid.amount == winner_amount
+                    && bid.placed_at < winner_placed_at);
+            if better {
+                winner_idx = Some(i as u32);
+                winner_amount = bid.amount;
+                winner_placed_at = bid.placed_at;
+            }
+        }
+
+        let mut winner_addr_opt: Option<Address> = None;
+        let mut desired_slot: u32 = 0;
+        let mut winning_amount: i128 = 0;
+        if let Some(widx) = winner_idx {
+            let wb = revealed.get(widx).unwrap();
+            winner_addr_opt = Some(wb.bidder.clone());
+            desired_slot = wb.desired_slot;
+            winning_amount = wb.amount;
+        }
+
+        // Refund revealed bidders. The winner gets back deposit minus the
+        // winning amount; everyone else who revealed is refunded in full.
+        // Committers who never revealed are not iterated here, so their deposit
+        // is forfeited (kept by the contract).
+        for bid in revealed.iter() {
+            let commit: SealedCommit = env
+                .storage()
+                .instance()
+                .get(&DataKey3::SlotBidCommit(round, bid.bidder.clone()))
+                .expect("Commitment missing for revealed bid");
+            let refund = match &winner_addr_opt {
+                Some(w) if *w == bid.bidder => commit.deposit - winning_amount,
+                _ => commit.deposit,
+            };
+            if refund > 0 {
+                token_client.transfer(&env.current_contract_address(), &bid.bidder, &refund);
+            }
+        }
+
+        if let Some(ref winner_addr) = winner_addr_opt {
+            // Move the winner into their desired slot (swap with the occupant).
+            let mut payout_order: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PayoutOrder)
+                .expect("Not initialized");
+            let mut winner_current_pos: Option<u32> = None;
+            for (i, addr) in payout_order.iter().enumerate() {
+                if addr == *winner_addr {
+                    winner_current_pos = Some(i as u32);
+                    break;
+                }
+            }
+            if let Some(current_pos) = winner_current_pos {
+                if current_pos != desired_slot && desired_slot < payout_order.len() {
+                    let addr_at_desired = payout_order.get(desired_slot).unwrap();
+                    let mut new_order: Vec<Address> = Vec::new(&env);
+                    for (i, addr) in payout_order.iter().enumerate() {
+                        let idx = i as u32;
+                        if idx == desired_slot {
+                            new_order.push_back(winner_addr.clone());
+                        } else if idx == current_pos {
+                            new_order.push_back(addr_at_desired.clone());
+                        } else {
+                            new_order.push_back(addr);
+                        }
+                    }
+                    payout_order = new_order;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::PayoutOrder, &payout_order);
+                }
+            }
+
+            // Distribute the winning bid among the other active members.
+            let members: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Members)
+                .expect("Not initialized");
+            let exited: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::ExitedMembers)
+                .unwrap_or(Vec::new(&env));
+            let suspended: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::SuspendedMembers)
+                .unwrap_or(Vec::new(&env));
+            let mut eligible: i128 = 0;
+            for m in members.iter() {
+                if m != *winner_addr && !exited.contains(&m) && !suspended.contains(&m) {
+                    eligible += 1;
+                }
+            }
+            let bonus: i128 = if eligible > 0 { winning_amount / eligible } else { 0 };
+            if bonus > 0 {
+                for m in members.iter() {
+                    if m != *winner_addr && !exited.contains(&m) && !suspended.contains(&m) {
+                        token_client.transfer(&env.current_contract_address(), &m, &bonus);
+                    }
+                }
+            }
+        }
+
+        // Close the auction.
+        state.open = false;
+        env.storage().instance().set(&DataKey3::SealedAuction, &state);
+
+        let (winner_for_event, settled_bid) = match winner_addr_opt {
+            Some(w) => (w, winning_amount),
+            None => (env.current_contract_address(), 0i128),
+        };
+        events::emit_sealed_auction_settled(&env, 0, round, winner_for_event, settled_bid);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// #375: Read the current sealed-auction configuration and phase state.
+    pub fn get_sealed_auction(env: Env) -> Option<SealedAuctionState> {
+        env.storage().instance().get(&DataKey3::SealedAuction)
+    }
+
+    /// #375: Read the valid revealed bids recorded for a given auction round.
+    pub fn get_sealed_revealed_bids(env: Env, round: u32) -> Vec<SlotBid> {
+        env.storage()
+            .instance()
+            .get(&DataKey3::SealedRevealedBids(round))
+            .unwrap_or(Vec::new(&env))
     }
 
     // ─── Cross-Group Member Migration ────────────────────────────────────────
@@ -8698,6 +9168,83 @@ impl AhjoorContract {
             .unwrap_or(Map::new(&env))
     }
 
+    // ── #359: Savings Goal Milestone Reward Distribution ─────────────────────
+
+    /// Admin funds the savings goal reward pool. Tokens are transferred from admin
+    /// to the contract and credited to the shared reward pool.
+    pub fn fund_savings_reward_pool(env: Env, admin: Address, amount: i128) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin { panic!("Only admin can fund the savings reward pool"); }
+        if amount <= 0 { panic!("Amount must be positive"); }
+
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&admin, &env.current_contract_address(), &amount);
+
+        let pool: i128 = env.storage().instance().get(&DataKey::RewardPool).unwrap_or(0);
+        env.storage().instance().set(&DataKey::RewardPool, &(pool + amount));
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Create a new savings goal for a group member.
+    pub fn create_savings_goal(
+        env: Env,
+        member: Address,
+        group_id: u32,
+        name: String,
+        description: String,
+        target_amount: i128,
+        token: Address,
+        target_date: u64,
+        priority: u32,
+        category: String,
+        metadata: Map<String, String>,
+    ) -> u32 {
+        savings_goal_tracking_impl::SavingsGoalTrackingImpl::create_goal(
+            &env, member, group_id, name, description, target_amount, token,
+            target_date, priority, category, metadata,
+        )
+    }
+
+    /// Add milestones (with optional reward_bps) to a savings goal.
+    pub fn add_savings_goal_milestones(
+        env: Env,
+        goal_id: u32,
+        milestones: Vec<savings_goal_tracking::Milestone>,
+    ) {
+        savings_goal_tracking_impl::SavingsGoalTrackingImpl::add_milestones(&env, goal_id, milestones);
+    }
+
+    /// Contribute to a savings goal. Milestone thresholds are checked and token rewards
+    /// distributed from the reward pool if any reward_bps milestones are newly crossed.
+    pub fn contribute_to_savings_goal(
+        env: Env,
+        goal_id: u32,
+        member: Address,
+        amount: i128,
+        source: String,
+    ) -> savings_goal_tracking::GoalContribution {
+        savings_goal_tracking_impl::SavingsGoalTrackingImpl::contribute_to_goal(
+            &env, goal_id, member, amount, source,
+        )
+    }
+
+    /// Returns the savings goal reward pool balance.
+    pub fn get_savings_reward_pool(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::RewardPool).unwrap_or(0)
+    }
+
+    /// Returns the bitmask of claimed milestones for a (goal_id, member) pair.
+    pub fn get_savings_milestones_claimed(env: Env, goal_id: u32, member: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::SavingsMilestonesClaimed(goal_id, member))
+            .unwrap_or(0u64)
+    }
+
 }
 
 mod test;
@@ -8711,4 +9258,6 @@ mod test_cosigner_guarantee;
 mod test_proxy;
 mod test_group_freeze;
 mod test_snapshot;
+#[cfg(test)]
+mod test_savings_milestone_rewards;
 pub use events::*;

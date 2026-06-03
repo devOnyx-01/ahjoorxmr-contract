@@ -5,6 +5,7 @@ struct TokenWhitelistClient;
 impl TokenWhitelistClient {
     fn new(_env: &Env, _contract: &Address) -> Self { Self }
     fn is_token_allowed(&self, _token: &Address) -> bool { true }
+    fn is_token_allowed_for_contract(&self, _contract_id: &Address, _token: &Address) -> bool { true }
 }
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -107,6 +108,12 @@ const IDEMPOTENCY_KEY_BUMP_AMOUNT: u32 = 17_280;
 const DEFAULT_MIN_COLLATERAL: i128 = 1_000_000; // 1 USDC (7 decimals)
 /// Default maximum tip: 3000 bps = 30% of base payment amount (#265)
 const DEFAULT_MAX_TIP_BPS: u32 = 3_000;
+/// Maximum number of beneficiaries in a tip split configuration (#370)
+const MAX_TIP_SPLIT_BENEFICIARIES: u32 = 10;
+/// Maximum number of historical notification keys to retain (#377)
+const MAX_NOTIFICATION_KEY_HISTORY: u32 = 5;
+/// Default notification key overlap window in seconds: 30 days (#377)
+const DEFAULT_KEY_OVERLAP_WINDOW_SECONDS: u64 = 30 * 24 * 3600;
 /// Default evidence submission window: 7 days in ledgers (~120,960 ledgers at 5s/ledger) (#308)
 const DEFAULT_EVIDENCE_WINDOW_LEDGERS: u32 = 120_960;
 /// Maximum evidence submissions per party (#308)
@@ -224,6 +231,33 @@ pub struct SpendLimit {
     pub window_seconds: u64,
 }
 
+/// #358: Trust tier for a buyer as assigned by the merchant.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuyerTrustTierLevel {
+    New = 0,
+    Standard = 1,
+    Trusted = 2,
+    VIP = 3,
+}
+
+/// #370: Tip split beneficiary allocation
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipSplitBeneficiary {
+    pub recipient: Address,
+    pub bps: u32,
+}
+
+/// #377: Notification key entry with validity window
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationKeyEntry {
+    pub key: soroban_sdk::Bytes,
+    pub valid_from: u64,
+    pub valid_until: u64,
+}
+
 /// Tracks cumulative spend within the current rolling window (#235).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,15 +283,30 @@ pub enum MerchantStatus {
     Banned = 2,
 }
 
-/// On-chain appeal record for a banned merchant.
+/// Status of a merchant appeal in the reinstatement workflow.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppealStatus {
+    /// Appeal is pending admin review
+    Pending = 0,
+    /// Appeal approved, merchant in cooling-off period
+    ApprovedCoolingOff = 1,
+    /// Appeal approved and cooling-off completed, merchant reinstated
+    ApprovedReinstated = 2,
+    /// Appeal rejected
+    Rejected = 3,
+}
+
+/// On-chain appeal record for a banned merchant with time-locked reinstatement.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerchantAppeal {
     pub merchant: Address,
-    pub evidence_hash: BytesN<32>,
+    pub reason_hash: BytesN<32>,
     pub submitted_at: u64,
-    pub resolved: bool,
-    pub approved: bool,
+    pub status: AppealStatus,
+    /// Ledger timestamp when cooling-off period ends (0 if not in cooling-off)
+    pub cooling_off_until: u64,
 }
 
 /// KYB (Know Your Business) verification record (#310)
@@ -811,8 +860,8 @@ pub enum DataKey {
 }
 
 /// Overflow storage keys — split from DataKey because #[contracttype] is bounded to 50 variants.
-#[derive(Clone)]
 #[contracttype]
+#[derive(Clone)]
 pub enum DataKey2 {
     /// Persistent: per-payment approval state
     ApprovalState(u32),
@@ -925,6 +974,16 @@ pub enum DataKey3 {
     RecurringCounter,
     RecurringSchedule(u32),
     MerchantSettlementVolume(Address),
+    /// #358: buyer trust tier assigned by merchant (merchant, buyer) → BuyerTrustTierLevel
+    BuyerTrustTier(Address, Address),
+    /// #358: per-tier spending limit (merchant, tier_value as u32) → SpendLimit
+    TierSpendingLimit(Address, u32),
+    /// #370: tip split configuration (merchant) → Vec<TipSplitBeneficiary>
+    TipSplitConfig(Address),
+    /// #377: notification key history (merchant) → Vec<NotificationKeyEntry>
+    NotificationKeyHistory(Address),
+    /// #377: notification key rotation config
+    NotificationKeyRotationConfig,
 }
 
 mod events;
@@ -4416,6 +4475,167 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::MerchantNotificationKey(merchant))
     }
 
+    // =========================================================================
+    // Notification Key Rotation (#377)
+    // =========================================================================
+
+    /// Rotate notification key with overlap window for backward-compatible decryption.
+    /// Sets old key's valid_until to now + overlap_window, adds new key with valid_from = now.
+    pub fn rotate_notification_key(
+        env: Env,
+        merchant: Address,
+        new_key: Bytes,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if new_key.len() > MAX_NOTIFICATION_KEY_LEN {
+            panic!("Notification key exceeds maximum length of 128 bytes");
+        }
+
+        if new_key.is_empty() {
+            panic!("Notification key cannot be empty");
+        }
+
+        let now = env.ledger().timestamp();
+        let overlap_window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::NotificationKeyRotationConfig)
+            .unwrap_or(DEFAULT_KEY_OVERLAP_WINDOW_SECONDS);
+        let overlap_until = now + overlap_window;
+
+        // Get current key history or create new
+        let mut history: soroban_sdk::Vec<NotificationKeyEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::NotificationKeyHistory(merchant.clone()))
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        // Get current active key (if exists)
+        let old_key: Option<Bytes> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantNotificationKey(merchant.clone()));
+
+        let old_key_hash = if let Some(ref key) = old_key {
+            // Set old key's valid_until
+            let old_entry = NotificationKeyEntry {
+                key: key.clone(),
+                valid_from: 0, // Find actual valid_from from history or use 0
+                valid_until: overlap_until,
+            };
+            history.push_back(old_entry);
+            env.crypto().sha256(key).into()
+        } else {
+            BytesN::from_array(&env, &[0u8; 32])
+        };
+
+        let new_key_hash: BytesN<32> = env.crypto().sha256(&new_key).into();
+
+        // Prune old keys if exceeds max history
+        while history.len() > MAX_NOTIFICATION_KEY_HISTORY {
+            history.remove(0);
+        }
+
+        // Store updated history
+        env.storage()
+            .persistent()
+            .set(&DataKey3::NotificationKeyHistory(merchant.clone()), &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey3::NotificationKeyHistory(merchant.clone()),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+        // Update active key
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantNotificationKey(merchant.clone()), &new_key);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantNotificationKey(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_notification_key_rotated(
+            &env,
+            merchant,
+            old_key_hash,
+            new_key_hash,
+            overlap_until,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the active notification key (newest key with valid_from <= now).
+    pub fn get_active_notification_key(env: Env, merchant: Address) -> Option<Bytes> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantNotificationKey(merchant))
+    }
+
+    /// Get notification key valid at a specific timestamp (historical lookup).
+    pub fn get_notification_key_at(
+        env: Env,
+        merchant: Address,
+        timestamp: u64,
+    ) -> Option<Bytes> {
+        // Check if timestamp is current or future -> return active key
+        let now = env.ledger().timestamp();
+        if timestamp >= now {
+            return env
+                .storage()
+                .persistent()
+                .get(&DataKey::MerchantNotificationKey(merchant.clone()));
+        }
+
+        // Look in history for key valid at timestamp
+        let history: Option<soroban_sdk::Vec<NotificationKeyEntry>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::NotificationKeyHistory(merchant));
+
+        if let Some(hist) = history {
+            for entry in hist.iter() {
+                if timestamp >= entry.valid_from && timestamp <= entry.valid_until {
+                    return Some(entry.key);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Set the notification key rotation overlap window (admin only).
+    pub fn set_notif_key_overlap_window(
+        env: Env,
+        admin: Address,
+        window_seconds: u64,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set overlap window");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::NotificationKeyRotationConfig, &window_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     // --- Token Swap Functions ---
 
     /// Merchant sets their preferred token for receiving payments.
@@ -4504,7 +4724,8 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::TokenWhitelistContract)
     }
 
-    /// Check if a token is allowed via the whitelist contract
+    /// Check if a token is allowed via the whitelist contract.
+    /// Delegates to contract-level allowlist first, then global whitelist.
     pub fn is_token_allowed(env: Env, token: Address) -> bool {
         if let Some(whitelist_contract) = env
             .storage()
@@ -4512,9 +4733,8 @@ impl AhjoorPaymentsContract {
             .get::<DataKey, Address>(&DataKey::TokenWhitelistContract)
         {
             let client = TokenWhitelistClient::new(&env, &whitelist_contract);
-            client.is_token_allowed(&token)
+            client.is_token_allowed_for_contract(&env.current_contract_address(), &token)
         } else {
-            // If no whitelist contract is set, allow all tokens (backward compatibility)
             true
         }
     }
@@ -5568,11 +5788,10 @@ impl AhjoorPaymentsContract {
             .get::<DataKey, Address>(&DataKey::TokenWhitelistContract)
         {
             let client = TokenWhitelistClient::new(env, &whitelist_contract);
-            if !client.is_token_allowed(token) {
+            if !client.is_token_allowed_for_contract(&env.current_contract_address(), token) {
                 panic_with_error!(env, Error::TokenNotAllowed);
             }
         }
-        // If no whitelist contract is set, allow all tokens (backward compatibility)
     }
 
     fn complete_payment_internal(env: &Env, payment_id: u32, scheduled_only: bool) {
@@ -6989,7 +7208,7 @@ impl AhjoorPaymentsContract {
     }
 
     /// Banned merchant submits an appeal. Only one active appeal per merchant.
-    pub fn submit_appeal(env: Env, merchant: Address, evidence_hash: BytesN<32>) {
+    pub fn submit_appeal(env: Env, merchant: Address, reason_hash: BytesN<32>) {
         Self::require_not_paused(&env);
         merchant.require_auth();
 
@@ -7009,7 +7228,7 @@ impl AhjoorPaymentsContract {
             .persistent()
             .get(&DataKey2::MerchantAppeal(merchant.clone()));
         if let Some(existing) = existing_opt {
-            if !existing.resolved {
+            if existing.status == AppealStatus::Pending || existing.status == AppealStatus::ApprovedCoolingOff {
                 panic!("An active appeal already exists");
             }
         }
@@ -7026,10 +7245,10 @@ impl AhjoorPaymentsContract {
 
         let appeal = MerchantAppeal {
             merchant: merchant.clone(),
-            evidence_hash: evidence_hash.clone(),
+            reason_hash: reason_hash.clone(),
             submitted_at: env.ledger().timestamp(),
-            resolved: false,
-            approved: false,
+            status: AppealStatus::Pending,
+            cooling_off_until: 0,
         };
 
         env.storage()
@@ -7041,14 +7260,14 @@ impl AhjoorPaymentsContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_appeal_submitted(&env, merchant, evidence_hash);
+        events::emit_appeal_submitted(&env, merchant, reason_hash);
 
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
-    /// Admin approves an appeal — reinstates the merchant.
+    /// Admin approves an appeal — merchant enters cooling-off period before full reinstatement.
     pub fn approve_appeal(env: Env, admin: Address, merchant: Address) {
         Self::require_not_paused(&env);
         admin.require_auth();
@@ -7067,15 +7286,66 @@ impl AhjoorPaymentsContract {
             .get(&DataKey2::MerchantAppeal(merchant.clone()))
             .expect("No appeal found");
 
-        if appeal.resolved {
-            panic!("Appeal already resolved");
+        if appeal.status != AppealStatus::Pending {
+            panic!("Appeal already resolved or not pending");
         }
 
-        appeal.resolved = true;
-        appeal.approved = true;
+        // Set cooling-off period (default: 7 days in seconds)
+        let cooling_off_period: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::AppealRejectionCooldownSeconds)
+            .unwrap_or(7 * 24 * 60 * 60); // Default 7 days
+        let cooling_off_until = env.ledger().timestamp() + cooling_off_period;
+
+        appeal.status = AppealStatus::ApprovedCoolingOff;
+        appeal.cooling_off_until = cooling_off_until;
         env.storage()
             .persistent()
             .set(&DataKey2::MerchantAppeal(merchant.clone()), &appeal);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::MerchantAppeal(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_appeal_approved(&env, merchant, cooling_off_until);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Complete reinstatement after cooling-off period has elapsed. Callable by anyone.
+    pub fn complete_reinstatement(env: Env, merchant: Address) {
+        Self::require_not_paused(&env);
+
+        let appeal: MerchantAppeal = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::MerchantAppeal(merchant.clone()))
+            .expect("No appeal found");
+
+        if appeal.status != AppealStatus::ApprovedCoolingOff {
+            panic!("Appeal is not in cooling-off period");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < appeal.cooling_off_until {
+            panic!("Cooling-off period has not elapsed");
+        }
+
+        // Update appeal status
+        let mut updated_appeal = appeal;
+        updated_appeal.status = AppealStatus::ApprovedReinstated;
+        env.storage()
+            .persistent()
+            .set(&DataKey2::MerchantAppeal(merchant.clone()), &updated_appeal);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::MerchantAppeal(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Reinstate merchant
         env.storage().persistent().set(
@@ -7091,11 +7361,7 @@ impl AhjoorPaymentsContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_appeal_approved(&env, merchant);
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_merchant_reinstated(&env, merchant, now);
     }
 
     /// Admin rejects an appeal — merchant remains banned and cooldown is applied.
@@ -7117,34 +7383,30 @@ impl AhjoorPaymentsContract {
             .get(&DataKey2::MerchantAppeal(merchant.clone()))
             .expect("No appeal found");
 
-        if appeal.resolved {
-            panic!("Appeal already resolved");
+        if appeal.status != AppealStatus::Pending {
+            panic!("Appeal already resolved or not pending");
         }
 
-        appeal.resolved = true;
-        appeal.approved = false;
+        appeal.status = AppealStatus::Rejected;
         env.storage()
             .persistent()
             .set(&DataKey2::MerchantAppeal(merchant.clone()), &appeal);
 
-        // Apply cooldown
+        // Apply cooldown for next appeal
         let cooldown_seconds: u64 = env
             .storage()
             .instance()
             .get(&DataKey2::AppealRejectionCooldownSeconds)
-            .unwrap_or(0);
-        if cooldown_seconds > 0 {
-            let cooldown_until = env.ledger().timestamp() + cooldown_seconds;
-            env.storage().persistent().set(
-                &DataKey2::AppealCooldownUntil(merchant.clone()),
-                &cooldown_until,
-            );
-            env.storage().persistent().extend_ttl(
-                &DataKey2::AppealCooldownUntil(merchant.clone()),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-        }
+            .unwrap_or(30 * 24 * 60 * 60); // Default 30 days
+        let cooldown_until = env.ledger().timestamp() + cooldown_seconds;
+        env.storage()
+            .persistent()
+            .set(&DataKey2::AppealCooldownUntil(merchant.clone()), &cooldown_until);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::AppealCooldownUntil(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         events::emit_appeal_rejected(&env, merchant);
 
@@ -7475,6 +7737,68 @@ impl AhjoorPaymentsContract {
             .get(&DataKey2::DefaultSpendLimit(merchant))
     }
 
+    // ─── #358: Buyer Trust Tier System ───────────────────────────────────────
+
+    /// Merchant assigns a trust tier to a buyer (New/Standard/Trusted/VIP).
+    /// Only the merchant may call this.
+    pub fn set_buyer_tier(
+        env: Env,
+        merchant: Address,
+        buyer: Address,
+        tier: BuyerTrustTierLevel,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        let key = DataKey3::BuyerTrustTier(merchant.clone(), buyer.clone());
+        let old_tier: u32 = env
+            .storage()
+            .persistent()
+            .get::<_, BuyerTrustTierLevel>(&key)
+            .map(|t| t as u32)
+            .unwrap_or(BuyerTrustTierLevel::New as u32);
+        env.storage().persistent().set(&key, &tier);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_buyer_tier_updated(&env, merchant, buyer, old_tier, tier as u32);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the trust tier assigned to a buyer by a specific merchant.
+    pub fn get_buyer_tier(env: Env, merchant: Address, buyer: Address) -> BuyerTrustTierLevel {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::BuyerTrustTier(merchant, buyer))
+            .unwrap_or(BuyerTrustTierLevel::New)
+    }
+
+    /// Merchant sets the spending limit for a specific trust tier.
+    /// tier_value: 0=New, 1=Standard, 2=Trusted, 3=VIP.
+    pub fn set_tier_spending_limit(
+        env: Env,
+        merchant: Address,
+        tier: BuyerTrustTierLevel,
+        amount: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if amount <= 0 { panic!("Tier spend limit amount must be positive"); }
+        if window_seconds == 0 { panic!("Window seconds must be positive"); }
+        let key = DataKey3::TierSpendingLimit(merchant.clone(), tier as u32);
+        let limit = SpendLimit { amount, window_seconds };
+        env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the spending limit configured for a trust tier by a merchant, if any.
+    pub fn get_tier_spending_limit(
+        env: Env,
+        merchant: Address,
+        tier: BuyerTrustTierLevel,
+    ) -> Option<SpendLimit> {
+        env.storage().persistent().get(&DataKey3::TierSpendingLimit(merchant, tier as u32))
+    }
+
     /// Check and update the customer spend window. Panics with CustomerSpendLimitExceeded if cap would be breached.
     fn check_and_update_customer_spend_limit(
         env: &Env,
@@ -7482,14 +7806,22 @@ impl AhjoorPaymentsContract {
         customer: &Address,
         amount: i128,
     ) {
-        // Individual override takes priority over default
+        // Priority: per-customer override → tier-based limit → global default (#358)
         let limit_opt: Option<SpendLimit> = env
             .storage()
             .persistent()
-            .get(&DataKey2::CustomerSpendLimit(
-                merchant.clone(),
-                customer.clone(),
-            ))
+            .get(&DataKey2::CustomerSpendLimit(merchant.clone(), customer.clone()))
+            .or_else(|| {
+                // #358: check tier-based limit
+                let tier: BuyerTrustTierLevel = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey3::BuyerTrustTier(merchant.clone(), customer.clone()))
+                    .unwrap_or(BuyerTrustTierLevel::New);
+                env.storage()
+                    .persistent()
+                    .get(&DataKey3::TierSpendingLimit(merchant.clone(), tier as u32))
+            })
             .or_else(|| {
                 env.storage()
                     .persistent()
@@ -8100,14 +8432,49 @@ impl AhjoorPaymentsContract {
             // Customer must auth the tip transfer.
             customer.require_auth();
             let token_client = token::Client::new(&env, &payment.token);
-            token_client.transfer(&customer, &payment.merchant, &tip_amount);
-            events::emit_tip_received(
-                &env,
-                payment_id,
-                payment.merchant.clone(),
-                tip_amount,
-                payment.token.clone(),
-            );
+            
+            // Check for tip split configuration (#370)
+            let split_config: Option<soroban_sdk::Vec<TipSplitBeneficiary>> = env
+                .storage()
+                .persistent()
+                .get(&DataKey3::TipSplitConfig(payment.merchant.clone()));
+            
+            match split_config {
+                Some(beneficiaries) => {
+                    // Multi-beneficiary distribution
+                    for beneficiary in beneficiaries.iter() {
+                        let allocated_amount = (tip_amount * beneficiary.bps as i128) / 10_000;
+                        
+                        // Skip zero allocations (rounding edge case)
+                        if allocated_amount > 0 {
+                            token_client.transfer(
+                                &customer,
+                                &beneficiary.recipient,
+                                &allocated_amount
+                            );
+                            
+                            events::emit_tip_split(
+                                &env,
+                                payment_id,
+                                beneficiary.recipient.clone(),
+                                allocated_amount,
+                                payment.token.clone(),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    // Fallback: single transfer to merchant (backward compatible)
+                    token_client.transfer(&customer, &payment.merchant, &tip_amount);
+                    events::emit_tip_received(
+                        &env,
+                        payment_id,
+                        payment.merchant.clone(),
+                        tip_amount,
+                        payment.token.clone(),
+                    );
+                }
+            }
         }
 
         Self::complete_payment_internal(&env, payment_id, false);
@@ -8266,6 +8633,104 @@ impl AhjoorPaymentsContract {
             .instance()
             .get(&DataKey2::MaxTipBps)
             .unwrap_or(DEFAULT_MAX_TIP_BPS)
+    }
+
+    // =========================================================================
+    // Tip Split Configuration (#370)
+    // =========================================================================
+
+    /// Configure tip split allocation for a merchant.
+    /// Validates that basis points sum to exactly 10,000 and beneficiary count <= MAX_TIP_SPLIT_BENEFICIARIES.
+    pub fn set_tip_split_config(
+        env: Env,
+        merchant: Address,
+        caller: Address,
+        split_map: soroban_sdk::Vec<(Address, u32)>,
+    ) {
+        caller.require_auth();
+        
+        // Validate caller is merchant (in production, add admin override if needed)
+        if caller != merchant {
+            panic!("Only merchant can configure tip splits");
+        }
+        
+        // Validate non-empty
+        if split_map.is_empty() {
+            panic!("Tip split configuration cannot be empty");
+        }
+        
+        // Validate max beneficiaries
+        if split_map.len() > MAX_TIP_SPLIT_BENEFICIARIES {
+            panic!("Tip split beneficiaries exceed maximum allowed");
+        }
+        
+        // Validate total bps sum to 10,000
+        let mut total_bps: u32 = 0;
+        for entry in split_map.iter() {
+            total_bps = total_bps.checked_add(entry.1).expect("BPS overflow");
+        }
+        if total_bps != 10_000 {
+            panic!("Tip split basis points must sum to exactly 10,000");
+        }
+        
+        // Convert to Vec<TipSplitBeneficiary> and store
+        let mut beneficiaries: soroban_sdk::Vec<TipSplitBeneficiary> = soroban_sdk::Vec::new(&env);
+        for entry in split_map.iter() {
+            beneficiaries.push_back(TipSplitBeneficiary {
+                recipient: entry.0,
+                bps: entry.1,
+            });
+        }
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey3::TipSplitConfig(merchant.clone()), &beneficiaries);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey3::TipSplitConfig(merchant),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+    }
+
+    /// Retrieve tip split configuration for a merchant.
+    /// Returns None if no configuration exists (fallback to default behavior).
+    pub fn get_tip_split_config(
+        env: Env,
+        merchant: Address,
+    ) -> Option<soroban_sdk::Vec<(Address, u32)>> {
+        let config: Option<soroban_sdk::Vec<TipSplitBeneficiary>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::TipSplitConfig(merchant));
+        
+        config.map(|beneficiaries| {
+            let mut result: soroban_sdk::Vec<(Address, u32)> = soroban_sdk::Vec::new(&env);
+            for b in beneficiaries.iter() {
+                result.push_back((b.recipient, b.bps));
+            }
+            result
+        })
+    }
+
+    /// Remove tip split configuration for a merchant.
+    /// Reverts to default behavior (100% to merchant).
+    pub fn remove_tip_split_config(
+        env: Env,
+        merchant: Address,
+        caller: Address,
+    ) {
+        caller.require_auth();
+        
+        // Validate caller is merchant (in production, add admin override if needed)
+        if caller != merchant {
+            panic!("Only merchant can remove tip split configuration");
+        }
+        
+        env.storage()
+            .persistent()
+            .remove(&DataKey3::TipSplitConfig(merchant));
     }
 
     // =========================================================================
@@ -9072,5 +9537,7 @@ mod test_referral;
 mod test_retry_queue;
 #[cfg(test)]
 mod test_spending_limit;
+#[cfg(test)]
+mod test_buyer_trust_tier;
 
 pub use events::*;

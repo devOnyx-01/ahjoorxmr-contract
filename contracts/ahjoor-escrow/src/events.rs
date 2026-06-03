@@ -1295,6 +1295,73 @@ pub fn emit_release_condition_waived(env: &Env, escrow_id: u32) {
     ReleaseConditionWaived { escrow_id }.publish(env);
 }
 
+// --- #272/#357: Inspector Events ---
+
+/// Event: Seller marked work complete; awaiting inspector (#272)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SellerMarkedComplete {
+    pub escrow_id: u32,
+    pub seller: Address,
+}
+
+/// Event: Inspector replaced by mutual agreement (#272)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InspectorReplaced {
+    pub escrow_id: u32,
+    pub old_inspector: Address,
+    pub new_inspector: Address,
+}
+
+/// Event: Inspection report submitted by inspector (#272)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InspectionReportSubmitted {
+    pub escrow_id: u32,
+    pub inspector: Address,
+    pub approved: bool,
+    pub report_hash: BytesN<32>,
+}
+
+/// Event: Inspector reputation score updated (#357)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InspectorScoreUpdated {
+    pub inspector: Address,
+    pub total_rulings: u32,
+    pub correct_rulings: u32,
+    pub accuracy_bps: u32,
+}
+
+pub fn emit_seller_marked_complete(e: &Env, escrow_id: u32, seller: Address) {
+    SellerMarkedComplete { escrow_id, seller }.publish(e);
+}
+
+pub fn emit_inspector_replaced(e: &Env, escrow_id: u32, old_inspector: Address, new_inspector: Address) {
+    InspectorReplaced { escrow_id, old_inspector, new_inspector }.publish(e);
+}
+
+pub fn emit_inspection_report_submitted(
+    e: &Env,
+    escrow_id: u32,
+    inspector: Address,
+    approved: bool,
+    report_hash: BytesN<32>,
+) {
+    InspectionReportSubmitted { escrow_id, inspector, approved, report_hash }.publish(e);
+}
+
+pub fn emit_inspector_score_updated(
+    e: &Env,
+    inspector: Address,
+    total_rulings: u32,
+    correct_rulings: u32,
+    accuracy_bps: u32,
+) {
+    InspectorScoreUpdated { inspector, total_rulings, correct_rulings, accuracy_bps }.publish(e);
+}
+
 // ── #332: Milestone BPS Events ────────────────────────────────────────────────
 
 pub fn emit_milestone_submitted(e: &Env, escrow_id: u32, milestone_index: u32, delivery_hash: BytesN<32>) {
@@ -1644,4 +1711,105 @@ pub fn emit_veto_overridden(
     elapsed_seconds: u64,
 ) {
     VetoOverridden { escrow_id, admin, reason_hash, elapsed_seconds }.publish(e);
+}
+
+// ── #376: Bounty Board Milestone Gating Events ───────────────────────────────
+
+/// Event: A milestone-gated bounty was created.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct BountyMilestoneCreated {
+    pub escrow_id: u32,
+    pub buyer: Address,
+    pub milestone_count: u32,
+    pub total_amount: i128,
+}
+
+/// Event: A bounty milestone deliverable was submitted by the solver.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct BountyMilestoneSubmitted {
+    pub escrow_id: u32,
+    pub index: u32,
+    pub solver: Address,
+    pub deliverable_hash: BytesN<32>,
+}
+
+/// Event: A bounty milestone was verified by its designated verifier and the
+/// corresponding tranche released to the solver.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MilestoneVerified {
+    pub escrow_id: u32,
+    pub index: u32,
+    pub amount: i128,
+    pub verifier: Address,
+}
+
+pub struct BountyMilestoneVerifierReplaced {
+    pub escrow_id: u32,
+    pub index: u32,
+    pub old_verifier: Address,
+    pub new_verifier: Address,
+}
+
+pub fn emit_bounty_milestone_created(
+    e: &Env,
+    escrow_id: u32,
+    buyer: Address,
+    milestone_count: u32,
+    total_amount: i128,
+) {
+    BountyMilestoneCreated {
+        escrow_id,
+        buyer,
+        milestone_count,
+        total_amount,
+    }
+    .publish(e);
+}
+
+pub fn emit_bounty_milestone_submitted(
+    e: &Env,
+    escrow_id: u32,
+    index: u32,
+    solver: Address,
+    deliverable_hash: BytesN<32>,
+) {
+    BountyMilestoneSubmitted {
+        escrow_id,
+        index,
+        solver,
+        deliverable_hash,
+    }
+    .publish(e);
+}
+
+pub fn emit_milestone_verified(
+    e: &Env,
+    escrow_id: u32,
+    index: u32,
+    amount: i128,
+    verifier: Address,
+) {
+    MilestoneVerified {
+        escrow_id,
+        index,
+        amount,
+        verifier,
+    }
+    .publish(e);
+}
+
+pub fn emit_bounty_milestone_verifier_replaced(
+    e: &Env,
+    escrow_id: u32,
+    index: u32,
+    old_verifier: Address,
+    new_verifier: Address,
+) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "BountyVerifierReplaced"),),
+        (escrow_id, index, old_verifier, new_verifier),
+    );
 }

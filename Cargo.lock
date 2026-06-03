@@ -43,7 +43,15 @@ dependencies = [
 name = "ahjoor-rosca"
 version = "0.1.0"
 dependencies = [
+ "ahjoor-token-whitelist",
  "proptest",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "ahjoor-token-whitelist"
+version = "0.1.0"
+dependencies = [
  "soroban-sdk",
 ]
 
