@@ -289,12 +289,6 @@ pub enum DataKey2 {
     // #240: Co-Signer Guarantee
     CoSigners,               // Map<Address, CoSignerRecord> — member → co-signer record
     CoSignerWindowLedgers,   // u32 — grace period ledgers before penalty applied
-    // #315: Payout Order Randomization
-    RandomizePayoutOrder,    // bool — enable randomization for this group
-    PayoutOrderSeed,         // BytesN<32> — seed for Fisher-Yates shuffle
-    PayoutOrderFinalized,    // bool — track if order has been finalized
-    // #352: Contribution Rebalancing
-    BasePoolTarget,          // i128 — immutable payout target per cycle (initial_members × contribution_amount)
 }
 
 /// Overflow key enum — DataKey2 is capped at 50 variants by the soroban XDR limit.
@@ -325,8 +319,8 @@ pub enum DataKey3 {
     // #313: Emergency Liquidity Reserve
     EmergencyReserveBalance, // i128 — total balance in emergency reserve
     EmergencyLoanCounter,    // u32 — counter for loan IDs
-    EmergencyLoan,           // Map<u32, EmergencyLoan> — loan_id → loan record
-    MemberOutstandingLoan,   // Map<Address, u32> — member → active loan_id (0 = none)
+    EmergencyLoan(u32),      // loan_id → EmergencyLoan record
+    MemberOutstandingLoan(Address), // member → active loan_id
     /// #314: Group treasury configuration
     TreasuryConfig,          // TreasuryConfig
     /// #314: Group treasury balance
@@ -345,6 +339,13 @@ pub enum DataKey3 {
     LateContributionCount,   // Map<Address, u32> — consecutive late payment count per member
     LateContribThreshold,    // u32 — late payments before demotion is triggered (default: 3)
     GracePeriodSeconds,      // u64 — seconds after deadline during which late payments are accepted
+    ReserveEnabled,          // bool
+    // #315: Payout Order Randomization
+    RandomizePayoutOrder,    // bool — enable randomization for this group
+    PayoutOrderSeed,         // BytesN<32> — seed for Fisher-Yates shuffle
+    PayoutOrderFinalized,    // bool — track if order has been finalized
+    // #352: Contribution Rebalancing
+    BasePoolTarget,          // i128 — immutable payout target per cycle (initial_members × contribution_amount)
 }
 
 // ── #330: Contribution Delegation ────────────────────────────────────────────
@@ -393,6 +394,21 @@ pub enum PersistentKey {
     LastSnapshotLedger,        // u32 — last snapshot ledger for spam guard (#243)
     MinSnapshotIntervalLedgers, // u32 — min interval between snapshots (#243)
     MemberCreditScores,        // Map<Address, MemberScore> — per-member credit score (#269)
+    /// #364: Point-in-time cycle snapshot keyed by cycle number
+    CycleSnapshot(u32),        // cycle_number → CycleSnapshotData
+}
+
+/// #364: Immutable point-in-time snapshot of group state at cycle end.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CycleSnapshotData {
+    pub cycle_number: u32,
+    pub members: Vec<Address>,
+    pub contribution_amounts: Map<Address, i128>,
+    pub payout_queue: Vec<Address>,
+    pub pool_balance: i128,
+    pub timestamp: u64,
+    pub snapshot_hash: BytesN<32>,
 }
 
 /// Record of a single freeze/unfreeze cycle for a group.

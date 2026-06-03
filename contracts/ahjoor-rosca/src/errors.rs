@@ -162,4 +162,21 @@ pub enum ExtError {
     SplitAlreadyConfirmed = 91,
     /// Not all members have confirmed; cannot execute split yet (#331).
     SplitNotFullyConfirmed = 92,
+    AuctionNotEnabled = 93,
+    AuctionNotOpen = 94,
+    AuctionWindowClosed = 95,
+    MigrationAlreadyPending = 96,
+    MigrationNotFound = 97,
+    MigrationAlreadyExecuted = 98,
+    MigrationNotApproved = 99,
+    InvalidSlotIndex = 100,
+}
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtError2 {
+    NoBidFound = 101,
+    TokenMismatch = 102,
+    SlotOccupied = 103,
+    IncorrectContributionAmount = 104,
 }

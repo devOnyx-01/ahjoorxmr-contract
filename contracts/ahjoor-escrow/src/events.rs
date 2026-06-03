@@ -1269,13 +1269,7 @@ pub fn emit_multi_seller_escrow_released(
     escrow_id: u32,
     distributions: Vec<(Address, i128)>,
 ) {
-    env.events().publish(
-        ("ahjoor", "multi_seller_escrow_released"),
-        MultiSellerEscrowReleased {
-            escrow_id,
-            distributions,
-        },
-    );
+    MultiSellerEscrowReleased { escrow_id, distributions }.publish(env);
 }
 
 pub fn emit_seller_share_delegated(
@@ -1284,14 +1278,7 @@ pub fn emit_seller_share_delegated(
     original_seller: Address,
     delegate: Address,
 ) {
-    env.events().publish(
-        ("ahjoor", "seller_share_delegated"),
-        SellerShareDelegated {
-            escrow_id,
-            original_seller,
-            delegate,
-        },
-    );
+    SellerShareDelegated { escrow_id, original_seller, delegate }.publish(env);
 }
 
 
@@ -1301,21 +1288,11 @@ pub fn emit_conditional_release_triggered(
     oracle_contract: Address,
     condition_value: i128,
 ) {
-    env.events().publish(
-        ("ahjoor", "conditional_release_triggered"),
-        ConditionalReleaseTriggered {
-            escrow_id,
-            oracle_contract,
-            condition_value,
-        },
-    );
+    ConditionalReleaseTriggered { escrow_id, oracle_contract, condition_value }.publish(env);
 }
 
 pub fn emit_release_condition_waived(env: &Env, escrow_id: u32) {
-    env.events().publish(
-        ("ahjoor", "release_condition_waived"),
-        ReleaseConditionWaived { escrow_id },
-    );
+    ReleaseConditionWaived { escrow_id }.publish(env);
 }
 
 // ── #332: Milestone BPS Events ────────────────────────────────────────────────
@@ -1620,4 +1597,51 @@ pub fn emit_scheduled_release_executed(
         remaining_tranches,
     }
     .publish(e);
+}
+
+// ── #366: Seller Veto Override Events ────────────────────────────────────────
+
+/// Event: Seller raised a veto blocking fund release (#366)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SellerVetoRaised {
+    pub escrow_id: u32,
+    pub seller: Address,
+    pub veto_timestamp: u64,
+}
+
+/// Event: Seller cancelled their veto before the override window elapsed (#366)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SellerVetoCancelled {
+    pub escrow_id: u32,
+    pub seller: Address,
+}
+
+/// Event: Admin overrode the seller veto after the window elapsed (#366)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct VetoOverridden {
+    pub escrow_id: u32,
+    pub admin: Address,
+    pub reason_hash: BytesN<32>,
+    pub elapsed_seconds: u64,
+}
+
+pub fn emit_seller_veto_raised(e: &Env, escrow_id: u32, seller: Address, veto_timestamp: u64) {
+    SellerVetoRaised { escrow_id, seller, veto_timestamp }.publish(e);
+}
+
+pub fn emit_seller_veto_cancelled(e: &Env, escrow_id: u32, seller: Address) {
+    SellerVetoCancelled { escrow_id, seller }.publish(e);
+}
+
+pub fn emit_veto_overridden(
+    e: &Env,
+    escrow_id: u32,
+    admin: Address,
+    reason_hash: BytesN<32>,
+    elapsed_seconds: u64,
+) {
+    VetoOverridden { escrow_id, admin, reason_hash, elapsed_seconds }.publish(e);
 }

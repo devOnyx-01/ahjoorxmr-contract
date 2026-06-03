@@ -5,17 +5,21 @@ use soroban_sdk::{
 };
 use crate::pre_approved_spending::*;
 
-// Storage keys
+// Counter storage keys (static)
 const ALLOWANCE_COUNTER_KEY: &str = "allowance_counter";
-const ALLOWANCE_KEY_PREFIX: &str = "allowance_";
 const CONSENT_COUNTER_KEY: &str = "consent_counter";
-const CONSENT_KEY_PREFIX: &str = "consent_";
 const TRANSACTION_COUNTER_KEY: &str = "transaction_counter";
-const TRANSACTION_KEY_PREFIX: &str = "transaction_";
 const AUDIT_LOG_COUNTER_KEY: &str = "audit_log_counter";
-const AUDIT_LOG_KEY_PREFIX: &str = "audit_log_";
-const CUSTOMER_ALLOWANCES_KEY_PREFIX: &str = "customer_allowances_";
-const MERCHANT_ALLOWANCES_KEY_PREFIX: &str = "merchant_allowances_";
+
+#[contracttype]
+enum SpendingStorageKey {
+    Allowance(u32),
+    Consent(u32),
+    Transaction(u32),
+    AuditLog(u32),
+    CustomerAllowances(Address),
+    MerchantAllowances(Address),
+}
 
 /// Implementation of pre-approved spending functionality
 pub struct PreApprovedSpendingImpl;
@@ -81,17 +85,14 @@ impl PreApprovedSpendingImpl {
         };
 
         // Store allowance
-        let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, next_id));
+        let key = SpendingStorageKey::Allowance(next_id);
         env.storage().persistent().set(&key, &allowance);
         env.storage()
             .instance()
             .set(&Symbol::new(env, ALLOWANCE_COUNTER_KEY), &next_id);
 
         // Add to customer allowances list
-        let customer_key = Symbol::new(
-            env,
-            &format!("{}{}", CUSTOMER_ALLOWANCES_KEY_PREFIX, customer),
-        );
+        let customer_key = SpendingStorageKey::CustomerAllowances(customer.clone());
         let mut customer_allowances: Vec<u32> = env
             .storage()
             .persistent()
@@ -103,10 +104,7 @@ impl PreApprovedSpendingImpl {
             .set(&customer_key, &customer_allowances);
 
         // Add to merchant allowances list
-        let merchant_key = Symbol::new(
-            env,
-            &format!("{}{}", MERCHANT_ALLOWANCES_KEY_PREFIX, merchant),
-        );
+        let merchant_key = SpendingStorageKey::MerchantAllowances(merchant.clone());
         let mut merchant_allowances: Vec<u32> = env
             .storage()
             .persistent()
@@ -177,7 +175,7 @@ impl PreApprovedSpendingImpl {
         };
 
         // Store consent
-        let key = Symbol::new(env, &format!("{}{}", CONSENT_KEY_PREFIX, next_id));
+        let key = SpendingStorageKey::Consent(next_id);
         env.storage().persistent().set(&key, &consent);
         env.storage()
             .instance()
@@ -193,7 +191,7 @@ impl PreApprovedSpendingImpl {
         amount: i128,
         reference: String,
     ) -> AllowanceTransaction {
-        let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, allowance_id));
+        let key = SpendingStorageKey::Allowance(allowance_id);
         let mut allowance: SpendingAllowance = env
             .storage()
             .persistent()
@@ -287,7 +285,7 @@ impl PreApprovedSpendingImpl {
         };
 
         // Store transaction
-        let tx_key = Symbol::new(env, &format!("{}{}", TRANSACTION_KEY_PREFIX, next_tx_id));
+        let tx_key = SpendingStorageKey::Transaction(next_tx_id);
         env.storage().persistent().set(&tx_key, &transaction);
 
         // Store updated allowance
@@ -302,7 +300,7 @@ impl PreApprovedSpendingImpl {
             allowance_id,
             AuditAction::TransactionApproved,
             allowance.customer.clone(),
-            &format!("Spent {} from allowance", amount),
+            "Spent from allowance",
         );
 
         transaction
@@ -310,19 +308,19 @@ impl PreApprovedSpendingImpl {
 
     /// Get allowance details
     pub fn get_allowance(env: &Env, allowance_id: u32) -> Option<SpendingAllowance> {
-        let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, allowance_id));
+        let key = SpendingStorageKey::Allowance(allowance_id);
         env.storage().persistent().get(&key)
     }
 
     /// Get consent record
     pub fn get_consent(env: &Env, consent_id: u32) -> Option<ConsentRecord> {
-        let key = Symbol::new(env, &format!("{}{}", CONSENT_KEY_PREFIX, consent_id));
+        let key = SpendingStorageKey::Consent(consent_id);
         env.storage().persistent().get(&key)
     }
 
     /// Pause an allowance
     pub fn pause_allowance(env: &Env, allowance_id: u32) {
-        let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, allowance_id));
+        let key = SpendingStorageKey::Allowance(allowance_id);
         let mut allowance: SpendingAllowance = env
             .storage()
             .persistent()
@@ -345,7 +343,7 @@ impl PreApprovedSpendingImpl {
 
     /// Resume a paused allowance
     pub fn resume_allowance(env: &Env, allowance_id: u32) {
-        let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, allowance_id));
+        let key = SpendingStorageKey::Allowance(allowance_id);
         let mut allowance: SpendingAllowance = env
             .storage()
             .persistent()
@@ -372,7 +370,7 @@ impl PreApprovedSpendingImpl {
 
     /// Revoke an allowance
     pub fn revoke_allowance(env: &Env, allowance_id: u32) {
-        let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, allowance_id));
+        let key = SpendingStorageKey::Allowance(allowance_id);
         let mut allowance: SpendingAllowance = env
             .storage()
             .persistent()
@@ -395,7 +393,7 @@ impl PreApprovedSpendingImpl {
 
     /// Revoke consent
     pub fn revoke_consent(env: &Env, consent_id: u32) {
-        let key = Symbol::new(env, &format!("{}{}", CONSENT_KEY_PREFIX, consent_id));
+        let key = SpendingStorageKey::Consent(consent_id);
         let mut consent: ConsentRecord = env
             .storage()
             .persistent()
@@ -410,7 +408,7 @@ impl PreApprovedSpendingImpl {
 
     /// Get remaining balance
     pub fn get_remaining_balance(env: &Env, allowance_id: u32) -> i128 {
-        let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, allowance_id));
+        let key = SpendingStorageKey::Allowance(allowance_id);
         let allowance: SpendingAllowance = env
             .storage()
             .persistent()
@@ -425,7 +423,7 @@ impl PreApprovedSpendingImpl {
 
     /// Get daily remaining balance
     pub fn get_daily_remaining(env: &Env, allowance_id: u32) -> i128 {
-        let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, allowance_id));
+        let key = SpendingStorageKey::Allowance(allowance_id);
         let allowance: SpendingAllowance = env
             .storage()
             .persistent()
@@ -455,14 +453,11 @@ impl PreApprovedSpendingImpl {
     /// Get all allowances for a customer
     pub fn get_customer_allowances(env: &Env, customer: Address) -> Vec<SpendingAllowance> {
         let mut allowances = Vec::new(env);
-        let customer_key = Symbol::new(
-            env,
-            &format!("{}{}", CUSTOMER_ALLOWANCES_KEY_PREFIX, customer),
-        );
+        let customer_key = SpendingStorageKey::CustomerAllowances(customer);
 
         if let Some(allowance_ids) = env.storage().persistent().get::<_, Vec<u32>>(&customer_key) {
             for id in allowance_ids.iter() {
-                let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, id));
+                let key = SpendingStorageKey::Allowance(id);
                 if let Some(allowance) = env.storage().persistent().get::<_, SpendingAllowance>(&key) {
                     allowances.push_back(allowance);
                 }
@@ -475,14 +470,11 @@ impl PreApprovedSpendingImpl {
     /// Get all allowances for a merchant
     pub fn get_merchant_allowances(env: &Env, merchant: Address) -> Vec<SpendingAllowance> {
         let mut allowances = Vec::new(env);
-        let merchant_key = Symbol::new(
-            env,
-            &format!("{}{}", MERCHANT_ALLOWANCES_KEY_PREFIX, merchant),
-        );
+        let merchant_key = SpendingStorageKey::MerchantAllowances(merchant);
 
         if let Some(allowance_ids) = env.storage().persistent().get::<_, Vec<u32>>(&merchant_key) {
             for id in allowance_ids.iter() {
-                let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, id));
+                let key = SpendingStorageKey::Allowance(id);
                 if let Some(allowance) = env.storage().persistent().get::<_, SpendingAllowance>(&key) {
                     allowances.push_back(allowance);
                 }
@@ -494,7 +486,7 @@ impl PreApprovedSpendingImpl {
 
     /// Verify consent is valid
     pub fn verify_consent(env: &Env, consent_id: u32) -> bool {
-        let key = Symbol::new(env, &format!("{}{}", CONSENT_KEY_PREFIX, consent_id));
+        let key = SpendingStorageKey::Consent(consent_id);
         if let Some(consent) = env.storage().persistent().get::<_, ConsentRecord>(&key) {
             let now = env.ledger().timestamp();
             consent.status == ConsentStatus::Active && now <= consent.expires_at
@@ -510,7 +502,7 @@ impl PreApprovedSpendingImpl {
         per_transaction_limit: i128,
         daily_limit: i128,
     ) {
-        let key = Symbol::new(env, &format!("{}{}", ALLOWANCE_KEY_PREFIX, allowance_id));
+        let key = SpendingStorageKey::Allowance(allowance_id);
         let mut allowance: SpendingAllowance = env
             .storage()
             .persistent()
@@ -558,10 +550,10 @@ impl PreApprovedSpendingImpl {
             action,
             actor,
             timestamp: env.ledger().timestamp(),
-            details: String::from_small_copy(env, details),
+            details: String::from_str(env, details),
         };
 
-        let key = Symbol::new(env, &format!("{}{}", AUDIT_LOG_KEY_PREFIX, next_log_id));
+        let key = SpendingStorageKey::AuditLog(next_log_id);
         env.storage().persistent().set(&key, &log);
         env.storage()
             .instance()
