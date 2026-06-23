@@ -1316,6 +1316,29 @@ impl AhjoorContract {
     /// - Executes the payout with whatever funds have been collected
     ///
     /// Admin only. Panics with `DeadlineNotPassed` if called before the deadline.
+    // ── Audit Trail Public Methods ────────────────────────────────────────────
+    pub fn get_cycle_record(env: Env, cycle_number: u32) -> Option<CycleRecord> {
+        audit_trail::get_cycle_record(&env, cycle_number)
+    }
+
+    pub fn set_cycle_retention_window(env: Env, new_window: u32) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        admin.require_auth();
+        audit_trail::set_retention_window(&env, new_window);
+    }
+
+    pub fn get_cycle_retention_window(env: Env) -> u32 {
+        audit_trail::get_retention_window(&env)
+    }
+
+    pub fn get_member_contribution_history(env: Env, member: Address) -> Vec<ContributionEntry> {
+        audit_trail::get_member_contribution_history(&env, member)
+    }
+
     pub fn finalize_round(env: Env) {
         internals::check_not_paused(&env);
         internals::check_not_frozen(&env);
