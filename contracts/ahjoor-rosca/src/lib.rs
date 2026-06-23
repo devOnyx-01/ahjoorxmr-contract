@@ -1435,6 +1435,7 @@ impl AhjoorContract {
         for member in defaulters.iter() {
             // #240: if member has an active co-signer and window > 0, open grace period
             // instead of immediately applying the penalty
+            // #399: if member has a pending co-signer, skip window and apply penalty immediately
             if co_signer_window > 0 {
                 if let Some(record) = co_signers.get(member.clone()) {
                     if record.status == CoSignerStatus::Active {
@@ -1460,6 +1461,7 @@ impl AhjoorContract {
                             .set(&DataKey3::CoSignerWindowStart, &window_starts);
                         events::emit_co_signer_window_expired(&env, 0, member.clone());
                     }
+                    // #399: If status is Pending, fall through to apply penalty immediately
                 }
             }
 
