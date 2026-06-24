@@ -1017,6 +1017,7 @@ pub enum FailedDebitStatus {
 pub struct FailedDebitRecord {
     pub id: u32,
     pub plan_id: u32,
+    pub invoice_id: Option<u32>,
     pub merchant: Address,
     pub customer: Address,
     pub token: Address,
@@ -1050,9 +1051,11 @@ pub struct RecurringInvoice {
     pub amount: i128,
     pub token: Address,
     pub interval_seconds: u64,
+    pub interval_ledgers: u32,
     pub max_cycles: u32,
     pub cycles_triggered: u32,
     pub next_due_at: u64,
+    pub next_due_ledger: u64,
     pub reference_hash: Option<BytesN<32>>,
     pub active: bool,
 }
@@ -7923,6 +7926,7 @@ impl AhjoorPaymentsContract {
         amount: i128,
         token: Address,
         interval_seconds: u64,
+        interval_ledgers: u32,
         max_cycles: u32,
         reference_hash: Option<BytesN<32>>,
     ) -> u32 {
@@ -7934,6 +7938,9 @@ impl AhjoorPaymentsContract {
         }
         if interval_seconds == 0 {
             panic!("Interval must be positive");
+        }
+        if interval_ledgers == 0 {
+            panic!("Interval ledgers must be positive");
         }
 
         Self::require_token_allowed(&env, &token);
@@ -7950,7 +7957,8 @@ impl AhjoorPaymentsContract {
             .instance()
             .set(&DataKey2::RecurringInvoiceCounter, &counter);
 
-        let now = env.ledger().timestamp();
+        let now_ts = env.ledger().timestamp();
+        let now_ledger = env.ledger().sequence();
         let invoice = RecurringInvoice {
             id: invoice_id,
             merchant: merchant.clone(),
@@ -7958,9 +7966,11 @@ impl AhjoorPaymentsContract {
             amount,
             token,
             interval_seconds,
+            interval_ledgers,
             max_cycles,
             cycles_triggered: 0,
-            next_due_at: now,
+            next_due_at: now_ts,
+            next_due_ledger: now_ledger as u64,
             reference_hash,
             active: true,
         };
@@ -7999,9 +8009,13 @@ impl AhjoorPaymentsContract {
             panic!("Recurring invoice is cancelled");
         }
 
-        let now = env.ledger().timestamp();
-        if now < invoice.next_due_at {
+        let now_ts = env.ledger().timestamp();
+        let now_ledger = env.ledger().sequence() as u64;
+        if now_ts < invoice.next_due_at {
             panic!("Invoice interval has not elapsed");
+        }
+        if now_ledger < invoice.next_due_ledger {
+            panic!("Invoice interval has not elapsed (ledger)");
         }
 
         if invoice.max_cycles > 0 && invoice.cycles_triggered >= invoice.max_cycles {
@@ -8023,7 +8037,8 @@ impl AhjoorPaymentsContract {
         );
 
         invoice.cycles_triggered += 1;
-        invoice.next_due_at = now + invoice.interval_seconds;
+        invoice.next_due_at = now_ts + invoice.interval_seconds;
+        invoice.next_due_ledger = now_ledger + invoice.interval_ledgers as u64;
 
         // Auto-complete if max_cycles reached
         if invoice.max_cycles > 0 && invoice.cycles_triggered >= invoice.max_cycles {
@@ -8905,6 +8920,7 @@ impl AhjoorPaymentsContract {
         token: Address,
         amount: i128,
         plan_id: u32,
+        invoice_id: Option<u32>,
     ) -> u32 {
         Self::require_not_paused(&env);
         merchant.require_auth();
@@ -8951,6 +8967,7 @@ impl AhjoorPaymentsContract {
             let rec = FailedDebitRecord {
                 id: record_id,
                 plan_id,
+                invoice_id,
                 merchant: merchant.clone(),
                 customer: customer.clone(),
                 token: token.clone(),
@@ -8968,6 +8985,7 @@ impl AhjoorPaymentsContract {
             let rec = FailedDebitRecord {
                 id: record_id,
                 plan_id,
+                invoice_id,
                 merchant: merchant.clone(),
                 customer: customer.clone(),
                 token: token.clone(),
@@ -9210,6 +9228,11 @@ impl AhjoorPaymentsContract {
                 PERSISTENT_BUMP_AMOUNT,
             );
             events::emit_debit_retry_succeeded(&env, record_id, rec.plan_id, rec.amount);
+
+            // If this debit is linked to a recurring invoice, advance the invoice cycle
+            if let Some(invoice_id) = rec.invoice_id {
+                Self::advance_recurring_invoice_on_retry_success(&env, invoice_id, record_id);
+            }
         } else {
             rec.attempt_number += 1;
             if rec.attempt_number > cfg.max_retry_attempts {
@@ -9252,6 +9275,39 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Internal helper to advance a recurring invoice when a linked debit retry succeeds.
+    fn advance_recurring_invoice_on_retry_success(env: &Env, invoice_id: u32, payment_id: u32) {
+        let mut invoice: RecurringInvoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found");
+
+        if !invoice.active {
+            return;
+        }
+
+        invoice.cycles_triggered += 1;
+        invoice.next_due_at = invoice.next_due_at.saturating_add(invoice.interval_seconds);
+        invoice.next_due_ledger = invoice.next_due_ledger.saturating_add(invoice.interval_ledgers as u64);
+
+        if invoice.max_cycles > 0 && invoice.cycles_triggered >= invoice.max_cycles {
+            invoice.active = false;
+            events::emit_recurring_invoice_completed(env, invoice_id);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey2::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_invoice_cycle_triggered(env, invoice_id, payment_id, invoice.cycles_triggered);
     }
 
     /// Customer triggers an early retry regardless of the back-off schedule,
@@ -9305,6 +9361,9 @@ impl AhjoorPaymentsContract {
                 PERSISTENT_BUMP_AMOUNT,
             );
             events::emit_debit_retry_succeeded(&env, record_id, rec.plan_id, rec.amount);
+            if let Some(invoice_id) = rec.invoice_id {
+                Self::advance_recurring_invoice_on_retry_success(&env, invoice_id, record_id);
+            }
         } else {
             rec.attempt_number += 1;
             if rec.attempt_number > cfg.max_retry_attempts {
