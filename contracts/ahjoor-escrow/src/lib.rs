@@ -538,6 +538,8 @@ pub struct BountyData {
     pub submission_hash: Option<BytesN<32>>,
     /// Number of times this bounty has been rejected and re-opened.
     pub rejection_count: u32,
+    /// Bounty funds already paid out before final cancellation.
+    pub fees_disbursed: i128,
 }
 
 // ── #376: Bounty Board Milestone Gating with Verifier Sign-Off Chain ─────────
@@ -2495,6 +2497,7 @@ impl AhjoorEscrowContract {
         if arbiter_fee > 0 {
             client.transfer(&env.current_contract_address(), &arbiter, &arbiter_fee);
             events::emit_arbiter_fee_paid(env, escrow_id, arbiter.clone(), arbiter_fee);
+            Self::record_bounty_disbursement(env, escrow_id, arbiter_fee);
         }
 
         let fee_bps: u32 = env
@@ -2516,6 +2519,7 @@ impl AhjoorEscrowContract {
                 &protocol_fee,
             );
             events::emit_protocol_fee_paid(env, escrow_id, protocol_fee, fee_recipient);
+            Self::record_bounty_disbursement(env, escrow_id, protocol_fee);
         }
 
         let distributable = escrow.amount - protocol_fee - arbiter_fee;
@@ -5126,6 +5130,7 @@ impl AhjoorEscrowContract {
             solver: None,
             submission_hash: None,
             rejection_count: 0,
+            fees_disbursed: 0,
         };
         env.storage()
             .persistent()
@@ -5420,11 +5425,16 @@ impl AhjoorEscrowContract {
             panic!("Cannot cancel bounty in current state");
         }
 
-        let amount = escrow.amount;
+        let refund_amount = escrow
+            .amount
+            .checked_sub(bounty_data.fees_disbursed)
+            .expect("Disbursed fees exceed bounty amount");
         let token_client = token::Client::new(&env, &escrow.token);
 
         // Refund buyer
-        token_client.transfer(&env.current_contract_address(), &buyer, &amount);
+        if refund_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &buyer, &refund_amount);
+        }
 
         // Update escrow status
         escrow.status = EscrowStatus::Refunded;
@@ -5437,7 +5447,7 @@ impl AhjoorEscrowContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_bounty_cancelled(&env, escrow_id, buyer, amount);
+        events::emit_bounty_cancelled(&env, escrow_id, buyer, refund_amount);
 
         env.storage()
             .instance()
@@ -5600,6 +5610,7 @@ impl AhjoorEscrowContract {
             solver: None,
             submission_hash: None,
             rejection_count: 0,
+            fees_disbursed: 0,
         };
         env.storage()
             .persistent()
@@ -5760,6 +5771,7 @@ impl AhjoorEscrowContract {
 
         let token_client = token::Client::new(&env, &escrow.token);
         token_client.transfer(&env.current_contract_address(), &solver, &amount);
+        Self::record_bounty_disbursement(&env, escrow_id, amount);
 
         milestone.status = BountyMilestoneStatus::Paid;
         states.set(index, milestone);
@@ -6601,6 +6613,28 @@ impl AhjoorEscrowContract {
                 .get(&DataKey::DefaultArbiterFeeBps)
                 .unwrap_or(0),
         )
+    }
+
+    fn record_bounty_disbursement(env: &Env, escrow_id: u32, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+
+        if let Some(mut bounty_data) = env
+            .storage()
+            .persistent()
+            .get::<DataKey2, BountyData>(&DataKey2::BountyData(escrow_id))
+        {
+            bounty_data.fees_disbursed += amount;
+            env.storage()
+                .persistent()
+                .set(&DataKey2::BountyData(escrow_id), &bounty_data);
+            env.storage().persistent().extend_ttl(
+                &DataKey2::BountyData(escrow_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
     }
 
     fn is_open_escrow_status(status: EscrowStatus) -> bool {
