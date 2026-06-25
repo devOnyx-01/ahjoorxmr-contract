@@ -39,8 +39,6 @@ pub struct RoscaConfig {
     pub max_defaults: u32,
     /// Additional ledgers before penalties are applied after deadline (ledger-mode groups).
     pub grace_period_ledgers: u32,
-    /// Additional seconds before penalties are applied after deadline (timestamp-mode groups).
-    pub grace_period_seconds: u64,
     pub use_timestamp_schedule: bool,
     pub round_duration_seconds: u64,
     pub max_members: Option<u32>,
@@ -357,8 +355,6 @@ pub struct ContribDelegationRecord {
     TreasuryRoundProposal(u32), // (round_index) → TreasuryRoundProposal
     /// #314: Treasury round votes per member
     TreasuryRoundVotes(u32, Address), // (round_index, member) → bool
-    // #330: Contribution Delegation
-    ContribDelegations,      // Map<Address, ContribDelegationRecord> — member → delegation
     // #331: Group Split
     SplitProposalCounter,    // u32
     SplitProposals,          // Map<u32, SplitProposal>
@@ -366,7 +362,6 @@ pub struct ContribDelegationRecord {
     // #356: Penalty-Based Slot Demotion
     LateContributionCount,   // Map<Address, u32> — consecutive late payment count per member
     LateContribThreshold,    // u32 — late payments before demotion is triggered (default: 3)
-    GracePeriodSeconds,      // u64 — seconds after deadline during which late payments are accepted
     // #359: Savings goal milestone reward pool
     SavingsRewardPool,       // i128 — token balance held for savings goal milestone rewards
     // #359: Per-member milestone claim bitmask (goal_id, member) → u64 bitmask
@@ -380,12 +375,20 @@ pub struct ContribDelegationRecord {
 
 // ── #330: Contribution Delegation ────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum ExpiryMode {
+    Ledger = 0,
+    Timestamp = 1,
+}
+
 /// Delegation record granting a proxy the right to act for a member.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContribDelegationRecord {
     pub proxy: Address,
-    pub expiry_ledger: u64,
+    pub expiry: u64,
+    pub expiry_mode: ExpiryMode,
 }
 
 // ── #331: Group Split ─────────────────────────────────────────────────────────
