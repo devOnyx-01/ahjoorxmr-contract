@@ -40,6 +40,7 @@ fn setup_snapshot<'a>() -> (Env, AhjoorContractClient<'a>, Address, Address, Add
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,

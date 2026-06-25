@@ -1,6 +1,34 @@
 use crate::{errors::{Error, ExtError}, events, audit_trail, ContributionEntry, CycleSnapshotData, DataKey, DataKey2, DataKey3, PersistentKey, PayoutRecord, SlotBid, types::{InsuranceClaim, InsuranceCoverageMode}};
 use soroban_sdk::{panic_with_error, token, Address, Bytes, BytesN, Env, Map, Vec};
 
+/// Returns the timestamp (seconds) after which the grace period for a given round deadline expires.
+///
+/// Branches on `DataKey::UseTimestampSchedule`:
+/// - timestamp-mode: adds `GracePeriodSeconds` (seconds) to `round_deadline`
+/// - ledger-mode: adds `GracePeriodLedgers` (treated as seconds for timestamp comparison)
+pub(crate) fn get_grace_deadline(env: &Env, round_deadline: u64) -> u64 {
+    let use_timestamp: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::UseTimestampSchedule)
+        .unwrap_or(false);
+    if use_timestamp {
+        let grace_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::GracePeriodSeconds)
+            .unwrap_or(0);
+        round_deadline.saturating_add(grace_seconds)
+    } else {
+        let grace_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GracePeriodLedgers)
+            .unwrap_or(0);
+        round_deadline.saturating_add(grace_ledgers as u64)
+    }
+}
+
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100_000;
 const PERSISTENT_BUMP_AMOUNT: u32 = 120_000;
 
@@ -127,14 +155,33 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
         .get(&DataKey::MemberContributions)
         .unwrap_or(Map::new(env));
 
+    // Read insurance pool here so we can exclude it from actual_pot.
+    let mut insurance_pool: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey2::InsurancePool)
+        .unwrap_or(0);
+
+    // expected_pot = what ALL non-suspended, non-exited members were supposed to contribute.
+    // Using all active members (not just paid ones) lets defaulters create a real shortfall.
+    let all_members: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::Members)
+        .unwrap_or(Vec::new(env));
     let mut expected_pot: i128 = 0;
-    for member in _paid_members.iter() {
+    for member in all_members.iter() {
+        if suspended_members.contains(&member) || exited_members.contains(&member) {
+            continue;
+        }
         let tier_bps = tiers.get(member.clone()).unwrap_or(10_000);
         let member_expected = (base_amount * tier_bps as i128) / 10_000;
         expected_pot += member_expected;
     }
 
-    // Calculate actual pot (excluding reward_pool for base token)
+    // actual_pot = contract balance minus reward pool and insurance reserves.
+    // Insurance reserves are not round contributions; excluding them prevents
+    // the pool from masking defaulter shortfalls.
     let mut actual_pot: i128 = 0;
     for token_addr in approved_tokens.iter() {
         let client = token::Client::new(env, &token_addr);
@@ -142,16 +189,10 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
 
         if token_addr == base_token {
             balance -= reward_pool;
+            balance -= insurance_pool;
             actual_pot = balance;
         }
     }
-
-    // #214: Draw from insurance pool based on InsuranceCoverageMode
-    let mut insurance_pool: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey2::InsurancePool)
-        .unwrap_or(0);
     let shortfall = expected_pot - actual_pot;
     let coverage_mode: InsuranceCoverageMode = env
         .storage()
@@ -166,18 +207,19 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
                 if insurance_pool >= shortfall { shortfall } else { insurance_pool }
             }
             InsuranceCoverageMode::Full => {
-                if insurance_pool >= shortfall {
-                    shortfall
-                } else {
-                    events::emit_insurance_pool_exhausted(env, current_round, shortfall - insurance_pool);
+                if insurance_pool == 0 {
+                    events::emit_insurance_pool_exhausted(env, current_round, shortfall);
                     0
+                } else {
+                    // Draw as much as available; if pool < shortfall the remainder is uncovered.
+                    shortfall.min(insurance_pool)
                 }
             }
         };
         if draw_amount > 0 {
             insurance_pool -= draw_amount;
             env.storage().instance().set(&DataKey2::InsurancePool, &insurance_pool);
-            events::emit_insurance_paid_out(env, current_round, draw_amount, insurance_pool);
+            events::emit_insurance_paid_out(env, current_round, shortfall, insurance_pool);
             events::emit_insurance_claim_executed(env, current_round, payout_recipient.clone(), draw_amount);
             let mut claims: Map<u32, Vec<InsuranceClaim>> = env
                 .storage()

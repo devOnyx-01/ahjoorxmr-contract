@@ -37,8 +37,10 @@ pub struct RoscaConfig {
     pub fee_recipient: Option<Address>,
     /// Number of consecutive missed rounds before suspension (default: 3)
     pub max_defaults: u32,
-    /// Additional ledgers (time units) before penalties are applied after deadline.
+    /// Additional ledgers before penalties are applied after deadline (ledger-mode groups).
     pub grace_period_ledgers: u32,
+    /// Additional seconds before penalties are applied after deadline (timestamp-mode groups).
+    pub grace_period_seconds: u64,
     pub use_timestamp_schedule: bool,
     pub round_duration_seconds: u64,
     pub max_members: Option<u32>,
@@ -311,6 +313,19 @@ pub enum DataKey3 {
     // #269: On-Chain Member Credit Score
     ScoreWeights,            // ScoreWeights — admin-configurable scoring formula weights
     MinCreditScore,          // i128 — minimum score required to join this group
+    // #398: Contribution-weight voting delegation
+    ContribDelegations,      // Map<Address, ContribDelegationRecord>
+    // #390: Timestamp-mode grace period
+    GracePeriodSeconds,      // u64 — grace window in seconds (used when UseTimestampSchedule=true)
+}
+
+/// #398: Records an active contribution-weight voting delegation with an expiry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContribDelegationRecord {
+    pub delegate: Address,
+    /// Ledger sequence after which this delegation is considered expired.
+    pub expiry_ledger: u64,
     // Slot Auction
     AuctionEnabled,          // bool — auction feature flag
     AuctionWindowLedgers,    // u64 — bidding window duration in seconds
