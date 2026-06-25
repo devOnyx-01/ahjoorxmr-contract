@@ -3,14 +3,14 @@ use soroban_sdk::{panic_with_error, token, Address, Bytes, BytesN, Env, Map, Vec
 
 /// Returns the timestamp (seconds) after which the grace period for a given round deadline expires.
 ///
-/// Branches on `DataKey::UseTimestampSchedule`:
+/// Branches on `DataKey2::UseTimestampSchedule`:
 /// - timestamp-mode: adds `GracePeriodSeconds` (seconds) to `round_deadline`
 /// - ledger-mode: adds `GracePeriodLedgers` (treated as seconds for timestamp comparison)
 pub(crate) fn get_grace_deadline(env: &Env, round_deadline: u64) -> u64 {
     let use_timestamp: bool = env
         .storage()
         .instance()
-        .get(&DataKey::UseTimestampSchedule)
+        .get(&DataKey2::UseTimestampSchedule)
         .unwrap_or(false);
     if use_timestamp {
         let grace_seconds: u64 = env
@@ -132,7 +132,7 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
     let fee_recipient_opt: Option<Address> = env
         .storage()
         .instance()
-        .get(&DataKey::FeeRecipient);
+        .get(&DataKey2::FeeRecipient);
 
     let mut total_payout_history_amt = 0i128;
     let mut reinvested_amount = 0i128;
@@ -147,7 +147,7 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
     let tiers: Map<Address, u32> = env
         .storage()
         .instance()
-        .get(&DataKey::MemberTiers)
+        .get(&DataKey2::MemberTiers)
         .unwrap_or(Map::new(env));
     let member_contributions: Map<Address, i128> = env
         .storage()
@@ -372,7 +372,7 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
     let use_timestamp_schedule: bool = env
         .storage()
         .instance()
-        .get(&DataKey::UseTimestampSchedule)
+        .get(&DataKey2::UseTimestampSchedule)
         .unwrap_or(false);
 
     let cycle_end_timestamp = if use_timestamp_schedule {
@@ -449,7 +449,7 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
         let tiers: Map<Address, u32> = env
             .storage()
             .instance()
-            .get(&DataKey::MemberTiers)
+            .get(&DataKey2::MemberTiers)
             .unwrap_or(Map::new(env));
         let tier_bps = tiers.get(payout_recipient.clone()).unwrap_or(10_000);
         let member_required = (base_amount * tier_bps as i128) / 10_000;
@@ -502,7 +502,7 @@ pub(crate) fn reset_round_state(env: &Env, current_round: u32) {
         env.storage().instance().set(&DataKey::RoundDuration, &pending);
         env.storage().instance().remove(&DataKey2::PendingRoundDuration);
         // Also update RoundDurationSeconds for timestamp-based scheduling
-        env.storage().instance().set(&DataKey::RoundDurationSeconds, &pending);
+        env.storage().instance().set(&DataKey2::RoundDurationSeconds, &pending);
         events::emit_round_duration_applied(env, current_round + 1, pending);
         pending
     } else {
@@ -528,14 +528,14 @@ pub(crate) fn reset_round_state(env: &Env, current_round: u32) {
     let use_timestamp: bool = env
         .storage()
         .instance()
-        .get(&DataKey::UseTimestampSchedule)
+        .get(&DataKey2::UseTimestampSchedule)
         .unwrap_or(false);
 
     if use_timestamp {
         let duration_seconds: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::RoundDurationSeconds)
+            .get(&DataKey2::RoundDurationSeconds)
             .unwrap_or(0);
         let next_timestamp_deadline = env.ledger().timestamp() + duration_seconds;
         env.storage()
@@ -707,3 +707,4 @@ pub(crate) fn execute_member_removal(env: &Env, member: &Address) {
 
     events::emit_mem_del(env, member.clone());
 }
+

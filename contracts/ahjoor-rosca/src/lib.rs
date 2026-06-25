@@ -119,7 +119,7 @@ impl AhjoorContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::ContractVersion, &1u32);
+            .set(&DataKey2::ContractVersion, &1u32);
         env.storage().instance().set(&DataKey::Members, &members);
         env.storage()
             .instance()
@@ -241,7 +241,7 @@ impl AhjoorContract {
         if let Some(recipient) = config.fee_recipient {
             env.storage()
                 .instance()
-                .set(&DataKey::FeeRecipient, &recipient);
+                .set(&DataKey2::FeeRecipient, &recipient);
         }
 
         // Suspension Threshold Configuration
@@ -266,10 +266,10 @@ impl AhjoorContract {
         // Timestamp-based Payout Scheduling
         env.storage()
             .instance()
-            .set(&DataKey::UseTimestampSchedule, &config.use_timestamp_schedule);
+            .set(&DataKey2::UseTimestampSchedule, &config.use_timestamp_schedule);
         env.storage()
             .instance()
-            .set(&DataKey::RoundDurationSeconds, &config.round_duration_seconds);
+            .set(&DataKey2::RoundDurationSeconds, &config.round_duration_seconds);
 
         if config.use_timestamp_schedule {
             let timestamp_deadline = resolved_start_at + config.round_duration_seconds;
@@ -389,7 +389,7 @@ impl AhjoorContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::ProposedAdmin, &proposed_admin);
+            .set(&DataKey2::ProposedAdmin, &proposed_admin);
 
         events::emit_admin_transfer_proposed(&env, admin, proposed_admin);
 
@@ -403,7 +403,7 @@ impl AhjoorContract {
         let proposed_admin: Address = env
             .storage()
             .instance()
-            .get(&DataKey::ProposedAdmin)
+            .get(&DataKey2::ProposedAdmin)
             .expect("No admin transfer proposed");
         proposed_admin.require_auth();
 
@@ -416,7 +416,7 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey::Admin, &proposed_admin);
-        env.storage().instance().remove(&DataKey::ProposedAdmin);
+        env.storage().instance().remove(&DataKey2::ProposedAdmin);
 
         events::emit_admin_transferred(&env, old_admin, proposed_admin);
 
@@ -505,7 +505,7 @@ impl AhjoorContract {
         let new_version = old_version.checked_add(1).expect("Version overflow");
         env.storage()
             .instance()
-            .set(&DataKey::ContractVersion, &new_version);
+            .set(&DataKey2::ContractVersion, &new_version);
 
         events::emit_contract_upgraded(&env, old_version, new_version, admin);
 
@@ -615,11 +615,11 @@ impl AhjoorContract {
         let mut tiers: Map<Address, u32> = env
             .storage()
             .instance()
-            .get(&DataKey::MemberTiers)
+            .get(&DataKey2::MemberTiers)
             .unwrap_or(Map::new(&env));
 
         tiers.set(member.clone(), tier_bps);
-        env.storage().instance().set(&DataKey::MemberTiers, &tiers);
+        env.storage().instance().set(&DataKey2::MemberTiers, &tiers);
 
         events::emit_member_tier_set(&env, member, tier_bps);
 
@@ -699,21 +699,21 @@ impl AhjoorContract {
 
     /// Get the proposed admin address, if any.
     pub fn get_proposed_admin(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::ProposedAdmin)
+        env.storage().instance().get(&DataKey2::ProposedAdmin)
     }
 
     fn get_or_init_version(env: &Env) -> u32 {
         if let Some(version) = env
             .storage()
             .instance()
-            .get::<DataKey, u32>(&DataKey::ContractVersion)
+            .get::<DataKey, u32>(&DataKey2::ContractVersion)
         {
             version
         } else {
             let initial_version = 1u32;
             env.storage()
                 .instance()
-                .set(&DataKey::ContractVersion, &initial_version);
+                .set(&DataKey2::ContractVersion, &initial_version);
             initial_version
         }
     }
@@ -759,7 +759,7 @@ impl AhjoorContract {
         let use_timestamp: bool = env
             .storage()
             .instance()
-            .get(&DataKey::UseTimestampSchedule)
+            .get(&DataKey2::UseTimestampSchedule)
             .unwrap_or(false);
 
         let deadline: u64 = if use_timestamp {
@@ -865,7 +865,7 @@ impl AhjoorContract {
         let tiers: Map<Address, u32> = env
             .storage()
             .instance()
-            .get(&DataKey::MemberTiers)
+            .get(&DataKey2::MemberTiers)
             .unwrap_or(Map::new(&env));
         let tier_bps = tiers.get(contributor.clone()).unwrap_or(10_000); // Default to 1x (10000 bps)
         let member_required_amount = (base_amount * tier_bps as i128) / 10_000;
@@ -1141,7 +1141,7 @@ impl AhjoorContract {
         let use_timestamp: bool = env
             .storage()
             .instance()
-            .get(&DataKey::UseTimestampSchedule)
+            .get(&DataKey2::UseTimestampSchedule)
             .unwrap_or(false);
 
         let deadline: u64 = if use_timestamp {
@@ -1257,7 +1257,7 @@ impl AhjoorContract {
         let use_timestamp: bool = env
             .storage()
             .instance()
-            .get(&DataKey::UseTimestampSchedule)
+            .get(&DataKey2::UseTimestampSchedule)
             .unwrap_or(false);
 
         let deadline: u64 = if use_timestamp {
@@ -1365,7 +1365,7 @@ impl AhjoorContract {
         let use_timestamp: bool = env
             .storage()
             .instance()
-            .get(&DataKey::UseTimestampSchedule)
+            .get(&DataKey2::UseTimestampSchedule)
             .unwrap_or(false);
 
         let deadline: u64 = if use_timestamp {
@@ -1694,6 +1694,35 @@ impl AhjoorContract {
         internals::check_not_frozen(&env);
         bidder.require_auth();
 
+    /// #390: Switch between ledger-based and timestamp-based scheduling.
+    /// Forbidden once the first round has started (CurrentRound > 0) to prevent
+    /// grace-window aliasing between the two scheduling modes.
+    pub fn set_use_timestamp_schedule(env: Env, admin: Address, value: bool) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
+        if admin != stored_admin {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+        if current_round > 0 {
+            panic_with_error!(&env, Error::CannotChangeMidRound);
+        }
+        env.storage().instance().set(&DataKey2::UseTimestampSchedule, &value);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Backward-compatible alias kept for existing test callers.
+    pub fn penalise_defaulter(env: Env, member: Address) {
+        Self::request_penalty_grace(env, member);
+    }
+
+    /// Member requests a grace-period deferral of their pending penalty.
+    /// Admin must approve; if within the grace window, the penalty is queued;
+    /// otherwise it is applied immediately.
+    pub fn request_penalty_grace(env: Env, member: Address) {
+        internals::check_not_paused(&env);
+        let admin: Address = env
         // Feature guard
         let auction_enabled: bool = env
             .storage()
@@ -4043,7 +4072,7 @@ impl AhjoorContract {
         let use_timestamp: bool = env
             .storage()
             .instance()
-            .get(&DataKey::UseTimestampSchedule)
+            .get(&DataKey2::UseTimestampSchedule)
             .unwrap_or(false);
 
         let deadline: u64 = if use_timestamp {
@@ -4945,7 +4974,7 @@ impl AhjoorContract {
             if let Some(fee_recipient) = env
                 .storage()
                 .instance()
-                .get::<DataKey, Address>(&DataKey::FeeRecipient)
+                .get::<DataKey, Address>(&DataKey2::FeeRecipient)
             {
                 client.transfer(&env.current_contract_address(), &fee_recipient, &remaining);
             } else if let Some(first_member) = members.get(0) {
@@ -5347,7 +5376,7 @@ impl AhjoorContract {
                 let use_timestamp: bool = env
                     .storage()
                     .instance()
-                    .get(&DataKey::UseTimestampSchedule)
+                    .get(&DataKey2::UseTimestampSchedule)
                     .unwrap_or(false);
                 if use_timestamp {
                     env.storage()
@@ -5468,7 +5497,7 @@ impl AhjoorContract {
         let use_timestamp: bool = env
             .storage()
             .instance()
-            .get(&DataKey::UseTimestampSchedule)
+            .get(&DataKey2::UseTimestampSchedule)
             .unwrap_or(false);
 
         let deadline: u64 = if use_timestamp {
@@ -5503,7 +5532,7 @@ impl AhjoorContract {
         let use_timestamp: bool = env
             .storage()
             .instance()
-            .get(&DataKey::UseTimestampSchedule)
+            .get(&DataKey2::UseTimestampSchedule)
             .unwrap_or(false);
 
         let deadline: u64 = if use_timestamp {
@@ -5565,7 +5594,7 @@ impl AhjoorContract {
         let use_timestamp: bool = env
             .storage()
             .instance()
-            .get(&DataKey::UseTimestampSchedule)
+            .get(&DataKey2::UseTimestampSchedule)
             .unwrap_or(false);
 
         let current_deadline: u64 = if use_timestamp {
@@ -5583,7 +5612,7 @@ impl AhjoorContract {
         let round_duration: u64 = if use_timestamp {
             env.storage()
                 .instance()
-                .get(&DataKey::RoundDurationSeconds)
+                .get(&DataKey2::RoundDurationSeconds)
                 .unwrap_or(0)
         } else {
             env.storage()
@@ -5745,7 +5774,7 @@ impl AhjoorContract {
     pub fn get_fee_recipient(env: Env) -> Option<Address> {
         env.storage()
             .instance()
-            .get(&DataKey::FeeRecipient)
+            .get(&DataKey2::FeeRecipient)
     }
 
     /// Get the maximum number of consecutive defaults before suspension.
@@ -7526,7 +7555,7 @@ impl AhjoorContract {
         let use_timestamp: bool = env
             .storage()
             .instance()
-            .get(&DataKey::UseTimestampSchedule)
+            .get(&DataKey2::UseTimestampSchedule)
             .unwrap_or(false);
         let deadline: u64 = if use_timestamp {
             env.storage()
@@ -7622,7 +7651,7 @@ impl AhjoorContract {
         let tiers: Map<Address, u32> = env
             .storage()
             .instance()
-            .get(&DataKey::MemberTiers)
+            .get(&DataKey2::MemberTiers)
             .unwrap_or(Map::new(&env));
         let tier_bps = tiers.get(member.clone()).unwrap_or(10_000);
         let member_required_amount = (base_amount * tier_bps as i128) / 10_000;
@@ -9725,3 +9754,4 @@ mod test_emergency_reserve;
 #[cfg(test)]
 mod test_savings_milestone_rewards;
 pub use events::*;
+

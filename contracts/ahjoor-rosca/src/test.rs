@@ -108,6 +108,13 @@ fn setup_with_members<'a>(n: usize, mint_amount: i128) -> TestSetup<'a> {
     }
 }
 
+#[test]
+fn test_datakey_variant_count() {
+    assert!(std::mem::variant_count::<DataKey>() < 50, "DataKey must remain under 50 variants");
+    assert!(std::mem::variant_count::<DataKey2>() < 50, "DataKey2 must remain under 50 variants");
+    assert!(std::mem::variant_count::<DataKey3>() < 50, "DataKey3 must remain under 50 variants");
+}
+
 /// Calls `client.init(...)` on `setup` using sensible defaults:
 /// - All addresses in `setup.members` as the member list
 /// - `contribution_amount = 100`
@@ -4411,7 +4418,7 @@ fn test_upgrade_increments_contract_version() {
     let version: u32 = env.as_contract(&client.address, || {
         env.storage()
             .instance()
-            .get(&DataKey::ContractVersion)
+            .get(&DataKey2::ContractVersion)
             .unwrap()
     });
     assert_eq!(version, 2);
@@ -4911,3 +4918,4 @@ fn test_overflow_guard_on_large_contribution() {
     let setup2 = setup_with_members(3, 1_000_000);
     default_init(&setup2);
 }
+
