@@ -37,6 +37,8 @@ mod test_token_whitelist;
 mod test_slot_auction;
 mod test_sealed_slot_auction;
 mod test_migration;
+mod test_co_payer_split;
+mod test_contribution_receipts;
 mod migration_client;
 pub use migration_client::RoscaMigrationClient;
 
@@ -1648,6 +1650,83 @@ impl AhjoorContract {
                     }
                 }
             }
+        }
+
+        // Mint NFT-style contribution receipts for every member who paid this round.
+        {
+            let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            let mut counter: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey3::ContributionReceiptCounter)
+                .unwrap_or(0);
+            let member_contributions: Map<Address, i128> = env
+                .storage()
+                .instance()
+                .get(&DataKey::MemberContributions)
+                .unwrap_or(Map::new(&env));
+            let now_ts = env.ledger().timestamp();
+
+            for member in paid_members.iter() {
+                let amount_contributed = member_contributions.get(member.clone()).unwrap_or(0);
+
+                // Compute a deterministic receipt hash from (counter, member, round, amount).
+                let mut preimage = Bytes::new(&env);
+                preimage.extend_from_array(&counter.to_be_bytes());
+                preimage.extend_from_array(&current_round.to_be_bytes());
+                let member_xdr = member.clone().to_xdr(&env);
+                preimage.append(&member_xdr);
+                let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+                let receipt = ContributionReceipt {
+                    receipt_id: counter,
+                    member: member.clone(),
+                    round: current_round,
+                    amount_contributed,
+                    token: token_addr.clone(),
+                    minted_at: now_ts,
+                    receipt_hash: hash.clone(),
+                };
+
+                env.storage()
+                    .persistent()
+                    .set(&DataKey3::ContributionReceipt(counter), &receipt);
+                env.storage().persistent().extend_ttl(
+                    &DataKey3::ContributionReceipt(counter),
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+
+                // Append to member's receipt index.
+                let mut ids: Vec<u32> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey3::MemberReceiptIds(member.clone()))
+                    .unwrap_or(Vec::new(&env));
+                ids.push_back(counter);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey3::MemberReceiptIds(member.clone()), &ids);
+                env.storage().persistent().extend_ttl(
+                    &DataKey3::MemberReceiptIds(member.clone()),
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+
+                events::emit_contribution_receipt_minted(
+                    &env,
+                    counter,
+                    member.clone(),
+                    current_round,
+                    amount_contributed,
+                    hash,
+                );
+
+                counter += 1;
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey3::ContributionReceiptCounter, &counter);
         }
 
         env.storage()
@@ -9873,6 +9952,191 @@ impl AhjoorContract {
             .persistent()
             .get(&DataKey3::SavingsMilestonesClaimed(goal_id, member))
             .unwrap_or(0u64)
+    }
+
+    // ─── Co-payer Contribution Splitting ─────────────────────────────────────
+
+    /// Register co-payer splits for a member's contribution obligation.
+    ///
+    /// Each `CoPayerSplit` specifies a co-payer address and the exact token amount
+    /// they will contribute on behalf of `member`. The sum of all split amounts
+    /// must equal the member's required contribution (base_amount × tier_bps / 10_000).
+    ///
+    /// Only the member themselves may register splits for their own slot.
+    /// Panics with `CopayerSplitsAlreadySet` if splits already exist — call
+    /// `revoke_co_payer_splits` first.
+    pub fn register_co_payer_splits(env: Env, member: Address, splits: Vec<CoPayerSplit>) {
+        internals::check_not_paused(&env);
+        internals::check_not_frozen(&env);
+        member.require_auth();
+
+        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+        let exited: Vec<Address> = env.storage().instance().get(&DataKey::ExitedMembers).unwrap_or(Vec::new(&env));
+        if exited.contains(&member) {
+            panic_with_error!(&env, Error::MemberHasExited);
+        }
+
+        if env.storage().persistent().has(&DataKey3::CoPayerSplits(member.clone())) {
+            panic_with_error!(&env, ExtError2::CopayerSplitsAlreadySet);
+        }
+
+        // Determine required contribution for member (accounting for tiers).
+        let base_amount: i128 = env.storage().instance().get(&DataKey::ContributionAmt).unwrap();
+        let tiers: Map<Address, u32> = env.storage().instance().get(&DataKey2::MemberTiers).unwrap_or(Map::new(&env));
+        let tier_bps = tiers.get(member.clone()).unwrap_or(10_000);
+        let required = (base_amount * tier_bps as i128) / 10_000;
+
+        let mut total: i128 = 0;
+        for split in splits.iter() {
+            if split.amount <= 0 {
+                panic_with_error!(&env, Error::AmountMustBePositive);
+            }
+            total += split.amount;
+        }
+        if total != required {
+            panic_with_error!(&env, ExtError2::CopayerAmountsMismatch);
+        }
+
+        let co_payer_count = splits.len() as u32;
+        env.storage().persistent().set(&DataKey3::CoPayerSplits(member.clone()), &splits);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::CoPayerSplits(member.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_co_payer_split_registered(&env, member, co_payer_count, total);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Remove the co-payer splits for `member`. Only the member can revoke.
+    pub fn revoke_co_payer_splits(env: Env, member: Address) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+
+        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+        if !env.storage().persistent().has(&DataKey3::CoPayerSplits(member.clone())) {
+            panic_with_error!(&env, ExtError2::NoCopayersRegistered);
+        }
+        env.storage().persistent().remove(&DataKey3::CoPayerSplits(member.clone()));
+        events::emit_co_payer_split_revoked(&env, member);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Contribute on behalf of `member` using registered co-payer splits.
+    ///
+    /// Each co-payer in the registered split list must have granted allowance to
+    /// this contract before this call. Tokens are transferred directly from each
+    /// co-payer to the contract. `member` is then marked as having paid for
+    /// the current round.
+    ///
+    /// Panics with `NoCopayersRegistered` if no split is registered for `member`.
+    /// Panics with `AlreadyContributed` if the member already paid this round.
+    pub fn contribute_split(env: Env, member: Address, token: Address) {
+        internals::check_not_paused(&env);
+        internals::check_not_frozen(&env);
+        member.require_auth();
+
+        let start_at: u64 = env.storage().instance().get(&DataKey2::StartAt).unwrap_or(env.ledger().timestamp());
+        if env.ledger().timestamp() < start_at {
+            panic_with_error!(&env, ExtError::GroupNotYetActive);
+        }
+
+        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+        let exited: Vec<Address> = env.storage().instance().get(&DataKey::ExitedMembers).unwrap_or(Vec::new(&env));
+        if exited.contains(&member) {
+            panic_with_error!(&env, Error::MemberHasExited);
+        }
+
+        let mut paid_members: Vec<Address> = env.storage().instance().get(&DataKey::PaidMembers).expect("Not initialized");
+        if paid_members.contains(&member) {
+            panic_with_error!(&env, Error::AlreadyContributed);
+        }
+
+        // Validate token is approved.
+        let approved_tokens: Vec<Address> = env.storage().instance().get(&DataKey::ApprovedTokens).unwrap_or(Vec::new(&env));
+        if !approved_tokens.contains(&token) {
+            panic_with_error!(&env, Error::TokenNotApproved);
+        }
+        Self::require_token_allowed(&env, &token);
+
+        let splits: Vec<CoPayerSplit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::CoPayerSplits(member.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError2::NoCopayersRegistered));
+
+        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap();
+        let token_client = token::Client::new(&env, &token);
+        let mut total_transferred: i128 = 0;
+
+        for split in splits.iter() {
+            token_client.transfer(&split.co_payer, &env.current_contract_address(), &split.amount);
+            events::emit_co_payer_contributed(&env, member.clone(), split.co_payer.clone(), split.amount, current_round);
+            total_transferred += split.amount;
+        }
+
+        // Mark member as paid and record contribution amount.
+        paid_members.push_back(member.clone());
+        env.storage().instance().set(&DataKey::PaidMembers, &paid_members);
+
+        let mut member_contributions: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberContributions)
+            .unwrap_or(Map::new(&env));
+        member_contributions.set(member.clone(), total_transferred);
+        env.storage().instance().set(&DataKey::MemberContributions, &member_contributions);
+
+        // Update savings goal tracking if configured.
+        let total_collected: i128 = env.storage().instance().get(&DataKey::TotalCollected).unwrap_or(0) + total_transferred;
+        env.storage().instance().set(&DataKey::TotalCollected, &total_collected);
+
+        events::emit_contrib(&env, member, current_round, token, total_transferred);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Return the registered co-payer splits for `member`, or an empty list.
+    pub fn get_co_payer_splits(env: Env, member: Address) -> Vec<CoPayerSplit> {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::CoPayerSplits(member))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // ─── NFT-Style Contribution Receipts ──────────────────────────────────────
+
+    /// Return a contribution receipt by its unique ID.
+    /// Panics with `ReceiptNotFound` if the ID does not exist.
+    pub fn get_contribution_receipt(env: Env, receipt_id: u32) -> ContributionReceipt {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::ContributionReceipt(receipt_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError2::ReceiptNotFound))
+    }
+
+    /// Return all receipt IDs minted for `member` across all rounds.
+    pub fn get_member_receipt_ids(env: Env, member: Address) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::MemberReceiptIds(member))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Return the total number of contribution receipts minted so far.
+    pub fn get_contribution_receipt_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey3::ContributionReceiptCounter)
+            .unwrap_or(0)
     }
 
 }

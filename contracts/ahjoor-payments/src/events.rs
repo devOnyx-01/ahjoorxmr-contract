@@ -1969,3 +1969,82 @@ pub fn emit_tier_fee_applied(
 ) {
     TierFeeApplied { merchant, tier_fee_bps, fee_collected, volume_30d }.publish(e);
 }
+
+// ── Dispute Mediation DAO Events ──────────────────────────────────────────────
+
+/// Event: DAO mediation configuration updated by admin.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DaoConfigured {
+    pub member_count: u32,
+    pub vote_window_seconds: u64,
+    pub min_votes: u32,
+}
+
+/// Event: Disputed payment escalated to the DAO for mediation.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DisputeEscalatedToDao {
+    pub payment_id: u32,
+    pub case_id: u32,
+    pub initiated_by: Address,
+    pub vote_window_closes_at: u64,
+}
+
+/// Event: DAO member cast a vote on a mediation case.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DaoVoteCast {
+    pub case_id: u32,
+    pub voter: Address,
+    pub for_merchant: bool,
+    pub votes_for_merchant: u32,
+    pub votes_for_customer: u32,
+}
+
+/// Event: DAO verdict executed — dispute resolved by quorum.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DaoVerdictExecuted {
+    pub case_id: u32,
+    pub payment_id: u32,
+    pub merchant_wins: bool,
+    pub votes_for_merchant: u32,
+    pub votes_for_customer: u32,
+}
+
+pub fn emit_dao_configured(e: &Env, member_count: u32, vote_window_seconds: u64, min_votes: u32) {
+    DaoConfigured { member_count, vote_window_seconds, min_votes }.publish(e);
+}
+
+pub fn emit_dispute_escalated_to_dao(
+    e: &Env,
+    payment_id: u32,
+    case_id: u32,
+    initiated_by: Address,
+    vote_window_closes_at: u64,
+) {
+    DisputeEscalatedToDao { payment_id, case_id, initiated_by, vote_window_closes_at }.publish(e);
+}
+
+pub fn emit_dao_vote_cast(
+    e: &Env,
+    case_id: u32,
+    voter: Address,
+    for_merchant: bool,
+    votes_for_merchant: u32,
+    votes_for_customer: u32,
+) {
+    DaoVoteCast { case_id, voter, for_merchant, votes_for_merchant, votes_for_customer }.publish(e);
+}
+
+pub fn emit_dao_verdict_executed(
+    e: &Env,
+    case_id: u32,
+    payment_id: u32,
+    merchant_wins: bool,
+    votes_for_merchant: u32,
+    votes_for_customer: u32,
+) {
+    DaoVerdictExecuted { case_id, payment_id, merchant_wins, votes_for_merchant, votes_for_customer }.publish(e);
+}

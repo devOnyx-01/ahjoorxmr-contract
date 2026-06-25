@@ -194,4 +194,12 @@ pub enum ExtError2 {
     TokenMismatch = 112,
     /// Member already has an outstanding emergency loan.
     OutstandingLoanExists = 113,
+    /// No co-payer splits registered for this member.
+    NoCopayersRegistered = 114,
+    /// Co-payer split amounts do not sum to the required contribution amount.
+    CopayerAmountsMismatch = 115,
+    /// Contribution receipt not found for the given ID.
+    ReceiptNotFound = 116,
+    /// Member has already registered co-payer splits; revoke first.
+    CopayerSplitsAlreadySet = 117,
 }
