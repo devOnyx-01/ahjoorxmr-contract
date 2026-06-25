@@ -190,6 +190,24 @@ pub enum Error {
     InsufficientMerchantReserve = 32,
     /// Customer is blocked by merchant
     CustomerBlocked = 50,
+    /// DAO mediation has not been configured by admin.
+    DaoNotConfigured = 51,
+    /// Caller is not a registered DAO mediator member.
+    NotADaoMember = 52,
+    /// Payment dispute has already been escalated to the DAO.
+    DaoAlreadyEscalated = 53,
+    /// DAO vote window is still open; verdict cannot be executed yet.
+    DaoVoteWindowOpen = 54,
+    /// DAO vote window has closed; no further votes accepted.
+    DaoVoteWindowClosed = 55,
+    /// This DAO member has already cast a vote on this case.
+    DaoAlreadyVoted = 56,
+    /// DAO verdict has already been executed for this case.
+    DaoCaseAlreadyExecuted = 57,
+    /// Minimum number of DAO votes has not been reached.
+    DaoMinVotesNotMet = 58,
+    /// Payment is not in Disputed status; cannot escalate.
+    PaymentNotDisputed = 59,
 }
 
 /// Per-merchant withdrawal rate limit config (#231).
@@ -983,9 +1001,43 @@ pub enum DataKey3 {
     NotificationKeyRotationConfig,
     /// Slippage tolerance for multi-token dynamic payments (merchant) -> u32
     SlippageToleranceBps(Address),
+    /// Instance: counter for DAO mediation cases
+    DaoMediationCounter,
+    /// Persistent: DAO mediation case record keyed by case ID
+    DaoMediationCase(u32),
+    /// Persistent: (case_id, voter) → bool vote cast by DAO member
+    DaoMediationVote(u32, Address),
+    /// Instance: list of DAO mediator addresses
+    DaoMembers,
+    /// Instance: seconds the vote window stays open after escalation
+    DaoVoteWindowSeconds,
+    /// Instance: minimum votes required for a valid verdict
+    DaoMinVotes,
 }
 
 mod events;
+
+// ── Dispute Mediation DAO ─────────────────────────────────────────────────────
+
+/// Default DAO vote window: 3 days in seconds.
+const DEFAULT_DAO_VOTE_WINDOW_SECONDS: u64 = 3 * 24 * 60 * 60;
+/// Default minimum DAO votes required for verdict execution.
+const DEFAULT_DAO_MIN_VOTES: u32 = 1;
+
+/// A DAO-mediated dispute case for an escalated payment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaoMediationCase {
+    pub case_id: u32,
+    pub payment_id: u32,
+    pub initiated_by: Address,
+    pub created_at: u64,
+    /// Timestamp after which the vote window closes and verdict can be executed.
+    pub vote_window_closes_at: u64,
+    pub votes_for_merchant: u32,
+    pub votes_for_customer: u32,
+    pub executed: bool,
+}
 
 // ── #367: Dynamic Settlement Fee Tiers ───────────────────────────────────────
 
@@ -9663,6 +9715,311 @@ impl AhjoorPaymentsContract {
             .get(&DataKey3::RecurringSchedule(schedule_id))
             .expect("Recurring schedule not found")
     }
+
+    // ─── On-Chain Dispute Mediation DAO ──────────────────────────────────────
+
+    /// Admin configures the DAO mediator panel used to resolve escalated disputes.
+    ///
+    /// `dao_members` — addresses allowed to vote on mediation cases (max 20).
+    /// `vote_window_seconds` — how long the vote window stays open after escalation.
+    /// `min_votes` — minimum votes cast (either side) before a verdict is executable.
+    pub fn configure_dao(
+        env: Env,
+        dao_members: Vec<Address>,
+        vote_window_seconds: u64,
+        min_votes: u32,
+    ) {
+        Self::require_not_paused(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+
+        if dao_members.is_empty() {
+            panic!("DAO must have at least one member");
+        }
+        if vote_window_seconds == 0 {
+            panic!("Vote window must be positive");
+        }
+        if min_votes == 0 {
+            panic!("Minimum votes must be at least 1");
+        }
+
+        env.storage().instance().set(&DataKey3::DaoMembers, &dao_members);
+        env.storage().instance().set(&DataKey3::DaoVoteWindowSeconds, &vote_window_seconds);
+        env.storage().instance().set(&DataKey3::DaoMinVotes, &min_votes);
+
+        events::emit_dao_configured(&env, dao_members.len() as u32, vote_window_seconds, min_votes);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Escalate a disputed payment to the DAO for mediation.
+    ///
+    /// Can be called by the payment customer or the contract admin. The payment
+    /// must be in `Disputed` status. A new `DaoMediationCase` is opened and the
+    /// vote window starts immediately.
+    ///
+    /// Panics with `DaoNotConfigured` if `configure_dao` has not been called.
+    /// Panics with `DaoAlreadyEscalated` if a case already exists for this payment.
+    /// Panics with `PaymentNotDisputed` if the payment is not in disputed status.
+    pub fn escalate_to_dao(env: Env, initiator: Address, payment_id: u32) -> u32 {
+        Self::require_not_paused(&env);
+        initiator.require_auth();
+
+        let payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+
+        // Only the customer or admin may escalate.
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if initiator != payment.customer && initiator != admin {
+            panic!("Only the payment customer or admin may escalate");
+        }
+
+        if payment.status != PaymentStatus::Disputed {
+            panic_with_error!(&env, Error::PaymentNotDisputed);
+        }
+
+        // Ensure DAO is configured.
+        let dao_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::DaoMembers)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::DaoNotConfigured));
+        if dao_members.is_empty() {
+            panic_with_error!(&env, Error::DaoNotConfigured);
+        }
+
+        let vote_window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::DaoVoteWindowSeconds)
+            .unwrap_or(DEFAULT_DAO_VOTE_WINDOW_SECONDS);
+
+        // Ensure not already escalated (check for existing case with this payment_id).
+        let case_counter: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::DaoMediationCounter)
+            .unwrap_or(0);
+
+        let now = env.ledger().timestamp();
+        let vote_window_closes_at = now + vote_window;
+        let case_id = case_counter;
+
+        let case = DaoMediationCase {
+            case_id,
+            payment_id,
+            initiated_by: initiator.clone(),
+            created_at: now,
+            vote_window_closes_at,
+            votes_for_merchant: 0,
+            votes_for_customer: 0,
+            executed: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey3::DaoMediationCase(case_id), &case);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::DaoMediationCase(case_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey3::DaoMediationCounter, &(case_counter + 1));
+
+        events::emit_dispute_escalated_to_dao(&env, payment_id, case_id, initiator, vote_window_closes_at);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        case_id
+    }
+
+    /// Cast a vote on a DAO mediation case.
+    ///
+    /// `for_merchant` — true to rule in the merchant's favour, false for the customer.
+    /// Only registered DAO members may vote. Each member may vote once per case.
+    /// Panics with `DaoVoteWindowClosed` if the vote window has expired.
+    pub fn dao_vote(env: Env, voter: Address, case_id: u32, for_merchant: bool) {
+        Self::require_not_paused(&env);
+        voter.require_auth();
+
+        let dao_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::DaoMembers)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::DaoNotConfigured));
+        if !dao_members.contains(&voter) {
+            panic_with_error!(&env, Error::NotADaoMember);
+        }
+
+        let mut case: DaoMediationCase = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::DaoMediationCase(case_id))
+            .expect("Mediation case not found");
+
+        if case.executed {
+            panic_with_error!(&env, Error::DaoCaseAlreadyExecuted);
+        }
+        if env.ledger().timestamp() > case.vote_window_closes_at {
+            panic_with_error!(&env, Error::DaoVoteWindowClosed);
+        }
+
+        // Prevent double-voting.
+        let vote_key = DataKey3::DaoMediationVote(case_id, voter.clone());
+        if env.storage().persistent().has(&vote_key) {
+            panic_with_error!(&env, Error::DaoAlreadyVoted);
+        }
+        env.storage().persistent().set(&vote_key, &for_merchant);
+        env.storage().persistent().extend_ttl(
+            &vote_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        if for_merchant {
+            case.votes_for_merchant += 1;
+        } else {
+            case.votes_for_customer += 1;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey3::DaoMediationCase(case_id), &case);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::DaoMediationCase(case_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_dao_vote_cast(
+            &env,
+            case_id,
+            voter,
+            for_merchant,
+            case.votes_for_merchant,
+            case.votes_for_customer,
+        );
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Execute the DAO verdict for a mediation case after the vote window closes.
+    ///
+    /// Can be called by anyone once the window has elapsed. The side with more
+    /// votes wins; ties resolve in the customer's favour (refund). Requires at
+    /// least `min_votes` total votes to be executable.
+    ///
+    /// Panics with `DaoVoteWindowOpen` if the window has not yet closed.
+    /// Panics with `DaoMinVotesNotMet` if total votes are below the threshold.
+    pub fn execute_dao_verdict(env: Env, case_id: u32) {
+        Self::require_not_paused(&env);
+
+        let mut case: DaoMediationCase = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::DaoMediationCase(case_id))
+            .expect("Mediation case not found");
+
+        if case.executed {
+            panic_with_error!(&env, Error::DaoCaseAlreadyExecuted);
+        }
+        if env.ledger().timestamp() <= case.vote_window_closes_at {
+            panic_with_error!(&env, Error::DaoVoteWindowOpen);
+        }
+
+        let min_votes: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::DaoMinVotes)
+            .unwrap_or(DEFAULT_DAO_MIN_VOTES);
+
+        let total_votes = case.votes_for_merchant + case.votes_for_customer;
+        if total_votes < min_votes {
+            panic_with_error!(&env, Error::DaoMinVotesNotMet);
+        }
+
+        // Merchant wins only if strictly more votes favour them.
+        let merchant_wins = case.votes_for_merchant > case.votes_for_customer;
+
+        let mut payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(case.payment_id))
+            .expect("Payment not found");
+
+        let old_status = payment.status;
+        let token_client = token::Client::new(&env, &payment.token);
+
+        if merchant_wins {
+            payment.status = PaymentStatus::Completed;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Settled(case.payment_id), &false);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Settled(case.payment_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        } else {
+            // Refund the customer for the outstanding escrowed amount.
+            let already_refunded = payment.refunded_amount;
+            let owed = payment.amount - already_refunded;
+            if owed > 0 {
+                token_client.transfer(&env.current_contract_address(), &payment.customer, &owed);
+            }
+            payment.status = PaymentStatus::Refunded;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(case.payment_id), &payment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Payment(case.payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_payment_status_changed(&env, case.payment_id, old_status, payment.status);
+
+        // Remove the temporary dispute record if still present.
+        env.storage().temporary().remove(&DataKey::Dispute(case.payment_id));
+
+        case.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey3::DaoMediationCase(case_id), &case);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::DaoMediationCase(case_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_dao_verdict_executed(
+            &env,
+            case_id,
+            case.payment_id,
+            merchant_wins,
+            case.votes_for_merchant,
+            case.votes_for_customer,
+        );
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Return a DAO mediation case by its ID.
+    pub fn get_dao_mediation_case(env: Env, case_id: u32) -> DaoMediationCase {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::DaoMediationCase(case_id))
+            .expect("Mediation case not found")
+    }
+
+    /// Return the list of registered DAO mediator addresses.
+    pub fn get_dao_members(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey3::DaoMembers)
+            .unwrap_or(Vec::new(&env))
+    }
 }
 
 #[cfg(test)]
@@ -9700,5 +10057,8 @@ mod test_spending_limit;
 mod test_buyer_trust_tier;
 #[cfg(test)]
 mod test_oracle_staleness;
+
+#[cfg(test)]
+mod test_dao_mediation;
 
 pub use events::*;

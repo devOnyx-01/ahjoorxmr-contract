@@ -1849,3 +1849,74 @@ pub struct ProxyExpired {
 pub fn emit_proxy_expired(e: &Env, group_id: u32, member: Address, proxy: Address, expiry_ledger: u64) {
     ProxyExpired { group_id, member, proxy, expiry_ledger }.publish(e);
 }
+
+// ── Co-payer Contribution Splitting Events ────────────────────────────────────
+
+/// Event: Member registered co-payer splits for their contribution obligation.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CoPayerSplitRegistered {
+    pub member: Address,
+    pub co_payer_count: u32,
+    pub total_split_amount: i128,
+}
+
+/// Event: A co-payer contributed on behalf of a member.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CoPayerContributed {
+    pub member: Address,
+    pub co_payer: Address,
+    pub amount: i128,
+    pub round: u32,
+}
+
+/// Event: Member's co-payer split registration was revoked.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CoPayerSplitRevoked {
+    pub member: Address,
+}
+
+pub fn emit_co_payer_split_registered(e: &Env, member: Address, co_payer_count: u32, total_split_amount: i128) {
+    CoPayerSplitRegistered { member, co_payer_count, total_split_amount }.publish(e);
+}
+
+pub fn emit_co_payer_contributed(e: &Env, member: Address, co_payer: Address, amount: i128, round: u32) {
+    CoPayerContributed { member, co_payer, amount, round }.publish(e);
+}
+
+pub fn emit_co_payer_split_revoked(e: &Env, member: Address) {
+    CoPayerSplitRevoked { member }.publish(e);
+}
+
+// ── NFT-Style Contribution Receipt Events ─────────────────────────────────────
+
+/// Event: Contribution receipt minted for a member after a completed round.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ContributionReceiptMinted {
+    pub receipt_id: u32,
+    pub member: Address,
+    pub round: u32,
+    pub amount_contributed: i128,
+    pub receipt_hash: BytesN<32>,
+}
+
+pub fn emit_contribution_receipt_minted(
+    e: &Env,
+    receipt_id: u32,
+    member: Address,
+    round: u32,
+    amount_contributed: i128,
+    receipt_hash: BytesN<32>,
+) {
+    ContributionReceiptMinted {
+        receipt_id,
+        member,
+        round,
+        amount_contributed,
+        receipt_hash,
+    }
+    .publish(e);
+}

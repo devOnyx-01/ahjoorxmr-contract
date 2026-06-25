@@ -318,62 +318,55 @@ pub enum DataKey3 {
     // #390: Timestamp-mode grace period
     GracePeriodSeconds,      // u64 — grace window in seconds (used when UseTimestampSchedule=true)
     // Reputation-gated fee discount
-    RepFeeDiscount,          // RepFeeDiscountConfig
+    RepFeeDiscount,
+    // Slot Auction
+    AuctionEnabled,
+    AuctionWindowLedgers,
+    AuctionOpenUntil,
+    AuctionBids,
+    AuctionRound,
+    // Cross-Group Migration
+    MigrationRequests,
+    IncomingMigrations,
+    MigratedMembers,
+    VacantSlots,
+    // #313: Emergency Liquidity Reserve
+    ReserveEnabled,
+    EmergencyReserveBalance,
+    EmergencyLoanCounter,
+    EmergencyLoan(u32),
+    MemberOutstandingLoan(Address),
+    // #314: Group treasury
+    TreasuryConfig,
+    TreasuryBalance,
+    TreasuryRoundProposal(u32),
+    TreasuryRoundVotes(u32, Address),
+    // #331: Group Split
+    SplitProposalCounter,
+    SplitProposals,
+    SplitConfirmationWindow,
+    // #356: Penalty-Based Slot Demotion
+    LateContributionCount,
+    LateContribThreshold,
+    // #359: Savings goal milestone reward pool
+    SavingsRewardPool,
+    SavingsMilestonesClaimed(u32, Address),
+    // #375: Sealed-bid (commit-reveal) slot auction
+    SealedAuction,
+    SlotBidCommit(u32, Address),
+    SealedCommitters(u32),
+    SealedRevealedBids(u32),
+    // Co-payer contribution splitting
+    CoPayerSplits(Address),
+    // NFT-style contribution receipts
+    ContributionReceiptCounter,
+    ContributionReceipt(u32),
+    MemberReceiptIds(Address),
 }
 
 const _: () = assert!(std::mem::variant_count::<DataKey>() < 50, "DataKey must remain under 50 variants");
 const _: () = assert!(std::mem::variant_count::<DataKey2>() < 50, "DataKey2 must remain under 50 variants");
 const _: () = assert!(std::mem::variant_count::<DataKey3>() < 50, "DataKey3 must remain under 50 variants");
-
-/// #398: Records an active contribution-weight voting delegation with an expiry.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContribDelegationRecord {
-    pub delegate: Address,
-    /// Ledger sequence after which this delegation is considered expired.
-    pub expiry_ledger: u64,
-    // Slot Auction
-    AuctionEnabled,          // bool — auction feature flag
-    AuctionWindowLedgers,    // u64 — bidding window duration in seconds
-    AuctionOpenUntil,        // u64 — timestamp when current auction window closes (0 = no open auction)
-    AuctionBids,             // Vec<SlotBid> — bids placed in the current auction
-    AuctionRound,            // u32 — the round for which the current auction was opened
-    // Cross-Group Migration
-    MigrationRequests,       // Map<Address, MigrationRequest> — member → pending outbound migration
-    IncomingMigrations,      // Map<Address, IncomingMigration> — member → pending inbound migration
-    MigratedMembers,         // Map<Address, MigratedMemberRecord> — member → migration annotation
-    VacantSlots,             // Vec<u32> — slot indices freed by migrated-out members
-    // #313: Emergency Liquidity Reserve
-    ReserveEnabled,          // bool — emergency reserve feature flag
-    EmergencyReserveBalance, // i128 — total balance in emergency reserve
-    EmergencyLoanCounter,    // u32 — counter for loan IDs
-    EmergencyLoan(u32),      // loan_id → EmergencyLoan record
-    MemberOutstandingLoan(Address), // member → active loan_id (0 = none)
-    /// #314: Group treasury configuration
-    TreasuryConfig,          // TreasuryConfig
-    /// #314: Group treasury balance
-    TreasuryBalance,         // i128
-    /// #314: Treasury round proposals per round
-    TreasuryRoundProposal(u32), // (round_index) → TreasuryRoundProposal
-    /// #314: Treasury round votes per member
-    TreasuryRoundVotes(u32, Address), // (round_index, member) → bool
-    // #331: Group Split
-    SplitProposalCounter,    // u32
-    SplitProposals,          // Map<u32, SplitProposal>
-    SplitConfirmationWindow, // u32 — ledgers members have to confirm
-    // #356: Penalty-Based Slot Demotion
-    LateContributionCount,   // Map<Address, u32> — consecutive late payment count per member
-    LateContribThreshold,    // u32 — late payments before demotion is triggered (default: 3)
-    // #359: Savings goal milestone reward pool
-    SavingsRewardPool,       // i128 — token balance held for savings goal milestone rewards
-    // #359: Per-member milestone claim bitmask (goal_id, member) → u64 bitmask
-    SavingsMilestonesClaimed(u32, Address), // (goal_id, member) → u64
-    // #375: Sealed-bid (commit-reveal) slot auction
-    SealedAuction,             // SealedAuctionState — config + current phase state
-    SlotBidCommit(u32, Address), // (round, bidder) → SealedCommit
-    SealedCommitters(u32),     // (round) → Vec<Address> — everyone who committed this round
-    SealedRevealedBids(u32),   // (round) → Vec<SlotBid> — valid revealed bids this round
-}
 
 // ── #330: Contribution Delegation ────────────────────────────────────────────
 
@@ -814,6 +807,27 @@ pub struct TreasuryRoundProposal {
 pub struct RepFeeDiscountConfig {
     pub threshold: i128,
     pub discount_bps: u32,
+}
+
+/// A single co-payer who covers part of a member's ROSCA contribution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoPayerSplit {
+    pub co_payer: Address,
+    pub amount: i128,
+}
+
+/// NFT-style on-chain receipt minted when a round completes for each contributing member.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContributionReceipt {
+    pub receipt_id: u32,
+    pub member: Address,
+    pub round: u32,
+    pub amount_contributed: i128,
+    pub token: Address,
+    pub minted_at: u64,
+    pub receipt_hash: BytesN<32>,
 }
 
 /// Aggregate read-only statistics returned by `get_group_analytics`.
