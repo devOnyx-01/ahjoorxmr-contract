@@ -317,6 +317,8 @@ pub enum DataKey3 {
     ContribDelegations,      // Map<Address, ContribDelegationRecord>
     // #390: Timestamp-mode grace period
     GracePeriodSeconds,      // u64 — grace window in seconds (used when UseTimestampSchedule=true)
+    // Reputation-gated fee discount
+    RepFeeDiscount,          // RepFeeDiscountConfig
 }
 
 const _: () = assert!(std::mem::variant_count::<DataKey>() < 50, "DataKey must remain under 50 variants");
@@ -803,4 +805,31 @@ pub struct TreasuryRoundProposal {
     pub votes_for: i128,
     pub votes_against: i128,
     pub confirmed: bool,
+}
+
+/// Members whose `MemberScore.score` >= `threshold` pay `discount_bps` fewer
+/// protocol-fee basis points on their payout round (floor: 0 bps).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepFeeDiscountConfig {
+    pub threshold: i128,
+    pub discount_bps: u32,
+}
+
+/// Aggregate read-only statistics returned by `get_group_analytics`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupAnalytics {
+    pub total_members: u32,
+    pub active_members: u32,
+    pub suspended_count: u32,
+    pub exited_count: u32,
+    pub current_round: u32,
+    pub total_rounds: u32,
+    pub paid_this_round: u32,
+    pub defaulters_this_round: u32,
+    pub total_contributions_collected: i128,
+    pub avg_credit_score: i128,
+    pub avg_reputation_score: i128,
+    pub fee_bps: u32,
 }

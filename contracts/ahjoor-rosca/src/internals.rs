@@ -134,6 +134,43 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
         .instance()
         .get(&DataKey2::FeeRecipient);
 
+    // Apply reputation-gated fee discount if the payout recipient's credit score
+    // meets the configured threshold.
+    let effective_fee_bps: u32 = if fee_bps > 0 {
+        let discount_cfg: Option<crate::RepFeeDiscountConfig> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::RepFeeDiscount);
+        if let Some(cfg) = discount_cfg {
+            let ms_map: Map<Address, crate::MemberScore> = env
+                .storage()
+                .persistent()
+                .get(&PersistentKey::MemberCreditScores)
+                .unwrap_or(Map::new(env));
+            let score = ms_map
+                .get(payout_recipient.clone())
+                .map(|ms| ms.score)
+                .unwrap_or(0);
+            if score >= cfg.threshold {
+                let discounted = fee_bps.saturating_sub(cfg.discount_bps);
+                events::emit_rep_fee_discount_applied(
+                    env,
+                    payout_recipient.clone(),
+                    fee_bps,
+                    discounted,
+                    score,
+                );
+                discounted
+            } else {
+                fee_bps
+            }
+        } else {
+            fee_bps
+        }
+    } else {
+        0
+    };
+
     let mut total_payout_history_amt = 0i128;
     let mut reinvested_amount = 0i128;
     let mut total_fee_collected = 0i128;
@@ -246,9 +283,9 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
         }
 
         if balance > 0 {
-            // Calculate protocol fee
-            let fee_amount = if fee_bps > 0 && fee_recipient_opt.is_some() {
-                (balance * (fee_bps as i128)) / 10_000
+            // Calculate protocol fee (already adjusted for reputation discount)
+            let fee_amount = if effective_fee_bps > 0 && fee_recipient_opt.is_some() {
+                (balance * (effective_fee_bps as i128)) / 10_000
             } else {
                 0
             };

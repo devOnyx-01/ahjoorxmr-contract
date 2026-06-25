@@ -1397,6 +1397,34 @@ pub fn emit_credit_score_updated(e: &Env, member: Address, old_score: i128, new_
     CreditScoreUpdated { member, old_score, new_score, reason }.publish(e);
 }
 
+// ── Reputation-Gated Fee Discount Event ──────────────────────────────────────
+
+/// Event: protocol fee reduced because recipient's credit score met the threshold.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RepFeeDiscountApplied {
+    pub member: Address,
+    pub original_fee_bps: u32,
+    pub effective_fee_bps: u32,
+    pub score: i128,
+}
+
+pub fn emit_rep_fee_discount_applied(
+    e: &Env,
+    member: Address,
+    original_fee_bps: u32,
+    effective_fee_bps: u32,
+    score: i128,
+) {
+    RepFeeDiscountApplied {
+        member,
+        original_fee_bps,
+        effective_fee_bps,
+        score,
+    }
+    .publish(e);
+}
+
 // ── #330: Contribution Delegation Events ─────────────────────────────────────
 
 /// Event: Member granted contribution delegation to a proxy (#330)

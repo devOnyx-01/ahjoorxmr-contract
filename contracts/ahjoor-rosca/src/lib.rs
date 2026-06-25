@@ -5393,6 +5393,100 @@ impl AhjoorContract {
         }
     }
 
+    /// Returns aggregate on-chain analytics for the group in a single view call.
+    /// Reads members, suspended/exited sets, round state, credit scores, and
+    /// reputation scores — all from existing storage; no writes performed.
+    pub fn get_group_analytics(env: Env) -> GroupAnalytics {
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .unwrap_or(Vec::new(&env));
+        let suspended: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuspendedMembers)
+            .unwrap_or(Vec::new(&env));
+        let exited: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExitedMembers)
+            .unwrap_or(Vec::new(&env));
+        let paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .unwrap_or(Vec::new(&env));
+        let defaulters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Defaulters)
+            .unwrap_or(Vec::new(&env));
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .unwrap_or(Vec::new(&env));
+        let total_collected: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCollected)
+            .unwrap_or(0);
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(0);
+
+        let total_members = members.len() as u32;
+        let suspended_count = suspended.len() as u32;
+        let exited_count = exited.len() as u32;
+        let active_members = total_members
+            .saturating_sub(suspended_count)
+            .saturating_sub(exited_count);
+
+        let credit_scores: Map<Address, MemberScore> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::MemberCreditScores)
+            .unwrap_or(Map::new(&env));
+        let rep_scores: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::ReputationScores)
+            .unwrap_or(Map::new(&env));
+
+        let mut total_credit = 0i128;
+        let mut total_rep = 0i128;
+        for m in members.iter() {
+            total_credit += credit_scores.get(m.clone()).map(|ms| ms.score).unwrap_or(0);
+            total_rep += rep_scores.get(m.clone()).unwrap_or(0);
+        }
+        let n = members.len() as i128;
+        let avg_credit_score = if n > 0 { total_credit / n } else { 0 };
+        let avg_reputation_score = if n > 0 { total_rep / n } else { 0 };
+
+        GroupAnalytics {
+            total_members,
+            active_members,
+            suspended_count,
+            exited_count,
+            current_round,
+            total_rounds: payout_order.len() as u32,
+            paid_this_round: paid_members.len() as u32,
+            defaulters_this_round: defaulters.len() as u32,
+            total_contributions_collected: total_collected,
+            avg_credit_score,
+            avg_reputation_score,
+            fee_bps,
+        }
+    }
+
     pub fn get_member_status(env: Env, member: Address) -> MemberStatus {
         let members: Vec<Address> = env
             .storage()
@@ -5783,6 +5877,42 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .get(&DataKey2::FeeRecipient)
+    }
+
+    /// Admin configures the reputation-gated fee discount.
+    /// Members whose on-chain credit score >= `threshold` receive a `discount_bps`
+    /// reduction on the protocol fee applied to their payout round. The effective
+    /// fee floors at 0. Pass `discount_bps = 0` to disable without removing the key.
+    pub fn set_reputation_fee_discount(
+        env: Env,
+        admin: Address,
+        threshold: i128,
+        discount_bps: u32,
+    ) {
+        internals::check_not_paused(&env);
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        let cfg = RepFeeDiscountConfig { threshold, discount_bps };
+        env.storage()
+            .instance()
+            .set(&DataKey3::RepFeeDiscount, &cfg);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the current reputation-gated fee discount config, if one has been set.
+    pub fn get_reputation_fee_discount(env: Env) -> Option<RepFeeDiscountConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey3::RepFeeDiscount)
     }
 
     /// Get the maximum number of consecutive defaults before suspension.
