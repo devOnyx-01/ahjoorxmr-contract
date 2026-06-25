@@ -343,6 +343,7 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
         contributions.push_back(ContributionEntry {
             member: member.clone(),
             amount,
+            timestamp: env.ledger().timestamp(),
         });
     }
 
@@ -412,7 +413,7 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
         env,
         current_round,
         total_payout_history_amt,
-        payout_recipient,
+        payout_recipient.clone(),
         total_payout_history_amt,
         contributions,
         defaulters,

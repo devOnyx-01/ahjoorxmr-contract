@@ -340,10 +340,17 @@ impl AhjoorContract {
             .instance()
             .set(&DataKey::QuorumPercentage, &51u32);
 
+        // Guard: reject if contribution_amount × max_members would overflow i128.
+        if contribution_amount.checked_mul(max_members as i128).is_none() {
+            panic_with_error!(&env, ExtError::InvalidAmount);
+        }
+
         events::emit_rosc_init(&env, member_count as u32, contribution_amount);
 
         // #352: Store immutable base pool target (initial_members × contribution_amount)
-        let base_pool_target = contribution_amount * (member_count as i128);
+        let base_pool_target = contribution_amount
+            .checked_mul(member_count as i128)
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError::InvalidAmount));
         env.storage()
             .instance()
             .set(&DataKey3::BasePoolTarget, &base_pool_target);

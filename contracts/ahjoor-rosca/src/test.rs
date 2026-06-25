@@ -4862,3 +4862,52 @@ fn test_cannot_change_timestamp_schedule_mid_round() {
 
 
 
+
+#[test]
+fn test_overflow_guard_on_large_contribution() {
+    // contribution_amount = i128::MAX / 50, max_members = 100 → product overflows i128
+    let setup = setup_env();
+    let mut members = soroban_sdk::Vec::new(&setup.env);
+    for _ in 0..2 {
+        members.push_back(Address::generate(&setup.env));
+    }
+    let overflow_amount: i128 = i128::MAX / 50;
+    let res = setup.client.try_init(
+        &setup.admin,
+        &members,
+        &overflow_amount,
+        &setup.token_admin,
+        &3600,
+        &RoscaConfig {
+            strategy: PayoutStrategy::RoundRobin,
+            custom_order: None,
+            penalty_amount: 0,
+            exit_penalty_bps: 0,
+            collective_goal: None,
+            member_goals: None,
+            fee_bps: 0,
+            fee_recipient: None,
+            max_defaults: 3,
+            grace_period_ledgers: 0,
+            use_timestamp_schedule: false,
+            round_duration_seconds: 0,
+            max_members: Some(100),
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,
+            late_fee_bps: 0,
+            grace_period_seconds: 0,
+            auction_enabled: false,
+            auction_window_ledgers: 0,
+            randomize_payout_order: false,
+            reserve_enabled: false,
+            reserve_contribution_bps: 0,
+        },
+        &None,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), ExtError::InvalidAmount.into());
+
+    // Normal group (small amount) must initialize without error
+    let setup2 = setup_with_members(3, 1_000_000);
+    default_init(&setup2);
+}
