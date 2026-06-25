@@ -981,6 +981,8 @@ pub enum DataKey3 {
     NotificationKeyHistory(Address),
     /// #377: notification key rotation config
     NotificationKeyRotationConfig,
+    /// Slippage tolerance for multi-token dynamic payments (merchant) -> u32
+    SlippageToleranceBps(Address),
 }
 
 mod events;
@@ -2594,6 +2596,26 @@ impl AhjoorPaymentsContract {
 
         Self::add_customer_payment(&env, &customer, payment_id);
 
+        // Store DynamicPayment so settle_dynamic_payment_if_needed can find it
+        let dynamic = DynamicPayment {
+            payment_id,
+            fiat_amount: amount_usdc,
+            fiat_currency: Symbol::new(&env, "USDC"),
+            oracle_address: oracle_addr,
+            token: payment_token.clone(),
+            slippage_bps,
+            creation_rate: price_data.price,
+            expiry: payment.expires_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey2::DynamicPayment(payment_id), &dynamic);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::DynamicPayment(payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
         // Emit SlippageToleranceApplied event (#135)
         events::emit_slippage_tolerance_applied(
             &env,
@@ -2643,6 +2665,12 @@ impl AhjoorPaymentsContract {
     }
 
     // --- Admin ---
+
+    pub fn set_merchant_slippage_tolerance(env: Env, merchant: Address, bps: u32) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        env.storage().persistent().set(&DataKey3::SlippageToleranceBps(merchant), &bps);
+    }
 
     pub fn set_max_batch_size(env: Env, new_size: u32) {
         Self::require_not_paused(&env);
@@ -6053,6 +6081,40 @@ impl AhjoorPaymentsContract {
             if dp.expiry > 0 && now > dp.expiry {
                 panic_with_error!(env, Error::DynamicPaymentExpired);
             }
+
+            // Fetch the current price from the oracle
+            let oracle_client = oracle::OracleClient::new(env, &dp.oracle_address);
+            let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).expect("Oracle not configured");
+            let current_price_data = oracle_client.lastprice(&dp.token, &usdc_token).expect("Oracle price unavailable");
+            let current_price = current_price_data.price;
+
+            // Get merchant-configured slippage tolerance or default to the payment's initial config
+            let merchant_slippage: Option<u32> = env.storage().persistent()
+                .get(&DataKey3::SlippageToleranceBps(payment.merchant.clone()));
+            let slippage_tolerance_bps = merchant_slippage.unwrap_or(dp.slippage_bps);
+
+            // Compute rate deviation
+            let rate_deviation = if current_price >= dp.creation_rate {
+                current_price - dp.creation_rate
+            } else {
+                dp.creation_rate - current_price
+            };
+            
+            // Check against tolerance
+            let deviation_bps = (rate_deviation * 10_000) / dp.creation_rate;
+            if deviation_bps > slippage_tolerance_bps as i128 {
+                events::emit_payment_swap_failed(
+                    env, 
+                    payment.id, 
+                    payment.customer.clone(), 
+                    dp.token.clone(), 
+                    payment.amount, 
+                    Symbol::new(env, "StalePrice")
+                );
+                panic_with_error!(env, Error::SlippageExceeded);
+            }
+
+            events::emit_dynamic_payment_settled(env, payment.id, dp.fiat_amount, payment.amount, current_price);
         }
     }
 
@@ -9636,5 +9698,7 @@ mod test_retry_queue;
 mod test_spending_limit;
 #[cfg(test)]
 mod test_buyer_trust_tier;
+#[cfg(test)]
+mod test_oracle_staleness;
 
 pub use events::*;
