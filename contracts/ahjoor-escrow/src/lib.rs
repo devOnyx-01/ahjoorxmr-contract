@@ -6084,6 +6084,15 @@ impl AhjoorEscrowContract {
             panic!("Threshold must be between 1 and approvers count");
         }
 
+        let in_progress: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::ReleaseApprovals(escrow_id))
+            .unwrap_or(Vec::new(&env));
+        if !in_progress.is_empty() {
+            panic!("Cannot reconfigure: approvals already in progress");
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey2::MultiPartyApprovers(escrow_id), &approvers);
@@ -7227,10 +7236,10 @@ impl AhjoorEscrowContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        events::emit_delivery_proof_submitted(&env, escrow_id, seller, computed, true);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_delivery_proof_submitted(&env, escrow_id, seller, computed, true);
     }
 
     /// Buyer explicitly approves the seller transfer, finalising it immediately.
