@@ -64,6 +64,7 @@ fn test_protocol_fee_deducted_from_payout() {
             fee_recipient: Some(fee_recipient.clone()),
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -74,6 +75,9 @@ fn test_protocol_fee_deducted_from_payout() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -119,6 +123,7 @@ fn test_protocol_fee_max_cap_enforced() {
             fee_recipient: Some(fee_recipient),
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -129,6 +134,9 @@ fn test_protocol_fee_max_cap_enforced() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -160,6 +168,7 @@ fn test_update_fee_function() {
             fee_recipient: Some(fee_recipient),
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -170,6 +179,9 @@ fn test_update_fee_function() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -207,6 +219,7 @@ fn test_no_fee_when_fee_bps_zero() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -217,6 +230,9 @@ fn test_no_fee_when_fee_bps_zero() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -257,6 +273,7 @@ fn test_partial_contribution_installments() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -267,6 +284,9 @@ fn test_partial_contribution_installments() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -327,6 +347,7 @@ fn test_partial_contribution_events_emitted() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -337,6 +358,9 @@ fn test_partial_contribution_events_emitted() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -370,6 +394,7 @@ fn test_cannot_exceed_remaining_contribution() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -380,6 +405,9 @@ fn test_cannot_exceed_remaining_contribution() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -417,6 +445,7 @@ fn test_get_member_contribution_status() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -427,6 +456,9 @@ fn test_get_member_contribution_status() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -476,12 +508,13 @@ fn test_timestamp_based_scheduling() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: true,
             round_duration_seconds,
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0, randomize_payout_order: false, reserve_enabled: false, reserve_contribution_bps: 0,},
         &None,
     );
 
@@ -539,13 +572,14 @@ fn test_max_members_enforcement() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: Some(2),
         
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0, randomize_payout_order: false, reserve_enabled: false, reserve_contribution_bps: 0,},
         &None,
     );
 
@@ -580,13 +614,14 @@ fn test_update_max_members() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
         
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0, randomize_payout_order: false, reserve_enabled: false, reserve_contribution_bps: 0,},
         &None,
     );
 
@@ -628,13 +663,14 @@ fn test_max_members_boundary() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: Some(3),
         
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0, randomize_payout_order: false, reserve_enabled: false, reserve_contribution_bps: 0,},
         &None,
     );
 
@@ -671,13 +707,14 @@ fn test_max_members_proposal() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: Some(5),
         
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0, randomize_payout_order: false, reserve_enabled: false, reserve_contribution_bps: 0,},
         &None,
     );
 
@@ -730,12 +767,13 @@ fn test_configurable_max_defaults() {
             max_defaults: 2, // Custom threshold
         
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0, randomize_payout_order: false, reserve_enabled: false, reserve_contribution_bps: 0,},
         &None,
     );
 
@@ -784,6 +822,7 @@ fn test_suspension_threshold_set_event() {
             fee_recipient: None,
             max_defaults: 5,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -794,6 +833,9 @@ fn test_suspension_threshold_set_event() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -823,12 +865,13 @@ fn test_max_defaults_must_be_at_least_one() {
             max_defaults: 0, // Invalid
         
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0, randomize_payout_order: false, reserve_enabled: false, reserve_contribution_bps: 0,},
         &None,
     );
 
@@ -858,13 +901,14 @@ fn test_penalise_defaulter_uses_max_defaults() {
             max_defaults: 2,
 
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
         
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0, randomize_payout_order: false, reserve_enabled: false, reserve_contribution_bps: 0,},
         &None,
     );
 
@@ -927,12 +971,13 @@ fn test_all_features_integrated() {
             max_defaults: 2, // Suspend after 2 defaults
         
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0, randomize_payout_order: false, reserve_enabled: false, reserve_contribution_bps: 0,},
         &None,
     );
 
@@ -965,6 +1010,75 @@ fn test_all_features_integrated() {
     assert_eq!(client.get_max_defaults(), 2);
 }
 
+// ============================================================================
+// ISSUE #391: Round reset clears contributions, paid members, and defaulters
+// ============================================================================
+
+#[test]
+fn test_round_reset_clears_contributions() {
+    let (env, client, _admin, token_admin, _tc, tac, members) =
+        setup_with_members(3, 1000);
+
+    client.init(
+        &_admin,
+        &members,
+        &100,
+        &token_admin,
+        &3600,
+        &RoscaConfig {
+            strategy: PayoutStrategy::RoundRobin,
+            custom_order: None,
+            penalty_amount: 10,
+            exit_penalty_bps: 0,
+            collective_goal: None,
+            member_goals: None,
+            fee_bps: 0,
+            fee_recipient: None,
+            max_defaults: 3,
+            grace_period_ledgers: 0,
+            grace_period_seconds: 0,
+            use_timestamp_schedule: false,
+            round_duration_seconds: 0,
+            max_members: None,
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,
+            late_fee_bps: 0,
+            grace_period_seconds: 0,
+            auction_enabled: false,
+            auction_window_ledgers: 0,
+            randomize_payout_order: false,
+            reserve_enabled: false,
+            reserve_contribution_bps: 0,
+        },
+        &None,
+    );
+
+    let m1 = members.get(0).unwrap();
+    let m2 = members.get(1).unwrap();
+
+    // Round 0: both contribute
+    env.ledger().set_timestamp(100);
+    client.contribute(&m1, &token_admin, &100);
+    client.contribute(&m2, &token_admin, &100);
+
+    let contribs_r0 = client.get_round_contributions();
+    assert_eq!(contribs_r0.get(m1.clone()).unwrap(), 100);
+    assert_eq!(contribs_r0.get(m2.clone()).unwrap(), 100);
+
+    // Close round to trigger reset
+    env.ledger().set_timestamp(4000);
+    client.close_round();
+
+    // Verify contributions, paid members, and defaulters are cleared
+    let contribs_r1 = client.get_round_contributions();
+    assert!(contribs_r1.is_empty(), "MemberContributions must be empty after round reset");
+
+    // All members should be able to contribute in round 1 without AlreadyContributed
+    env.ledger().set_timestamp(4100);
+    client.contribute(&m1, &token_admin, &100);  // would panic with AlreadyContributed if not fixed
+    client.contribute(&m2, &token_admin, &100);
+}
 
 
 

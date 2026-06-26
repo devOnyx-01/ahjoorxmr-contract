@@ -80,6 +80,7 @@ fn test_window_expiry_auto_approves() {
     env.ledger().with_mut(|l| l.sequence_number += 20);
 
     client.expire_seller_transfer_veto(&escrow_id);
+    client.finalize_seller_transfer(&escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Active);

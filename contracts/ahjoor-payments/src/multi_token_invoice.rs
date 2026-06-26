@@ -1,8 +1,37 @@
 #![allow(dead_code)]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
+    contract, contracterror, contractclient, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     BytesN, Env, Map, String, Symbol, Vec,
 };
+
+/// Minimal oracle interface for cross-token price lookups (#354).
+#[allow(dead_code)]
+#[contractclient(name = "InvoiceOracleClient")]
+pub trait InvoiceOracleInterface {
+    /// Returns the price of `base` in terms of `quote`, scaled by 1_000_000.
+    /// Returns `None` if the price feed is unavailable.
+    fn get_price(env: soroban_sdk::Env, base: Address, quote: Address) -> Option<i128>;
+}
+
+/// Record of a cross-token oracle settlement for an invoice (#354).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossTokenSettlementRecord {
+    /// Invoice ID that was settled.
+    pub invoice_id: u32,
+    /// Token sent by the payer.
+    pub paid_token: Address,
+    /// Amount of `paid_token` sent by the payer.
+    pub paid_amount: i128,
+    /// Token the invoice was denominated in.
+    pub invoiced_token: Address,
+    /// Equivalent amount in the invoiced token (computed via oracle).
+    pub invoiced_amount: i128,
+    /// Oracle price used (base/quote, scaled by 1_000_000).
+    pub oracle_price: i128,
+    /// Slippage tolerance that was checked (in basis points).
+    pub max_slippage_bps: u32,
+}
 
 /// Multi-token invoice with preferred settlement conversion
 #[contracttype]
@@ -36,6 +65,10 @@ pub struct MultiTokenInvoice {
     pub conversion_rates: Map<Address, i128>,
     /// Settlement conversion rate (base to preferred settlement)
     pub settlement_conversion_rate: i128,
+    /// Optional oracle contract for cross-token settlement (#354).
+    /// When set, payers may settle using any accepted token and oracle price lookup
+    /// is used to validate the equivalent amount.
+    pub oracle_contract: Option<Address>,
     /// Metadata
     pub metadata: Map<String, String>,
 }
@@ -123,6 +156,9 @@ pub enum MultiTokenInvoiceError {
     InvalidLineItem = 8,
     SettlementFailed = 9,
     InvalidConversionRate = 10,
+    SlippageExceeded = 11,
+    OracleNotConfigured = 12,
+    OraclePriceUnavailable = 13,
 }
 
 pub trait MultiTokenInvoiceInterface {

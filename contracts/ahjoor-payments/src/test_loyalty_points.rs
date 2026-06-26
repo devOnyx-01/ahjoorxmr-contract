@@ -157,6 +157,7 @@ fn test_floor_enforcement() {
             capture_deadline: 0,
             external_id: None,
             tipping_enabled: false,
+            extension_count: 0,
         }
     });
     // Floor was enforced — test passes if no panic

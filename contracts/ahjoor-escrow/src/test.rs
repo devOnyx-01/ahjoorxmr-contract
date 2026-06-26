@@ -82,6 +82,86 @@ fn test_create_escrow() {
 }
 
 #[test]
+fn test_receipt_transfer_and_release_to_new_holder() {
+    let s = setup();
+
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    let new_holder = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(&buyer, &seller, &arbiter, &250, &s.token_addr, &deadline, &None, &Vec::new(&s.env), &false, &0u32);
+
+    let receipt = s.client.get_escrow_receipt(&escrow_id).expect("receipt exists");
+    let receipt_id = receipt.receipt_id;
+
+    s.client.transfer_escrow_receipt(&seller, &receipt_id, &new_holder);
+
+    s.client.release_escrow(&buyer, &escrow_id);
+
+    assert_eq!(s.token_client.balance(&new_holder), 250);
+    assert!(s.client.get_escrow_receipt(&escrow_id).is_none());
+}
+
+#[test]
+#[should_panic(expected = "Only current holder can transfer receipt")]
+fn test_non_holder_transfer_rejected() {
+    let s = setup();
+
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(&buyer, &seller, &arbiter, &250, &s.token_addr, &deadline, &None, &Vec::new(&s.env), &false, &0u32);
+
+    let receipt = s.client.get_escrow_receipt(&escrow_id).expect("receipt exists");
+    let receipt_id = receipt.receipt_id;
+
+    // Arbiter is not the holder — should panic
+    s.client.transfer_escrow_receipt(&arbiter, &receipt_id, &Address::generate(&s.env));
+}
+
+#[test]
+#[should_panic(expected = "ActiveMilestoneInProgress")]
+fn test_mid_milestone_transfer_rejection() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_milestone_escrow(&buyer, &seller, &arbiter, &s.token_addr, &deadline, &make_milestones(&s.env, &[100, 100]));
+
+    let receipt = s.client.get_escrow_receipt(&escrow_id).expect("receipt exists");
+    let receipt_id = receipt.receipt_id;
+
+    // Seller cannot transfer while milestones present
+    s.client.transfer_escrow_receipt(&seller, &receipt_id, &Address::generate(&s.env));
+}
+
+#[test]
+fn test_burn_on_cancel() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(&buyer, &seller, &arbiter, &250, &s.token_addr, &deadline, &None, &Vec::new(&s.env), &false, &0u32);
+
+    s.client.request_cancellation(&seller, &escrow_id, &BytesN::from_array(&s.env, &[0u8; 32]));
+    s.client.accept_cancellation(&buyer, &escrow_id);
+
+    assert!(s.client.get_escrow_receipt(&escrow_id).is_none());
+}
+
+#[test]
 #[should_panic(expected = "Escrow amount must be positive")]
 fn test_create_escrow_zero_amount_panics() {
     let s = setup();
@@ -2942,7 +3022,10 @@ fn test_arbiter_fee_deducted_from_loser_seller_wins() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: Some(500u32),
-        dispute_default_winner: None,    };
+        dispute_default_winner: None,
+        auto_renew_max_renewals: None,
+
+        auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     s.client.dispute_escrow(&buyer, &escrow_id, &String::from_str(&s.env, "dispute"), &1000);
@@ -2982,7 +3065,10 @@ fn test_arbiter_fee_deducted_from_loser_buyer_wins() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: Some(500u32),
-        dispute_default_winner: None,    };
+        dispute_default_winner: None,
+        auto_renew_max_renewals: None,
+
+        auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     s.client.dispute_escrow(&buyer, &escrow_id, &String::from_str(&s.env, "dispute"), &1000);
@@ -3022,7 +3108,10 @@ fn test_arbiter_fee_zero_is_valid() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: Some(0u32),
-        dispute_default_winner: None,    };
+        dispute_default_winner: None,
+        auto_renew_max_renewals: None,
+
+        auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     s.client.dispute_escrow(&buyer, &escrow_id, &String::from_str(&s.env, "dispute"), &1000);
@@ -3059,7 +3148,10 @@ fn test_arbiter_fee_cap_enforced_at_creation() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: Some(1001u32), // exceeds 1000 bps max
-        dispute_default_winner: None,    };
+        dispute_default_winner: None,
+        auto_renew_max_renewals: None,
+
+        auto_renew_interval_ledgers: None,    };
     let result = s.client.try_create_escrow_v2(&buyer, &request);
     assert!(result.is_err());
 }
@@ -3117,7 +3209,10 @@ fn test_arbiter_fee_emits_event() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: Some(300u32),
-        dispute_default_winner: None,    };
+        dispute_default_winner: None,
+        auto_renew_max_renewals: None,
+
+        auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     s.client.dispute_escrow(&buyer, &escrow_id, &String::from_str(&s.env, "dispute"), &1000);
@@ -3163,7 +3258,10 @@ fn test_release_before_min_lock_until_panics() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     // Still before lock_until
@@ -3202,7 +3300,10 @@ fn test_release_at_min_lock_until_succeeds() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     // Exactly at lock_until
@@ -3244,7 +3345,10 @@ fn test_release_after_min_lock_until_succeeds() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     s.env.ledger().set_timestamp(2500);
@@ -3283,7 +3387,10 @@ fn test_dispute_not_blocked_by_lock() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     // Still locked, but dispute should work
@@ -3324,7 +3431,10 @@ fn test_lock_and_deadline_independently_configurable() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     let escrow = s.client.get_escrow(&escrow_id);
@@ -3362,7 +3472,10 @@ fn test_time_locked_escrow_emits_event() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     s.client.create_escrow_v2(&buyer, &request);
 
     let events = s.env.events().all();
@@ -3399,7 +3512,10 @@ fn test_deadline_must_be_after_lock_until() {
         release_comparison: None,
         release_threshold_price: None,
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let result = s.client.try_create_escrow_v2(&buyer, &request);
     assert!(result.is_err());
 }
@@ -3523,7 +3639,10 @@ fn test_oracle_release_triggers_when_price_below_threshold() {
         release_comparison: Some(0u32), // LessOrEqual
         release_threshold_price: Some(500),
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     // Price = 400 <= 500 → condition met
@@ -3564,7 +3683,10 @@ fn test_oracle_release_does_not_trigger_when_price_above_threshold() {
         release_comparison: Some(0u32), // LessOrEqual
         release_threshold_price: Some(500),
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     // Price = 600 > 500 → condition NOT met
@@ -3605,7 +3727,10 @@ fn test_oracle_release_triggers_when_price_at_threshold() {
         release_comparison: Some(0u32), // LessOrEqual
         release_threshold_price: Some(500),
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     // Price exactly at threshold = 500 → condition met (<=)
@@ -3645,7 +3770,10 @@ fn test_oracle_release_greater_or_equal_condition() {
         release_comparison: Some(1u32), // GreaterOrEqual
         release_threshold_price: Some(1000),
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     // Price = 1200 >= 1000 → condition met
@@ -3685,7 +3813,10 @@ fn test_oracle_stale_price_blocks_release() {
         release_comparison: Some(0u32),
         release_threshold_price: Some(500),
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     // Set price at ts=0, advance ledger to ts=500 → age=500 > max_oracle_age(300)
@@ -3728,7 +3859,10 @@ fn test_manual_release_works_regardless_of_oracle_condition() {
         release_comparison: Some(0u32),
         release_threshold_price: Some(500),
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     // Manual release by buyer still works regardless of oracle
@@ -3768,7 +3902,10 @@ fn test_oracle_release_emits_event() {
         release_comparison: Some(0u32),
         release_threshold_price: Some(500),
         arbiter_fee_bps: None,
-            dispute_default_winner: None,    };
+            dispute_default_winner: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,    };
     let escrow_id = s.client.create_escrow_v2(&buyer, &request);
 
     set_escrow_oracle_price(&s, 300, 200);
@@ -4322,7 +4459,7 @@ fn test_partial_release_escalate() {
     s.env.ledger().set_timestamp(s.env.ledger().timestamp() + 86401);
 
     // Escalate to dispute
-    s.client.escalate_partial_release_to_dispute(&seller, &escrow_id);
+    s.client.escalate_partial_release_dispute(&seller, &escrow_id);
 
     // Check escrow status
     let escrow = s.client.get_escrow(&escrow_id);

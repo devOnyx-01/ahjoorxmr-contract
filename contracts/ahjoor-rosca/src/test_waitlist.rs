@@ -50,6 +50,9 @@ fn setup_waitlist<'a>() -> (Env, AhjoorContractClient<'a>, Address, Address, Vec
             grace_period_seconds: 0,
             auction_enabled: false,
             auction_window_ledgers: 0,
+            randomize_payout_order: false,
+            reserve_enabled: false,
+            reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -174,5 +177,37 @@ fn test_admin_remove_from_waitlist() {
     let wl = client.get_waitlist();
     assert_eq!(wl.len(), 1);
     assert_eq!(wl.get(0).unwrap().0, w2);
+}
+
+// ---------------------------------------------------------------------------
+// Test: #406 — waitlist length is capped at max_members
+// ---------------------------------------------------------------------------
+#[test]
+fn test_waitlist_cap_enforced() {
+    // setup_waitlist initialises with max_members = 10 and 3 existing members.
+    let (env, client, _admin, _token_addr, _members, _token_client, token_admin_client) =
+        setup_waitlist();
+
+    // Fill the waitlist up to max_members (10 slots)
+    let mut waitlisted = soroban_sdk::Vec::new(&env);
+    for _ in 0..10 {
+        let addr = Address::generate(&env);
+        token_admin_client.mint(&addr, &1000);
+        client.join_waitlist(&addr);
+        waitlisted.push_back(addr);
+    }
+    assert_eq!(client.get_waitlist().len(), 10, "waitlist should hold exactly max_members entries");
+
+    // One more join must be rejected with GroupFull
+    let overflow = Address::generate(&env);
+    token_admin_client.mint(&overflow, &1000);
+    let result = client.try_join_waitlist(&overflow);
+    assert!(
+        result.is_err(),
+        "joining a full waitlist must return an error"
+    );
+
+    // Verify the waitlist length hasn't changed
+    assert_eq!(client.get_waitlist().len(), 10, "waitlist must not grow beyond max_members");
 }
 

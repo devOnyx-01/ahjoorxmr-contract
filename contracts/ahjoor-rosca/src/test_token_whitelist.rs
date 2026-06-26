@@ -36,6 +36,7 @@ fn create_basic_config() -> RoscaConfig {
         fee_recipient: None,
         max_defaults: 3u32,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
         round_duration_seconds: 86400u64,
         max_members: Some(10u32),
@@ -46,6 +47,9 @@ fn create_basic_config() -> RoscaConfig {
     grace_period_seconds: 0,
     auction_enabled: false,
     auction_window_ledgers: 0,
+    randomize_payout_order: false,
+    reserve_enabled: false,
+    reserve_contribution_bps: 0,
     }
 }
 

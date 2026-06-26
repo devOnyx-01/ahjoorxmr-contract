@@ -46,6 +46,7 @@ fn test_per_type_quorum_enforced() {
             fee_recipient: None,
             max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -56,6 +57,9 @@ fn test_per_type_quorum_enforced() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         },
         &None,
     );
@@ -141,6 +145,7 @@ fn test_proposal_respects_quorum_at_creation() {
         strategy: PayoutStrategy::RoundRobin,
         custom_order: None, penalty_amount: 0, exit_penalty_bps: 0, collective_goal: None, member_goals: None, fee_bps: 0, fee_recipient: None, max_defaults: 3,
             grace_period_ledgers: 0,
+            grace_period_seconds: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -151,6 +156,9 @@ fn test_proposal_respects_quorum_at_creation() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
         }, &None);
 
     let creator = members.get(0).unwrap();

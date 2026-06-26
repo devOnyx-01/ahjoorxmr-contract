@@ -1,5 +1,5 @@
 #![cfg(test)]
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
+use soroban_sdk::{testutils::{Address as _, Ledger}, Address, BytesN, Env, Vec};
 use soroban_sdk::token::StellarAssetClient as TokenAdminClient;
 use soroban_sdk::token::Client as TokenClient;
 
@@ -26,6 +26,13 @@ fn make_config(env: &Env) -> RoscaConfig {
         skip_fee: 0,
         max_skips_per_cycle: 5,
         voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
+        randomize_payout_order: false,
+        reserve_enabled: false,
+        reserve_contribution_bps: 0,
     }
 }
 
@@ -168,6 +175,60 @@ fn test_operations_blocked_on_split_group() {
     let a2 = Vec::from_slice(&env, &[m1.clone()]);
     let b2 = Vec::from_slice(&env, &[m2.clone()]);
     client.propose_group_split(&admin, &0u32, &a2, &b2, &dummy_hash(&env));
+}
+
+// ── #400: complete_merge must require accepted == true ────────────────────────
+
+/// complete_merge on a proposal with accepted=false must error with MigrationNotApproved.
+#[test]
+#[should_panic]
+fn test_merge_requires_acceptance() {
+    let env = Env::default();
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let (client, admin, _token) = setup_split_rosca(&env, &[m1.clone(), m2.clone()]);
+
+    // propose_merge creates proposal with accepted=false
+    let proposal_id = client.propose_merge(&admin, &99u32);
+
+    // complete_merge WITHOUT calling accept_merge first → must panic (MigrationNotApproved)
+    let new_members: Vec<Address> = Vec::new(&env);
+    client.complete_merge(&admin, &proposal_id, &new_members);
+}
+
+/// complete_merge called twice on the same accepted proposal must error on the second call.
+#[test]
+#[should_panic]
+fn test_complete_merge_double_execution_blocked() {
+    let env = Env::default();
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let (client, admin, _token) = setup_split_rosca(&env, &[m1.clone(), m2.clone()]);
+
+    let proposal_id = client.propose_merge(&admin, &99u32);
+    client.accept_merge(&admin, &proposal_id);
+
+    let new_members: Vec<Address> = Vec::new(&env);
+    client.complete_merge(&admin, &proposal_id, &new_members);
+    // Second call: GroupStatus is now Merged → must panic
+    client.complete_merge(&admin, &proposal_id, &new_members);
+}
+
+/// Successful merge sets GroupStatus::Merged on the source group.
+#[test]
+fn test_complete_merge_sets_status_merged() {
+    let env = Env::default();
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let (client, admin, _token) = setup_split_rosca(&env, &[m1.clone(), m2.clone()]);
+
+    let proposal_id = client.propose_merge(&admin, &99u32);
+    client.accept_merge(&admin, &proposal_id);
+
+    let new_members: Vec<Address> = Vec::new(&env);
+    client.complete_merge(&admin, &proposal_id, &new_members);
+
+    assert_eq!(client.get_group_status(), GroupStatus::Merged);
 }
 
 #[test]
