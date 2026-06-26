@@ -218,6 +218,80 @@ fn test_release_escrow_by_buyer() {
 }
 
 #[test]
+fn test_amendment_past_deadline_rejected() {
+    let s = setup();
+    s.env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &2_000);
+
+    let deadline = s.env.ledger().timestamp() + 1_000;
+    let escrow_id = s.client.create_escrow(&buyer, &seller, &arbiter, &500, &s.token_addr, &deadline, &None, &Vec::new(&s.env), &false, &0u32);
+
+    let amended_deadline = s.env.ledger().timestamp() + 100;
+    let nonce = s.client.propose_amendment(&buyer, &escrow_id, &None, &Some(amended_deadline), &None);
+
+    s.env.ledger().with_mut(|li| li.timestamp = amended_deadline);
+    let result = s.client.try_sign_amendment(&seller, &escrow_id, &nonce);
+    assert_eq!(result.unwrap_err().unwrap(), EscrowError::InvalidDeadline.into());
+
+    let escrow = s.client.get_escrow(&escrow_id);
+    assert_eq!(escrow.deadline, deadline);
+}
+
+#[test]
+fn test_future_deadline_amendment_applies() {
+    let s = setup();
+    s.env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &2_000);
+
+    let deadline = s.env.ledger().timestamp() + 1_000;
+    let escrow_id = s.client.create_escrow(&buyer, &seller, &arbiter, &500, &s.token_addr, &deadline, &None, &Vec::new(&s.env), &false, &0u32);
+
+    let amended_deadline = s.env.ledger().timestamp() + 2_000;
+    let nonce = s.client.propose_amendment(&buyer, &escrow_id, &None, &Some(amended_deadline), &None);
+    s.client.sign_amendment(&seller, &escrow_id, &nonce);
+
+    let escrow = s.client.get_escrow(&escrow_id);
+    assert_eq!(escrow.amount, 500);
+    assert_eq!(escrow.deadline, amended_deadline);
+}
+
+#[test]
+fn test_tranche_index_bounds_check() {
+    let s = setup();
+    s.env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1_000);
+
+    let mut schedule = Vec::new(&s.env);
+    schedule.push_back(ReleaseTranche { unlock_at: 1_100, amount: 100, claimed: false });
+    schedule.push_back(ReleaseTranche { unlock_at: 1_200, amount: 150, claimed: false });
+    schedule.push_back(ReleaseTranche { unlock_at: 1_300, amount: 250, claimed: false });
+
+    let escrow_id = s.client.create_escrow_with_schedule(&buyer, &seller, &arbiter, &s.token_addr, &2_000, &schedule);
+
+    let bad_index = s.client.try_claim_scheduled_tranche(&seller, &escrow_id, &99u32);
+    assert_eq!(bad_index.unwrap_err().unwrap(), EscrowError::InvalidTrancheIndex.into());
+
+    s.env.ledger().with_mut(|li| li.timestamp = 1_250);
+    s.client.claim_scheduled_tranche(&seller, &escrow_id, &1u32);
+    assert_eq!(s.token_client.balance(&seller), 150);
+
+    let duplicate = s.client.try_claim_scheduled_tranche(&seller, &escrow_id, &1u32);
+    assert_eq!(duplicate.unwrap_err().unwrap(), EscrowError::TrancheAlreadyClaimed.into());
+}
+
+#[test]
 fn test_release_escrow_by_arbiter() {
     let s = setup();
 
@@ -4496,4 +4570,3 @@ fn test_partial_release_non_active() {
     let justification_hash = BytesN::from_array(&s.env, &[1u8; 32]);
     s.client.request_partial_release(&seller, &escrow_id, &100, &justification_hash);
 }
-

@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN, Env, String, Symbol, Vec};
 use ahjoor_token_whitelist::TokenWhitelistClient;
 
 // --- Storage TTL Constants ---
@@ -16,6 +16,14 @@ const DEFAULT_MAX_ORACLE_AGE_SECONDS: u64 = 300;
 const DEFAULT_INSURANCE_TRIGGER_DAYS: u64 = 7;
 const DEFAULT_MAX_TOPUP_MULTIPLIER: u32 = 3;
 const DEFAULT_PARTIAL_RELEASE_RESPONSE_DEADLINE: u64 = 86400; // 1 day
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EscrowError {
+    InvalidDeadline = 1,
+    InvalidTrancheIndex = 2,
+    TrancheAlreadyClaimed = 3,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
@@ -477,6 +485,8 @@ pub struct ReleaseTranche {
     pub unlock_at: u64,
     /// Token amount released in this tranche.
     pub amount: i128,
+    /// Whether this tranche has already been claimed.
+    pub claimed: bool,
 }
 
 // ── #332: Milestone BPS Progressive Release ───────────────────────────────────
@@ -1022,6 +1032,7 @@ impl AhjoorEscrowContract {
                 &DataKey::Escrow(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
             );
             env.storage().persistent().remove(&key);
+            Self::record_inspector_incomplete_ruling(&env, &old_inspector);
             events::emit_inspector_replaced(&env, escrow_id, old_inspector, new_inspector);
         } else {
             env.storage().persistent().set(&key, &replacement);
@@ -1152,6 +1163,28 @@ impl AhjoorEscrowContract {
         env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         let accuracy_bps = (score.correct_rulings * 10_000) / score.total_rulings;
+        events::emit_inspector_score_updated(env, inspector.clone(), score.total_rulings, score.correct_rulings, accuracy_bps);
+    }
+
+    /// Internal: replacement before a ruling counts as an incomplete ruling.
+    fn record_inspector_incomplete_ruling(env: &Env, inspector: &Address) {
+        let key = DataKey2::InspectorScore(inspector.clone());
+        let mut score: InspectorScore = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(InspectorScore { total_rulings: 0, correct_rulings: 0 });
+
+        score.total_rulings = score.total_rulings.saturating_add(1);
+
+        env.storage().persistent().set(&key, &score);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        let accuracy_bps = if score.total_rulings == 0 {
+            10_000
+        } else {
+            (score.correct_rulings * 10_000) / score.total_rulings
+        };
         events::emit_inspector_score_updated(env, inspector.clone(), score.total_rulings, score.correct_rulings, accuracy_bps);
     }
 
@@ -3305,6 +3338,10 @@ impl AhjoorEscrowContract {
             panic!("Cannot extend deadline while escrow is disputed");
         }
 
+        if new_deadline <= env.ledger().timestamp() {
+            panic_with_error!(&env, EscrowError::InvalidDeadline);
+        }
+
         if new_deadline <= escrow.deadline {
             panic!("New deadline must be greater than current deadline");
         }
@@ -3374,6 +3411,13 @@ impl AhjoorEscrowContract {
             panic!("Deadline extension proposal has expired");
         }
 
+        if proposal.new_deadline <= now {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::DeadlineProposal(escrow_id));
+            panic_with_error!(&env, EscrowError::InvalidDeadline);
+        }
+
         if proposal.new_deadline <= escrow.deadline {
             env.storage()
                 .persistent()
@@ -3401,6 +3445,220 @@ impl AhjoorEscrowContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Propose mutually agreed escrow amendments for amount, deadline, or metadata.
+    pub fn propose_amendment(
+        env: Env,
+        caller: Address,
+        escrow_id: u32,
+        new_amount: Option<i128>,
+        new_deadline: Option<u64>,
+        new_metadata_hash: Option<BytesN<32>>,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can propose amendment");
+        }
+        if Self::is_terminal_escrow_status(escrow.status) {
+            panic!("Cannot amend terminal escrow");
+        }
+        if let Some(deadline) = new_deadline {
+            if deadline <= env.ledger().timestamp() {
+                panic_with_error!(&env, EscrowError::InvalidDeadline);
+            }
+        }
+        if let Some(amount) = new_amount {
+            if amount <= 0 {
+                panic!("New amount must be positive");
+            }
+        }
+
+        let nonce: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::AmendmentNonce(escrow_id))
+            .unwrap_or(0);
+        let next_nonce = nonce.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey2::AmendmentNonce(escrow_id), &next_nonce);
+
+        let now = env.ledger().timestamp();
+        let expiry_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::AmendmentExpirySeconds)
+            .unwrap_or(DEFAULT_AMENDMENT_EXPIRY_SECONDS);
+        let proposal = AmendmentProposal {
+            nonce,
+            proposer: caller.clone(),
+            new_amount,
+            new_deadline,
+            new_metadata_hash,
+            proposed_at: now,
+            expires_at: now + expiry_seconds,
+            buyer_signed: caller == escrow.buyer,
+            seller_signed: caller == escrow.seller,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey2::AmendmentProposal(escrow_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::AmendmentProposal(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_amendment_proposed(
+            &env,
+            escrow_id,
+            nonce,
+            caller,
+            proposal.new_amount,
+            proposal.new_deadline,
+            proposal.new_metadata_hash.clone(),
+            proposal.expires_at,
+        );
+
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        nonce
+    }
+
+    /// Sign the pending amendment for an escrow.
+    pub fn sign_amendment(env: Env, caller: Address, escrow_id: u32, nonce: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can sign amendment");
+        }
+
+        let key = DataKey2::AmendmentProposal(escrow_id);
+        let mut proposal: AmendmentProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("No amendment proposal found");
+        if proposal.nonce != nonce {
+            panic!("Amendment nonce mismatch");
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            env.storage().persistent().remove(&key);
+            panic!("Amendment proposal has expired");
+        }
+
+        if caller == escrow.buyer {
+            proposal.buyer_signed = true;
+        } else {
+            proposal.seller_signed = true;
+        }
+
+        env.storage().persistent().set(&key, &proposal);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_amendment_signed(&env, escrow_id, nonce, caller);
+
+        if proposal.buyer_signed && proposal.seller_signed {
+            Self::apply_amendment(env, escrow_id, nonce);
+        }
+    }
+
+    /// Apply a fully signed amendment to an escrow.
+    pub fn apply_amendment(env: Env, escrow_id: u32, nonce: u32) {
+        Self::require_not_paused(&env);
+
+        let key = DataKey2::AmendmentProposal(escrow_id);
+        let proposal: AmendmentProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("No amendment proposal found");
+        if proposal.nonce != nonce {
+            panic!("Amendment nonce mismatch");
+        }
+        if !proposal.buyer_signed || !proposal.seller_signed {
+            panic!("Amendment requires buyer and seller signatures");
+        }
+        let now = env.ledger().timestamp();
+        if now > proposal.expires_at {
+            env.storage().persistent().remove(&key);
+            panic!("Amendment proposal has expired");
+        }
+        if let Some(deadline) = proposal.new_deadline {
+            if deadline <= now {
+                panic_with_error!(&env, EscrowError::InvalidDeadline);
+            }
+        }
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+        if Self::is_terminal_escrow_status(escrow.status) {
+            panic!("Cannot amend terminal escrow");
+        }
+
+        let old_amount = escrow.amount;
+        let old_deadline = escrow.deadline;
+        let old_metadata_hash = escrow.metadata_hash.clone();
+
+        if let Some(new_amount) = proposal.new_amount {
+            if new_amount <= 0 {
+                panic!("New amount must be positive");
+            }
+            let token_client = token::Client::new(&env, &escrow.token);
+            if new_amount > escrow.amount {
+                let delta = new_amount - escrow.amount;
+                token_client.transfer(&escrow.buyer, &env.current_contract_address(), &delta);
+            } else if new_amount < escrow.amount {
+                let delta = escrow.amount - new_amount;
+                token_client.transfer(&env.current_contract_address(), &escrow.buyer, &delta);
+            }
+            escrow.amount = new_amount;
+        }
+        if let Some(new_deadline) = proposal.new_deadline {
+            escrow.deadline = new_deadline;
+        }
+        if proposal.new_metadata_hash.is_some() {
+            escrow.metadata_hash = proposal.new_metadata_hash.clone();
+        }
+
+        env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().persistent().remove(&key);
+
+        events::emit_amendment_applied(
+            &env,
+            escrow_id,
+            nonce,
+            old_amount,
+            escrow.amount,
+            old_deadline,
+            escrow.deadline,
+            old_metadata_hash,
+            escrow.metadata_hash,
+        );
+
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Get escrow details
@@ -6270,6 +6528,7 @@ impl AhjoorEscrowContract {
 
         let now = env.ledger().timestamp();
         let mut total: i128 = 0;
+        let mut stored_schedule = Vec::new(&env);
         for i in 0..schedule.len() {
             let tranche = schedule.get(i).unwrap();
             if tranche.amount <= 0 {
@@ -6279,6 +6538,11 @@ impl AhjoorEscrowContract {
                 panic!("Each tranche unlock_at must be in the future");
             }
             total += tranche.amount;
+            stored_schedule.push_back(ReleaseTranche {
+                unlock_at: tranche.unlock_at,
+                amount: tranche.amount,
+                claimed: false,
+            });
         }
 
         let request = EscrowCreateRequest {
@@ -6308,7 +6572,7 @@ impl AhjoorEscrowContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey2::ReleaseSchedule(escrow_id), &schedule);
+            .set(&DataKey2::ReleaseSchedule(escrow_id), &stored_schedule);
         env.storage().persistent().extend_ttl(
             &DataKey2::ReleaseSchedule(escrow_id),
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -6354,7 +6618,7 @@ impl AhjoorEscrowContract {
             panic!("Escrow is not in a claimable state");
         }
 
-        let schedule: Vec<ReleaseTranche> = env
+        let mut schedule: Vec<ReleaseTranche> = env
             .storage()
             .persistent()
             .get(&DataKey2::ReleaseSchedule(escrow_id))
@@ -6375,9 +6639,13 @@ impl AhjoorEscrowContract {
             if released_index >= total_tranches {
                 break;
             }
-            let tranche = schedule.get(released_index).unwrap();
+            let mut tranche = schedule.get(released_index).unwrap();
             if tranche.unlock_at > now {
                 break;
+            }
+            if tranche.claimed {
+                released_index += 1;
+                continue;
             }
 
             token_client.transfer(
@@ -6385,6 +6653,8 @@ impl AhjoorEscrowContract {
                 &beneficiary,
                 &tranche.amount,
             );
+            tranche.claimed = true;
+            schedule.set(released_index, tranche.clone());
 
             let remaining_tranches = total_tranches - released_index - 1;
             events::emit_scheduled_release_executed(
@@ -6406,6 +6676,14 @@ impl AhjoorEscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey2::ReleasedIndex(escrow_id), &released_index);
+        env.storage()
+            .persistent()
+            .set(&DataKey2::ReleaseSchedule(escrow_id), &schedule);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::ReleaseSchedule(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.storage().persistent().extend_ttl(
             &DataKey2::ReleasedIndex(escrow_id),
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -6441,6 +6719,99 @@ impl AhjoorEscrowContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Claim one specific scheduled tranche by index.
+    pub fn claim_scheduled_tranche(env: Env, beneficiary: Address, escrow_id: u32, tranche_index: u32) {
+        Self::require_not_paused(&env);
+        beneficiary.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.seller != beneficiary {
+            panic!("Only the beneficiary (seller) can claim scheduled releases");
+        }
+        if !Self::is_open_escrow_status(escrow.status) && escrow.status != EscrowStatus::PartiallyReleased {
+            panic!("Escrow is not in a claimable state");
+        }
+
+        let mut schedule: Vec<ReleaseTranche> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::ReleaseSchedule(escrow_id))
+            .expect("No release schedule found for this escrow");
+        let total_tranches = schedule.len();
+        if tranche_index >= total_tranches {
+            panic_with_error!(&env, EscrowError::InvalidTrancheIndex);
+        }
+
+        let mut tranche = schedule.get(tranche_index).unwrap();
+        if tranche.claimed {
+            panic_with_error!(&env, EscrowError::TrancheAlreadyClaimed);
+        }
+        if tranche.unlock_at > env.ledger().timestamp() {
+            panic!("No tranches are currently claimable");
+        }
+
+        let token_client = token::Client::new(&env, &escrow.token);
+        token_client.transfer(&env.current_contract_address(), &beneficiary, &tranche.amount);
+
+        tranche.claimed = true;
+        schedule.set(tranche_index, tranche.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey2::ReleaseSchedule(escrow_id), &schedule);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::ReleaseSchedule(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let mut claimed_count = 0u32;
+        for i in 0..total_tranches {
+            if schedule.get(i).unwrap().claimed {
+                claimed_count += 1;
+            }
+        }
+        let remaining_tranches = total_tranches - claimed_count;
+        env.storage()
+            .persistent()
+            .set(&DataKey2::ReleasedIndex(escrow_id), &claimed_count);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::ReleasedIndex(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let mut updated_escrow = escrow.clone();
+        updated_escrow.status = if remaining_tranches == 0 {
+            Self::burn_receipt_if_exists(&env, escrow_id);
+            EscrowStatus::Released
+        } else {
+            EscrowStatus::PartiallyReleased
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &updated_escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_scheduled_release_executed(
+            &env,
+            escrow_id,
+            tranche_index,
+            tranche.amount,
+            remaining_tranches,
+        );
+
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Read the release schedule for a staged-release escrow.

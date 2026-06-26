@@ -3770,9 +3770,6 @@ impl AhjoorPaymentsContract {
                 voucher.uses_remaining -= 1;
             }
             let exhausted = voucher.max_uses > 0 && voucher.uses_remaining == 0;
-            if exhausted {
-                voucher.revoked = true; // mark exhausted by setting revoked (uses_remaining=0 is the real signal)
-            }
             env.storage().persistent().set(&voucher_key, &voucher);
             env.storage().persistent().extend_ttl(
                 &voucher_key,

@@ -205,3 +205,33 @@ fn test_low_score_inspector_blocked_from_high_value_escrow() {
     let result = client.try_create_escrow_with_inspector(&buyer, &hv_req, &Some(inspector.clone()));
     assert!(result.is_err());
 }
+
+#[test]
+fn test_replaced_inspector_score_penalized() {
+    let (env, _admin, buyer, seller, arbiter, token, client) = setup_test_env();
+    let old_inspector = Address::generate(&env);
+    let new_inspector = Address::generate(&env);
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&buyer, &5_000);
+
+    let req = make_request(&env, &seller, &arbiter, &token, 1000);
+    let first_escrow = client.create_escrow_with_inspector(&buyer, &req, &Some(old_inspector.clone()));
+    client.dispute_escrow(&buyer, &first_escrow, &String::from_str(&env, "d"), &1000);
+    client.resolve_dispute(&arbiter, &first_escrow, &0);
+
+    let (total_before, correct_before, accuracy_before) = client.get_inspector_score(&old_inspector);
+    assert_eq!((total_before, correct_before, accuracy_before), (1, 1, 10_000));
+
+    let replacement_escrow = client.create_escrow_with_inspector(&buyer, &req, &Some(old_inspector.clone()));
+    client.replace_inspector(&buyer, &replacement_escrow, &new_inspector);
+    client.replace_inspector(&seller, &replacement_escrow, &new_inspector);
+
+    let (total_after, correct_after, accuracy_after) = client.get_inspector_score(&old_inspector);
+    assert_eq!(total_after, 2);
+    assert_eq!(correct_after, 1);
+    assert!(accuracy_after < accuracy_before);
+    assert_eq!(accuracy_after, 5_000);
+
+    let (new_total, new_correct, new_accuracy) = client.get_inspector_score(&new_inspector);
+    assert_eq!((new_total, new_correct, new_accuracy), (0, 0, 10_000));
+}

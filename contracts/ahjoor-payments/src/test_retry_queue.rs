@@ -110,7 +110,7 @@ fn test_retry_not_due_before_backoff() {
     let env = Env::default();
     let (client, _admin, merchant, customer, token, _ta) = setup_retry(&env);
 
-    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &3u32);
+    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &3u32, &Option::<u32>::None);
     assert_eq!(client.get_failed_debit(&record_id).status, FailedDebitStatus::Pending);
 
     // Retry immediately without advancing ledger → RetryNotDue
@@ -123,7 +123,7 @@ fn test_retry_after_backoff_succeeds() {
     let (client, _admin, merchant, customer, token, ta) = setup_retry(&env);
 
     // First attempt fails (insufficient balance)
-    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &4u32);
+    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &4u32, &Option::<u32>::None);
     let rec = client.get_failed_debit(&record_id);
     assert_eq!(rec.status, FailedDebitStatus::Pending);
 
@@ -147,7 +147,7 @@ fn test_max_attempts_leads_to_abandonment() {
     // Low max attempts
     client.set_retry_config(&admin, &1u64, &100u64, &2u32);
 
-    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &5u32);
+    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &5u32, &Option::<u32>::None);
     assert_eq!(client.get_failed_debit(&record_id).status, FailedDebitStatus::Pending);
 
     // Exhaust all attempts (balance never topped up)
@@ -171,7 +171,7 @@ fn test_early_retry_bypasses_backoff() {
     let env = Env::default();
     let (client, _admin, merchant, customer, token, ta) = setup_retry(&env);
 
-    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &6u32);
+    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &6u32, &Option::<u32>::None);
     assert_eq!(client.get_failed_debit(&record_id).status, FailedDebitStatus::Pending);
 
     // Top up customer — no ledger advance needed for early retry
@@ -191,7 +191,7 @@ fn test_backoff_doubles_per_attempt() {
 
     client.set_retry_config(&admin, &10u64, &1_000u64, &5u32);
 
-    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &7u32);
+    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &7u32, &Option::<u32>::None);
     let rec1 = client.get_failed_debit(&record_id);
     let first_next = rec1.next_retry_ledger;
 
@@ -210,7 +210,7 @@ fn test_retry_after_customer_top_up() {
     let env = Env::default();
     let (client, _admin, merchant, customer, token, ta) = setup_retry(&env);
 
-    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &8u32);
+    let record_id = client.initiate_allowed_payment(&merchant, &customer, &token, &5_000, &8u32, &Option::<u32>::None);
     let rec = client.get_failed_debit(&record_id);
     assert_eq!(rec.status, FailedDebitStatus::Pending);
 
