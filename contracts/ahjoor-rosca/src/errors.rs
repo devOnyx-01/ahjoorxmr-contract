@@ -162,6 +162,8 @@ pub enum ExtError {
     SplitAlreadyConfirmed = 91,
     /// Not all members have confirmed; cannot execute split yet (#331).
     SplitNotFullyConfirmed = 92,
+    /// Proxy has consumed all authorized rounds (#403).
+    ProxyRoundsExhausted = 118,
 }
 
 /// Extension error codes 101+ — overflow from ExtError (50-variant limit).

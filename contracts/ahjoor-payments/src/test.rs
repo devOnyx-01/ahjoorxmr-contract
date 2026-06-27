@@ -4079,76 +4079,97 @@ fn test_bulk_expire_payments_success() {
 }
 
 #[test]
-#[should_panic]
-fn test_bulk_expire_ineligible_payment_reverts_entire_batch() {
+fn test_bulk_expire_ineligible_payment_skipped() {
     let s = setup();
     s.init();
     let customer = Address::generate(&s.env);
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&customer, &1000);
 
-    let pid0 = s.client.create_payment(
-        &customer,
-        &merchant,
-        &100,
-        &s.token_addr,
-        &None,
-        &None,
-        &None,
-    );
-    let pid1 = s.client.create_payment(
-        &customer,
-        &merchant,
-        &200,
-        &s.token_addr,
-        &None,
-        &None,
-        &None,
-    );
+    let pid0 = s.client.create_payment(&customer, &merchant, &100, &s.token_addr, &None, &None, &None);
+    let pid1 = s.client.create_payment(&customer, &merchant, &200, &s.token_addr, &None, &None, &None);
 
-    // Advance past expiry then complete pid1 so it is ineligible
-    s.env
-        .ledger()
-        .with_mut(|l| l.timestamp = 7 * 24 * 60 * 60 + 1);
+    s.env.ledger().with_mut(|l| l.timestamp = 7 * 24 * 60 * 60 + 1);
     s.client.complete_payment(&pid1);
 
-    // Batch contains one eligible (pid0) and one ineligible (pid1, Completed) — must revert
-    s.client
-        .bulk_expire_payments(&s.admin, &vec![&s.env, pid0, pid1]);
+    // pid1 is Completed (ineligible) — it should be skipped, pid0 expired
+    let skipped = s.client.bulk_expire_payments(&s.admin, &vec![&s.env, pid0, pid1]);
+
+    assert_eq!(s.client.get_payment(&pid0).status, PaymentStatus::Expired);
+    assert_eq!(s.client.get_payment(&pid1).status, PaymentStatus::Completed);
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped.get(0).unwrap(), pid1);
 }
 
 #[test]
-#[should_panic(expected = "Batch size exceeds maximum allowed")]
 fn test_bulk_expire_exceeds_cap_rejected() {
     let s = setup();
     s.init();
     let mut ids = soroban_sdk::Vec::new(&s.env);
-    for i in 0u32..51 {
+    for i in 0u32..21 {
         ids.push_back(i);
     }
-    s.client.bulk_expire_payments(&s.admin, &ids);
+    let err = s.client.try_bulk_expire_payments(&s.admin, &ids).unwrap_err().unwrap();
+    assert_eq!(err, ExtError::InvalidAmount.into());
 }
 
 #[test]
-#[should_panic(expected = "Payment has not expired yet")]
-fn test_bulk_expire_not_expired_rejected() {
+fn test_bulk_expire_not_expired_skipped() {
     let s = setup();
     s.init();
     let customer = Address::generate(&s.env);
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&customer, &500);
 
-    let pid = s.client.create_payment(
-        &customer,
-        &merchant,
-        &100,
-        &s.token_addr,
-        &None,
-        &None,
-        &None,
-    );
-    // Do NOT advance time — payment hasn't expired
-    s.client.bulk_expire_payments(&s.admin, &vec![&s.env, pid]);
+    let pid = s.client.create_payment(&customer, &merchant, &100, &s.token_addr, &None, &None, &None);
+    // Do NOT advance time — payment hasn't expired; should be skipped
+    let skipped = s.client.bulk_expire_payments(&s.admin, &vec![&s.env, pid]);
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(s.client.get_payment(&pid).status, PaymentStatus::Pending);
+}
+
+#[test]
+fn test_bulk_expire_cap_enforced() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &10_000);
+
+    // Create 5 expired + 3 already-expired (completed) payments
+    let mut expired_ids = soroban_sdk::Vec::new(&s.env);
+    for _ in 0..5 {
+        let pid = s.client.create_payment(&customer, &merchant, &100, &s.token_addr, &None, &None, &None);
+        expired_ids.push_back(pid);
+    }
+    let mut completed_ids = soroban_sdk::Vec::new(&s.env);
+    for _ in 0..3 {
+        let pid = s.client.create_payment(&customer, &merchant, &100, &s.token_addr, &None, &None, &None);
+        completed_ids.push_back(pid);
+    }
+
+    s.env.ledger().with_mut(|l| l.timestamp = 7 * 24 * 60 * 60 + 1);
+    for i in 0..3 {
+        s.client.complete_payment(&completed_ids.get(i).unwrap());
+    }
+
+    let mut all_ids = expired_ids.clone();
+    for pid in completed_ids.iter() {
+        all_ids.push_back(pid);
+    }
+
+    let skipped = s.client.bulk_expire_payments(&s.admin, &all_ids);
+    // 5 expired, 3 skipped (completed)
+    assert_eq!(skipped.len(), 3);
+    for pid in expired_ids.iter() {
+        assert_eq!(s.client.get_payment(&pid).status, PaymentStatus::Expired);
+    }
+
+    // Cap enforcement: 21 IDs → InvalidAmount
+    let mut big_batch = soroban_sdk::Vec::new(&s.env);
+    for i in 0u32..21 { big_batch.push_back(i); }
+    let err = s.client.try_bulk_expire_payments(&s.admin, &big_batch).unwrap_err().unwrap();
+    assert_eq!(err, ExtError::InvalidAmount.into());
 }
 
 // ===========================================================================

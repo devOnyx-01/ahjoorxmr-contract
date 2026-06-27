@@ -124,7 +124,31 @@ fn test_proxy_authorization_expires_after_max_rounds() {
         .try_contribute_as_proxy(&proxy, &0, &member, &token_addr, &100)
         .unwrap_err()
         .unwrap();
-    assert_eq!(err, Error::NoDelegationFound.into());
+    assert_eq!(err, errors::ExtError2::ProxyRoundsExhausted.into());
+}
+
+#[test]
+fn test_proxy_round_limit_enforced() {
+    let (env, client, _admin, token_addr, _token_client, token_admin_client, members, proxy) =
+        setup_proxy();
+    let member = members.get(0).unwrap();
+    let other = members.get(1).unwrap();
+
+    // Authorize for exactly 1 round
+    client.authorize_proxy(&member, &0, &proxy, &1);
+
+    // First contribution should succeed
+    client.contribute_as_proxy(&proxy, &0, &member, &token_addr, &100);
+    client.contribute(&other, &token_addr, &100);
+
+    env.ledger().set_timestamp(200);
+
+    // Second attempt must return ProxyRoundsExhausted, not NoDelegationFound
+    let err = client
+        .try_contribute_as_proxy(&proxy, &0, &member, &token_addr, &100)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, errors::ExtError2::ProxyRoundsExhausted.into());
 }
 
 #[test]

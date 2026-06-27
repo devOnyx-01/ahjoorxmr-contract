@@ -1601,7 +1601,7 @@ impl AhjoorContract {
             let bonus_amount: i128 = env
                 .storage()
                 .instance()
-                .get(&DataKey2::CycleBonusAmount)
+                .get(&DataKey4::CycleBonusAmount)
                 .unwrap_or(0);
             if bonus_amount > 0 {
                 let cycle_number = (current_round + 1) / cycle_len;
@@ -1748,14 +1748,14 @@ impl AhjoorContract {
         let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
         if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
         if amount < 0 { panic_with_error!(&env, Error::AmountMustBePositive); }
-        env.storage().instance().set(&DataKey2::CycleBonusAmount, &amount);
+        env.storage().instance().set(&DataKey4::CycleBonusAmount, &amount);
         events::emit_cycle_bonus_configured(&env, amount);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Returns the configured cycle bonus amount (0 if not set).
     pub fn get_cycle_bonus(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey2::CycleBonusAmount).unwrap_or(0)
+        env.storage().instance().get(&DataKey4::CycleBonusAmount).unwrap_or(0)
     }
 
     // ─── Slot Auction ─────────────────────────────────────────────────────────
@@ -1778,35 +1778,6 @@ impl AhjoorContract {
         internals::check_not_frozen(&env);
         bidder.require_auth();
 
-    /// #390: Switch between ledger-based and timestamp-based scheduling.
-    /// Forbidden once the first round has started (CurrentRound > 0) to prevent
-    /// grace-window aliasing between the two scheduling modes.
-    pub fn set_use_timestamp_schedule(env: Env, admin: Address, value: bool) {
-        internals::check_not_paused(&env);
-        admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != stored_admin {
-            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
-        }
-        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
-        if current_round > 0 {
-            panic_with_error!(&env, Error::CannotChangeMidRound);
-        }
-        env.storage().instance().set(&DataKey2::UseTimestampSchedule, &value);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
-
-    /// Backward-compatible alias kept for existing test callers.
-    pub fn penalise_defaulter(env: Env, member: Address) {
-        Self::request_penalty_grace(env, member);
-    }
-
-    /// Member requests a grace-period deferral of their pending penalty.
-    /// Admin must approve; if within the grace window, the penalty is queued;
-    /// otherwise it is applied immediately.
-    pub fn request_penalty_grace(env: Env, member: Address) {
-        internals::check_not_paused(&env);
-        let admin: Address = env
         // Feature guard
         let auction_enabled: bool = env
             .storage()
@@ -3271,8 +3242,8 @@ impl AhjoorContract {
         let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
         if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
 
-        let min_dur: u64 = env.storage().instance().get(&DataKey2::MinRoundDuration).unwrap_or(60);
-        let max_dur: u64 = env.storage().instance().get(&DataKey2::MaxRoundDuration).unwrap_or(u64::MAX);
+        let min_dur: u64 = env.storage().instance().get(&DataKey4::MinRoundDuration).unwrap_or(60);
+        let max_dur: u64 = env.storage().instance().get(&DataKey4::MaxRoundDuration).unwrap_or(u64::MAX);
         if new_duration_seconds < min_dur || new_duration_seconds > max_dur {
             panic_with_error!(&env, ExtError::RoundDurationOutOfBounds);
         }
@@ -3280,7 +3251,7 @@ impl AhjoorContract {
         let old_duration: u64 = env.storage().instance().get(&DataKey::RoundDuration).unwrap_or(0);
         let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
 
-        env.storage().instance().set(&DataKey2::PendingRoundDuration, &new_duration_seconds);
+        env.storage().instance().set(&DataKey4::PendingRoundDuration, &new_duration_seconds);
         events::emit_round_duration_update_scheduled(&env, old_duration, new_duration_seconds, current_round + 1);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
@@ -3292,8 +3263,8 @@ impl AhjoorContract {
         let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
         if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
         if min_seconds == 0 || min_seconds > max_seconds { panic_with_error!(&env, ExtError::InvalidAmount); }
-        env.storage().instance().set(&DataKey2::MinRoundDuration, &min_seconds);
-        env.storage().instance().set(&DataKey2::MaxRoundDuration, &max_seconds);
+        env.storage().instance().set(&DataKey4::MinRoundDuration, &min_seconds);
+        env.storage().instance().set(&DataKey4::MaxRoundDuration, &max_seconds);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
@@ -4287,9 +4258,9 @@ impl AhjoorContract {
             .set(&DataKey2::ReinvestPreference, &preferences);
 
         env.storage()
-             .instance()
-             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-     }
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
 
     pub fn get_reinvest_preference(env: Env, member: Address) -> bool {
         let preferences: Map<Address, bool> = env
@@ -4300,7 +4271,7 @@ impl AhjoorContract {
         preferences.get(member).unwrap_or(false)
     }
 
-     pub fn vote_on_proposal(env: Env, voter: Address, proposal_id: u32, vote_for: bool) {
+    pub fn vote_on_proposal(env: Env, voter: Address, proposal_id: u32, vote_for: bool) {
         internals::check_not_paused(&env);
         voter.require_auth();
 
@@ -7479,11 +7450,11 @@ impl AhjoorContract {
         let proposal_id: u32 = env
             .storage()
             .instance()
-            .get(&DataKey2::MergeProposalCounter)
+            .get(&DataKey4::MergeProposalCounter)
             .unwrap_or(0) + 1;
         env.storage()
             .instance()
-            .set(&DataKey2::MergeProposalCounter, &proposal_id);
+            .set(&DataKey4::MergeProposalCounter, &proposal_id);
 
         let proposal = MergeProposal {
             id: proposal_id,
@@ -7496,12 +7467,12 @@ impl AhjoorContract {
         let mut proposals: Map<u32, MergeProposal> = env
             .storage()
             .instance()
-            .get(&DataKey2::MergeProposals)
+            .get(&DataKey4::MergeProposals)
             .unwrap_or(Map::new(&env));
         proposals.set(proposal_id, proposal);
         env.storage()
             .instance()
-            .set(&DataKey2::MergeProposals, &proposals);
+            .set(&DataKey4::MergeProposals, &proposals);
 
         events::emit_merge_proposed(&env, proposal_id, admin, group_b_id);
 
@@ -7534,7 +7505,7 @@ impl AhjoorContract {
         let mut proposals: Map<u32, MergeProposal> = env
             .storage()
             .instance()
-            .get(&DataKey2::MergeProposals)
+            .get(&DataKey4::MergeProposals)
             .unwrap_or(Map::new(&env));
         let mut proposal = proposals.get(merge_proposal_id).expect("Merge proposal not found");
 
@@ -7546,7 +7517,7 @@ impl AhjoorContract {
         proposals.set(merge_proposal_id, proposal);
         env.storage()
             .instance()
-            .set(&DataKey2::MergeProposals, &proposals);
+            .set(&DataKey4::MergeProposals, &proposals);
 
         events::emit_merge_accepted(&env, merge_proposal_id);
 
@@ -7590,7 +7561,7 @@ impl AhjoorContract {
         let mut proposals: Map<u32, MergeProposal> = env
             .storage()
             .instance()
-            .get(&DataKey2::MergeProposals)
+            .get(&DataKey4::MergeProposals)
             .unwrap_or(Map::new(&env));
         let proposal = proposals.get(merge_proposal_id).expect("Merge proposal not found");
 
@@ -7648,13 +7619,13 @@ impl AhjoorContract {
             .set(&DataKey2::GroupStatus, &GroupStatus::Merged);
         env.storage()
             .instance()
-            .set(&DataKey2::GroupMergedInto, &proposal.group_b_id);
+            .set(&DataKey4::GroupMergedInto, &proposal.group_b_id);
 
         // Remove proposal so it cannot be replayed
         proposals.remove(merge_proposal_id);
         env.storage()
             .instance()
-            .set(&DataKey2::MergeProposals, &proposals);
+            .set(&DataKey4::MergeProposals, &proposals);
 
         events::emit_merge_completed(&env, merge_proposal_id, new_members.len() as u32);
         events::emit_group_marked_merged(&env, proposal.group_b_id);
@@ -7669,7 +7640,7 @@ impl AhjoorContract {
         let proposals: Map<u32, MergeProposal> = env
             .storage()
             .instance()
-            .get(&DataKey2::MergeProposals)
+            .get(&DataKey4::MergeProposals)
             .unwrap_or(Map::new(&env));
         proposals.get(proposal_id).expect("Merge proposal not found")
     }
@@ -7979,11 +7950,7 @@ impl AhjoorContract {
         }
 
         if auth.used_rounds >= auth.max_rounds {
-            proxy_auths.remove(key);
-            env.storage()
-                .instance()
-                .set(&DataKey3::ProxyAuthorizations, &proxy_auths);
-            panic_with_error!(&env, Error::NoDelegationFound);
+            panic_with_error!(&env, ExtError2::ProxyRoundsExhausted);
         }
 
         let approved_tokens: Vec<Address> = env
@@ -8184,14 +8151,15 @@ impl AhjoorContract {
         }
 
         auth.used_rounds += 1;
-        if auth.used_rounds >= auth.max_rounds {
-            proxy_auths.remove((group_id, member.clone()));
-        } else {
-            proxy_auths.set((group_id, member.clone()), auth);
-        }
+        let proxy_exhausted = auth.used_rounds >= auth.max_rounds;
+        let proxy_addr = auth.proxy.clone();
+        proxy_auths.set((group_id, member.clone()), auth);
         env.storage()
             .instance()
             .set(&DataKey3::ProxyAuthorizations, &proxy_auths);
+        if proxy_exhausted {
+            events::emit_proxy_expired(&env, group_id, member.clone(), proxy_addr, env.ledger().sequence() as u64);
+        }
 
         if !activation_emitted {
             events::emit_group_activated(&env, start_at);
@@ -8766,7 +8734,7 @@ impl AhjoorContract {
             .get(&DataKey::Members)
             .expect("Not initialized");
         if !members.contains(&member) {
-            panic!("Only members can vote");
+            panic_with_error!(&env, Error::NotAMember);
         }
 
         // Check if already voted
@@ -8791,9 +8759,15 @@ impl AhjoorContract {
             proposal.votes_against = proposal.votes_against.saturating_add(1);
         }
 
-        // Check for majority (> 50%)
-        let total_votes = proposal.votes_for + proposal.votes_against;
-        if total_votes > (members.len() as i128 / 2) {
+        // Require quorum from QuorumConfig[RuleChange] (default 51%)
+        let quorum_config: Map<ProposalType, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::QuorumConfig)
+            .unwrap_or(Map::new(&env));
+        let quorum_bps = quorum_config.get(ProposalType::RuleChange).unwrap_or(5_100);
+        let quorum_required = (members.len() as u32 * quorum_bps) / 10_000;
+        if proposal.votes_for >= quorum_required as i128 {
             proposal.confirmed = true;
             events::emit_treasury_round_confirmed(&env, round_index);
         }
@@ -8807,6 +8781,14 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the current state of a treasury round proposal (#408).
+    pub fn get_treasury_round_proposal(env: Env, round_index: u32) -> TreasuryRoundProposal {
+        env.storage()
+            .instance()
+            .get(&DataKey3::TreasuryRoundProposal(round_index))
+            .expect("Proposal not found")
     }
 
     /// Execute treasury payment with member vote approval (#314)

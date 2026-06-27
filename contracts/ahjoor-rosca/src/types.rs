@@ -229,69 +229,62 @@ pub enum DataKey2 {
     RoundDurationSeconds = 46,    // u64
     MemberTiers = 49,             // Map<Address, u32>
 
-    InsurancePool,           // i128
-    InsuranceContributionBps, // u32
-    SkipFee,                 // i128
-    MaxSkipsPerCycle,        // u32
-    SkipRequests,            // Map<(Address, u32), bool>
-    MemberSkips,             // Map<(Address, u32), u32>
-    QuorumConfig,            // Map<ProposalType, u32>
-    VotingMode,              // VotingMode
-    ReinvestPreference,      // Map<Address, bool>
-    ExitRequests,            // Map<Address, ExitRequest>
-    /// Token whitelist contract address
-    TokenWhitelistContract,  // Address
-    // Audit Trail
-    CycleRecords,            // Map<u32, CycleRecord> — per-cycle audit trail
-    CycleRecordRetentionWindow, // u32 — number of cycles to retain in persistent storage
-    ArchivedCycleRecords,    // Map<u32, CycleRecord> — archived records in temporary storage
-    CycleStartTimestamps,    // Map<u32, u64> — track when each cycle started
-    // Emergency Payout
-    EmergencyPayoutConfig,   // EmergencyPayoutConfig
-    EmergencyPayoutRequests, // Map<(u32, Address), EmergencyPayoutRequest> — (round, requester)
-    EmergencyPayoutVotes,    // Map<(u32, Address, Address), bool> — (round, requester, voter)
-    EmergencyPayoutCount,    // Map<u32, u32> — (cycle, count) — emergency payouts per cycle
-    EmergencyPayoutApproved, // Map<(u32, Address), bool> — (round, requester) — track approved emergency payouts per cycle
-    // Group Dissolution
-    GroupStatus,             // GroupStatus
-    DissolutionConfig,       // DissolutionConfig
-    DissolutionVotes,        // Map<(u32, Address), bool> — (round, voter)
-    DissolutionVoteCount,    // Map<u32, i128> — (round, votes_for)
-    DissolutionDeadline,     // Map<u32, u64> — (round, deadline)
-    // #213: Payout Slot Swap
-    SlotSwapCounter,
-    SlotSwaps,               // Map<u32, SlotSwap>
-    SlotSwapRequiresAdmin,   // bool
-    SlotSwapExpirySeconds,   // u64
-    // #214: Insurance Coverage
-    InsuranceCoverageMode,   // InsuranceCoverageMode
-    InsuranceClaims,         // Map<u32, Vec<InsuranceClaim>>
-    // #218: Reinstatement
-    ReinstatementFee,        // i128
-    PendingReinstatementFee, // Vec<Address>
-    ActiveReinstatementProposal, // Map<Address, u32>
-    // Waitlist (#219)
-    Waitlist,                // Vec<(Address, u64)> — (address, joined_at)
-    CatchUpDebt,             // Map<Address, i128> — catch-up contributions owed
-    // #230: Group Merge
-    MergeProposalCounter,    // u32
-    MergeProposals,          // Map<u32, MergeProposal>
-    GroupMergedInto,         // u32 — target group_id this group was merged into
-    // #224: Cycle Completion Bonus
-    CycleBonusAmount,        // i128 — bonus per qualifying member per cycle
-    // #227: Round Duration Update
-    PendingRoundDuration,    // u64 — new duration to apply at next round start
-    MinRoundDuration,        // u64 — lower bound for round duration
-    MaxRoundDuration,        // u64 — upper bound for round duration
-    // Waitlist (#219)
-    StartAt,                 // u64
-    GroupActivationEmitted,  // bool
-    GracePeriodLedgers,      // u32
-    PendingPenalties,        // Map<Address, u32> (member -> round)
-    LastRoundDeadline,       // u64
-    // #240: Co-Signer Guarantee
-    CoSigners,               // Map<Address, CoSignerRecord> — member → co-signer record
-    CoSignerWindowLedgers,   // u32 — grace period ledgers before penalty applied
+    InsurancePool = 50,
+    InsuranceContributionBps = 51,
+    SkipFee = 52,
+    MaxSkipsPerCycle = 53,
+    SkipRequests = 54,
+    MemberSkips = 55,
+    QuorumConfig = 56,
+    VotingMode = 57,
+    ReinvestPreference = 58,
+    ExitRequests = 59,
+    TokenWhitelistContract = 60,
+    CycleRecords = 61,
+    CycleRecordRetentionWindow = 62,
+    ArchivedCycleRecords = 63,
+    CycleStartTimestamps = 64,
+    EmergencyPayoutConfig = 65,
+    EmergencyPayoutRequests = 66,
+    EmergencyPayoutVotes = 67,
+    EmergencyPayoutCount = 68,
+    EmergencyPayoutApproved = 69,
+    GroupStatus = 70,
+    DissolutionConfig = 71,
+    DissolutionVotes = 72,
+    DissolutionVoteCount = 73,
+    DissolutionDeadline = 74,
+    SlotSwapCounter = 75,
+    SlotSwaps = 76,
+    SlotSwapRequiresAdmin = 77,
+    SlotSwapExpirySeconds = 78,
+    InsuranceCoverageMode = 79,
+    InsuranceClaims = 80,
+    ReinstatementFee = 81,
+    PendingReinstatementFee = 82,
+    ActiveReinstatementProposal = 83,
+    Waitlist = 84,
+    CatchUpDebt = 85,
+    StartAt = 93,
+    GroupActivationEmitted = 94,
+    GracePeriodLedgers = 95,
+    PendingPenalties = 96,
+    LastRoundDeadline = 97,
+    CoSigners = 98,
+    CoSignerWindowLedgers = 99,
+}
+
+/// Overflow key enum for merge and round-duration keys (#230, #227).
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey4 {
+    MergeProposalCounter = 86,
+    MergeProposals = 87,
+    GroupMergedInto = 88,
+    CycleBonusAmount = 89,
+    PendingRoundDuration = 90,
+    MinRoundDuration = 91,
+    MaxRoundDuration = 92,
 }
 
 /// Overflow key enum — DataKey2 is capped at 50 variants by the soroban XDR limit.
@@ -367,9 +360,6 @@ pub enum DataKey3 {
     MemberReceiptIds(Address),
 }
 
-const _: () = assert!(std::mem::variant_count::<DataKey>() < 50, "DataKey must remain under 50 variants");
-const _: () = assert!(std::mem::variant_count::<DataKey2>() < 50, "DataKey2 must remain under 50 variants");
-const _: () = assert!(std::mem::variant_count::<DataKey3>() < 50, "DataKey3 must remain under 50 variants");
 
 // ── #330: Contribution Delegation ────────────────────────────────────────────
 

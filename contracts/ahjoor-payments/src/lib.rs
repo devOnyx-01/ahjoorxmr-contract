@@ -212,6 +212,14 @@ pub enum Error {
     MerchantKYBExpired = 60,
 }
 
+/// Extension errors that overflow the 50-variant contracterror limit.
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtError {
+    /// Batch size exceeds the allowed cap or amount is out of range.
+    InvalidAmount = 71,
+}
+
 /// Per-merchant withdrawal rate limit config (#231).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2070,6 +2078,12 @@ impl AhjoorPaymentsContract {
         if !release_to_merchant {
             Self::inc_global_refunded(&env, &payment.token, payment.amount);
             Self::inc_merchant_refunded(&env, &payment.merchant, &payment.token, payment.amount);
+        }
+
+        if !release_to_merchant {
+            // Reverse loyalty points on customer-favoured resolution (#411)
+            let refund_amt = payment.amount - payment.refunded_amount.min(payment.amount);
+            Self::reverse_points_for_refund(&env, &payment.customer, refund_amt, payment.amount);
         }
 
         events::emit_dispute_resolved(&env, payment_id, release_to_merchant, admin);
@@ -4326,6 +4340,9 @@ impl AhjoorPaymentsContract {
             payment.status = PaymentStatus::Refunded;
         }
 
+        // Reverse proportional loyalty points on refund (#411)
+        Self::reverse_points_for_refund(&env, &payment.customer, refund_amount, payment.amount);
+
         // Update stats (#70) — count each partial refund call
         Self::inc_global_refunded(&env, &payment.token, refund_amount);
         Self::inc_merchant_refunded(&env, &payment.merchant, &payment.token, refund_amount);
@@ -5611,11 +5628,10 @@ impl AhjoorPaymentsContract {
         result
     }
 
-    /// Expire a batch of payments atomically. Admin only.
-    /// Each payment must be Pending, Disputed, or Authorized and past its expiry/capture deadline.
-    /// If any payment is ineligible the entire batch reverts.
-    /// Batch size capped at MAX_SETTLEMENT_BATCH_SIZE (50).
-    pub fn bulk_expire_payments(env: Env, admin: Address, payment_ids: Vec<u32>) {
+    /// Expire a batch of payments. Admin only. Cap: 20 IDs.
+    /// Already-expired or ineligible IDs are skipped and returned.
+    /// Emits PaymentExpired per successfully expired payment and BulkExpireCompleted at end.
+    pub fn bulk_expire_payments(env: Env, admin: Address, payment_ids: Vec<u32>) -> Vec<u32> {
         Self::require_not_paused(&env);
         admin.require_auth();
         let stored_admin: Address = env
@@ -5627,70 +5643,48 @@ impl AhjoorPaymentsContract {
             panic!("Only admin can bulk expire payments");
         }
 
-        let batch_size = payment_ids.len();
-        if batch_size == 0 {
-            panic!("Batch cannot be empty");
-        }
-        if batch_size > MAX_SETTLEMENT_BATCH_SIZE {
-            panic!("Batch size exceeds maximum allowed");
+        if payment_ids.len() > 20 {
+            panic_with_error!(&env, ExtError::InvalidAmount);
         }
 
         let now = env.ledger().timestamp();
         let now_ledger = env.ledger().sequence() as u64;
-
-        // Pass 1: validate all — any failure reverts the entire batch atomically
-        for payment_id in payment_ids.iter() {
-            let payment: Payment = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Payment(payment_id))
-                .expect("Payment not found");
-
-            if payment.status != PaymentStatus::Pending
-                && payment.status != PaymentStatus::Disputed
-                && payment.status != PaymentStatus::Authorized
-            {
-                panic!("Payment is not in Pending, Disputed, or Authorized status");
-            }
-            if payment.status == PaymentStatus::Authorized {
-                if payment.capture_deadline == 0 || now_ledger <= payment.capture_deadline {
-                    panic!("Payment has not expired yet");
-                }
-            } else {
-                let deadline = payment.expires_at;
-                if deadline == 0 || now < deadline {
-                    panic!("Payment has not expired yet");
-                }
-            }
-        }
-
-        // Pass 2: process all refunds
+        let mut skipped: Vec<u32> = Vec::new(&env);
         let mut refund_total: i128 = 0;
+        let mut expired_count: u32 = 0;
+
         for payment_id in payment_ids.iter() {
-            let mut payment: Payment = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Payment(payment_id))
-                .expect("Payment not found");
+            let entry: Option<Payment> = env.storage().persistent().get(&DataKey::Payment(payment_id));
+            let Some(mut payment) = entry else {
+                skipped.push_back(payment_id);
+                continue;
+            };
+
+            let eligible = match payment.status {
+                PaymentStatus::Authorized => {
+                    payment.capture_deadline > 0 && now_ledger > payment.capture_deadline
+                }
+                PaymentStatus::Pending | PaymentStatus::Disputed => {
+                    payment.expires_at > 0 && now >= payment.expires_at
+                }
+                _ => false,
+            };
+
+            if !eligible {
+                skipped.push_back(payment_id);
+                continue;
+            }
 
             let refund_amount = payment.amount - payment.refunded_amount;
             if refund_amount > 0 {
-                let client = token::Client::new(&env, &payment.token);
-                client.transfer(
-                    &env.current_contract_address(),
-                    &payment.customer,
-                    &refund_amount,
-                );
-                refund_total = refund_total
-                    .checked_add(refund_amount)
-                    .expect("Refund total overflow");
+                let token_client = token::Client::new(&env, &payment.token);
+                token_client.transfer(&env.current_contract_address(), &payment.customer, &refund_amount);
+                refund_total = refund_total.checked_add(refund_amount).expect("overflow");
             }
 
             let old_status = payment.status;
             payment.status = PaymentStatus::Expired;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Payment(payment_id), &payment);
+            env.storage().persistent().set(&DataKey::Payment(payment_id), &payment);
             env.storage().persistent().extend_ttl(
                 &DataKey::Payment(payment_id),
                 PERSISTENT_LIFETIME_THRESHOLD,
@@ -5698,25 +5692,14 @@ impl AhjoorPaymentsContract {
             );
 
             Self::inc_global_expired(&env);
-            events::emit_payment_expired(
-                &env,
-                payment_id,
-                payment.customer.clone(),
-                refund_amount,
-                now,
-            );
-            events::emit_payment_status_changed(
-                &env,
-                payment_id,
-                old_status,
-                PaymentStatus::Expired,
-            );
+            events::emit_payment_expired(&env, payment_id, payment.customer.clone(), refund_amount, now);
+            events::emit_payment_status_changed(&env, payment_id, old_status, PaymentStatus::Expired);
+            expired_count += 1;
         }
 
-        events::emit_bulk_expire_completed(&env, batch_size, refund_total);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_bulk_expire_completed(&env, expired_count, refund_total);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        skipped
     }
 
     pub fn pause_contract(env: Env, admin: Address, reason: String) {
@@ -8387,6 +8370,44 @@ impl AhjoorPaymentsContract {
             .persistent()
             .get(&DataKey2::LoyaltyBalance(customer))
             .unwrap_or(0)
+    }
+
+    /// Internal: reverse loyalty points proportionally on refund (#411).
+    fn reverse_points_for_refund(env: &Env, customer: &Address, refund_amount: i128, original_amount: i128) {
+        if original_amount <= 0 || refund_amount <= 0 {
+            return;
+        }
+        let points_per_unit: u32 = match env.storage().instance().get(&DataKey2::LoyaltyPointsPerUnit) {
+            Some(v) => v,
+            None => return,
+        };
+        if points_per_unit == 0 {
+            return;
+        }
+        let points_earned = original_amount * points_per_unit as i128 / 1_000_000;
+        if points_earned <= 0 {
+            return;
+        }
+        let points_to_reverse = (refund_amount * points_earned) / original_amount;
+        if points_to_reverse <= 0 {
+            return;
+        }
+        let balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::LoyaltyBalance(customer.clone()))
+            .unwrap_or(0);
+        let new_balance = (balance - points_to_reverse).max(0);
+        let reversed = balance - new_balance;
+        env.storage().persistent().set(&DataKey2::LoyaltyBalance(customer.clone()), &new_balance);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::LoyaltyBalance(customer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        if reversed > 0 {
+            events::emit_points_expired(env, customer.clone(), reversed);
+        }
     }
 
     /// Internal: mint points to customer after a completed payment.
