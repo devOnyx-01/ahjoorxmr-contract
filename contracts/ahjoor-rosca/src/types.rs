@@ -287,6 +287,16 @@ pub enum DataKey4 {
     MaxRoundDuration = 92,
 }
 
+/// Waitlist ordering mode (#456).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum WaitlistMode {
+    /// First-in-first-out; earliest `joined_at` is promoted first (default).
+    Fifo = 0,
+    /// Highest `PersistentKey::ReputationScores` candidate is promoted first.
+    ReputationWeighted = 1,
+}
+
 /// Overflow key enum — DataKey2 is capped at 50 variants by the soroban XDR limit.
 #[derive(Clone)]
 #[contracttype]
@@ -358,6 +368,8 @@ pub enum DataKey3 {
     ContributionReceiptCounter,
     ContributionReceipt(u32),
     MemberReceiptIds(Address),
+    // #456: Waitlist priority ordering mode
+    WaitlistPriorityMode,       // WaitlistMode — settable by admin
 }
 
 
@@ -417,6 +429,8 @@ pub enum PersistentKey {
     MemberCreditScores,        // Map<Address, MemberScore> — per-member credit score (#269)
     /// #364: Point-in-time cycle snapshot keyed by cycle number
     CycleSnapshot(u32),        // cycle_number → CycleSnapshotData
+    /// #457: Ledger at which a member's credit score was last updated (cross-contract oracle)
+    CreditScoreUpdatedAt(Address), // u32 — ledger sequence of last credit score update
 }
 
 /// #364: Immutable point-in-time snapshot of group state at cycle end.

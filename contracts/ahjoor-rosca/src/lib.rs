@@ -7344,6 +7344,36 @@ impl AhjoorContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// #456: Admin sets the waitlist priority ordering mode.
+    /// `Fifo` retains the default FIFO behaviour; `ReputationWeighted` promotes the
+    /// highest-score waitlist candidate first on the next `enroll_from_waitlist` call.
+    pub fn set_waitlist_priority_mode(env: Env, admin: Address, mode: WaitlistMode) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set waitlist priority mode");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::WaitlistPriorityMode, &mode);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// #456: Get the current waitlist priority ordering mode.
+    pub fn get_waitlist_priority_mode(env: Env) -> WaitlistMode {
+        env.storage()
+            .instance()
+            .get(&DataKey3::WaitlistPriorityMode)
+            .unwrap_or(WaitlistMode::Fifo)
+    }
+
     /// Internal: promote the first waitlisted address to fill a vacancy left by `vacated_by`.
     /// Records the catch-up contribution debt; the new member must call `pay_catch_up_contribution`.
     /// #352: Recalculate per-member contribution amount from the immutable base pool target.
@@ -7409,13 +7439,73 @@ impl AhjoorContract {
             return;
         }
 
-        let (new_member, _) = waitlist.get(0).unwrap();
+        // #456: Select candidate based on waitlist priority mode
+        let mode: WaitlistMode = env
+            .storage()
+            .instance()
+            .get(&DataKey3::WaitlistPriorityMode)
+            .unwrap_or(WaitlistMode::Fifo);
 
-        // Remove from waitlist
+        let new_member: Address = match mode {
+            WaitlistMode::Fifo => {
+                // Existing FIFO: earliest joined_at (position 0)
+                let (addr, _) = waitlist.get(0).unwrap();
+                addr
+            }
+            WaitlistMode::ReputationWeighted => {
+                // Select the waitlist member with the highest reputation score
+                let rep_scores: Map<Address, i128> = env
+                    .storage()
+                    .persistent()
+                    .get(&PersistentKey::ReputationScores)
+                    .unwrap_or(Map::new(env));
+
+                let mut best_addr = {
+                    let (addr, _) = waitlist.get(0).unwrap();
+                    addr
+                };
+                let mut best_score: i128 = rep_scores.get(best_addr.clone()).unwrap_or(0);
+
+                for i in 1..waitlist.len() {
+                    let (addr, _) = waitlist.get(i).unwrap();
+                    let score = rep_scores.get(addr.clone()).unwrap_or(0);
+                    if score > best_score {
+                        best_score = score;
+                        best_addr = addr;
+                    }
+                }
+                best_addr
+            }
+        };
+
+        // Remove the selected member from the waitlist (may not be index 0 in reputation mode)
         let mut new_waitlist: Vec<(Address, u64)> = Vec::new(&env);
-        for i in 1..waitlist.len() {
-            new_waitlist.push_back(waitlist.get(i).unwrap());
+        let mut removed = false;
+        for i in 0..waitlist.len() {
+            let entry = waitlist.get(i).unwrap();
+            if !removed && entry.0 == new_member {
+                removed = true;
+            } else {
+                new_waitlist.push_back(entry);
+            }
         }
+
+        // Emit WaitlistUpdated with a hash of the new order for traceability (#456)
+        let order_hash: BytesN<32> = env
+            .crypto()
+            .sha256(&{
+                let mut buf = Bytes::new(env);
+                for i in 0..new_waitlist.len() {
+                    buf.append(&new_waitlist.get(i).unwrap().0.clone().to_xdr(env));
+                }
+                buf
+            })
+            .into();
+        env.events().publish(
+            (Symbol::new(env, "WaitlistUpdated"),),
+            (order_hash,),
+        );
+
         env.storage().instance().set(&DataKey2::Waitlist, &new_waitlist);
 
         // Add to members
@@ -8748,6 +8838,30 @@ impl AhjoorContract {
         })
     }
 
+    /// #457: Cross-contract credit score oracle.
+    /// Returns `(score, last_updated_ledger)` for external lending / DeFi protocols.
+    /// Members with no history return `(0, 0)`.
+    pub fn get_credit_score_oracle(env: Env, member: Address) -> (i128, u32) {
+        let scores: Map<Address, MemberScore> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::MemberCreditScores)
+            .unwrap_or(Map::new(&env));
+
+        let score = scores
+            .get(member.clone())
+            .map(|ms| ms.score)
+            .unwrap_or(0);
+
+        let last_updated: u32 = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::CreditScoreUpdatedAt(member))
+            .unwrap_or(0);
+
+        (score, last_updated)
+    }
+
     /// Enable group treasury for collective purchases (#314)
     pub fn enable_group_treasury(env: Env, admin: Address, treasury_admin: Address) {
         admin.require_auth();
@@ -9009,6 +9123,16 @@ impl AhjoorContract {
         );
 
         if old_score != ms.score {
+            // #457: Track ledger at which credit score last changed for cross-contract oracle
+            let current_ledger = env.ledger().sequence();
+            env.storage()
+                .persistent()
+                .set(&PersistentKey::CreditScoreUpdatedAt(member.clone()), &current_ledger);
+            env.storage().persistent().extend_ttl(
+                &PersistentKey::CreditScoreUpdatedAt(member.clone()),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
             events::emit_credit_score_updated(env, member.clone(), old_score, ms.score, reason);
         }
     }
