@@ -113,6 +113,31 @@ Ahjoor's smart contracts handle:
 - **Automated Payouts**: Scheduled recipients claim the full pot when their round is due
 - **Round Progression**: Time-based round advancement using Stellar ledger timestamps
 
+## Token Whitelist
+
+The `ahjoor-token-whitelist` contract (`contracts/ahjoor-token-whitelist`) restricts which tokens can be used across Ahjoor ROSCA, Escrow, and Payment groups. When a group contract is configured with a whitelist contract address, token operations are rejected unless the token is allowed.
+
+### Who controls it
+
+Only the contract **admin** can modify the whitelist. The admin is set once at deployment via `initialize(admin)`. All write operations require the admin address to authorize the transaction.
+
+### Key functions
+
+| Function | Description |
+| --- | --- |
+| `add_token(admin, token)` | Add a token contract address to the global whitelist. |
+| `remove_token(admin, token)` | Remove a token from the global whitelist. |
+| `is_whitelisted(token) → bool` | Return whether a token is on the global whitelist (read-only). |
+
+### Example CLI call
+
+```bash
+stellar contract invoke \
+  --id <WHITELIST_CONTRACT_ID> \
+  --network testnet \
+  -- is_whitelisted --token <TOKEN_ADDRESS>
+```
+
 ## State Archival & TTL
 
 Stellar/Soroban utilizes State Archival to manage network storage footprint. Idle contracts and data entries will eventually be archived. Ahjoor handles state preservation automatically when members interact with it (e.g. `init` or `contribute`). However, if the contract goes unused for a long period, participants should occasionally call the `bump_storage()` function to manually extend the time-to-live (TTL) of the contract's instance storage and avoid sudden state archival.
