@@ -103,6 +103,29 @@ cargo check --all
 make lint
 ```
 
+### Deploy to Testnet
+
+```bash
+# Fund a testnet account
+stellar keys generate --global alice --network testnet
+stellar keys fund alice --network testnet
+
+# Deploy the contract
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/ahjoor_rosca.wasm \
+  --source alice \
+  --network testnet
+
+# Verify deployment
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source alice \
+  --network testnet \
+  -- get_fee_bps
+```
+
+> **Note:** The `deploy` command prints a `CONTRACT_ID` — save it immediately, as you'll need it for all subsequent `stellar contract invoke` calls.
+
 ## Architecture
 
 Ahjoor's smart contracts handle:
