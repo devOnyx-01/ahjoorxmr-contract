@@ -2,7 +2,7 @@
 use super::*;
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::token::StellarAssetClient as TokenAdminClient;
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, Vec};
+use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, Map, Vec};
 
 fn setup_waitlist<'a>() -> (Env, AhjoorContractClient<'a>, Address, Address, Vec<Address>, TokenClient<'a>, TokenAdminClient<'a>) {
     let env = Env::default();
@@ -209,5 +209,72 @@ fn test_waitlist_cap_enforced() {
 
     // Verify the waitlist length hasn't changed
     assert_eq!(client.get_waitlist().len(), 10, "waitlist must not grow beyond max_members");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #456: test_waitlist_reputation_weighted_enrollment
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_waitlist_reputation_weighted_enrollment() {
+    let (env, client, admin, _token_addr, members, _token_client, token_admin_client) = setup_waitlist();
+
+    // Default mode is FIFO
+    assert_eq!(client.get_waitlist_priority_mode(), WaitlistMode::Fifo);
+
+    // Switch to reputation-weighted mode
+    client.set_waitlist_priority_mode(&admin, &WaitlistMode::ReputationWeighted);
+    assert_eq!(client.get_waitlist_priority_mode(), WaitlistMode::ReputationWeighted);
+
+    // Create two waitlist candidates
+    let low_rep  = Address::generate(&env);
+    let high_rep = Address::generate(&env);
+    token_admin_client.mint(&low_rep,  &10_000);
+    token_admin_client.mint(&high_rep, &10_000);
+
+    // Join waitlist: low_rep joins first (would win under FIFO)
+    client.join_waitlist(&low_rep);
+    client.join_waitlist(&high_rep);
+
+    // Seed reputation scores directly via env.as_contract so we can
+    // control which candidate appears "high reputation" without needing
+    // to run full rounds.  high_rep = 100, low_rep = 10.
+    env.as_contract(&client.address, || {
+        let mut scores: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::ReputationScores)
+            .unwrap_or(Map::new(&env));
+        scores.set(high_rep.clone(), 100i128);
+        scores.set(low_rep.clone(), 10i128);
+        env.storage()
+            .persistent()
+            .set(&PersistentKey::ReputationScores, &scores);
+    });
+
+    assert_eq!(client.get_reputation_score(&high_rep), 100);
+    assert_eq!(client.get_reputation_score(&low_rep), 10);
+
+    // Trigger a vacancy by having member 0 exit
+    let exiting = members.get(0).unwrap();
+    client.request_emergency_exit(&exiting);
+    client.approve_exit(&exiting);
+
+    // In ReputationWeighted mode, high_rep (score=100) is enrolled, not low_rep (score=10)
+    let new_members = client.get_group_info().members;
+    assert!(
+        new_members.contains(&high_rep),
+        "high-reputation candidate must be enrolled first in ReputationWeighted mode"
+    );
+    assert!(
+        !new_members.contains(&low_rep),
+        "low-reputation candidate must remain on waitlist"
+    );
+
+    // low_rep should still be on the waitlist
+    let remaining_waitlist = client.get_waitlist();
+    assert_eq!(remaining_waitlist.len(), 1);
+    let (remaining_addr, _) = remaining_waitlist.get(0).unwrap();
+    assert_eq!(remaining_addr, low_rep);
 }
 

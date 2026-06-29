@@ -1061,6 +1061,102 @@ fn test_round_reset_clears_contributions() {
     client.contribute(&m2, &token_admin, &100);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #457: test_credit_score_oracle_readable_cross_contract
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_credit_score_oracle_readable_cross_contract() {
+    let (env, client, admin, token_admin, _token_client, token_admin_client, members) =
+        setup_with_members(2, 1000);
+
+    let m1 = members.get(0).unwrap();
+    let m2 = members.get(1).unwrap();
+
+    client.init(
+        &admin,
+        &members,
+        &100,
+        &token_admin,
+        &3600,
+        &RoscaConfig {
+            strategy: PayoutStrategy::RoundRobin,
+            custom_order: None,
+            penalty_amount: 0,
+            exit_penalty_bps: 0,
+            collective_goal: None,
+            member_goals: None,
+            fee_bps: 0,
+            fee_recipient: None,
+            max_defaults: 3,
+            grace_period_ledgers: 0,
+            use_timestamp_schedule: false,
+            round_duration_seconds: 0,
+            max_members: None,
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,
+            late_fee_bps: 0,
+            grace_period_seconds: 0,
+            auction_enabled: false,
+            auction_window_ledgers: 0,
+            randomize_payout_order: false,
+            reserve_enabled: false,
+            reserve_contribution_bps: 0,
+        },
+        &None,
+    );
+
+    // 1. Members with no score history return (0, 0)
+    let (score_before, ledger_before) = client.get_credit_score_oracle(&m1);
+    assert_eq!(score_before, 0);
+    assert_eq!(ledger_before, 0);
+
+    // 2. Both members contribute on time (earns +10 credit score each)
+    env.ledger().set_timestamp(100);
+    client.contribute(&m1, &token_admin, &100);
+    client.contribute(&m2, &token_admin, &100);
+
+    // After on-time contribution the credit score should be updated
+    let score_m1 = client.get_credit_score(&m1).score;
+    assert_eq!(score_m1, 10);
+
+    // get_credit_score_oracle must reflect the same score
+    let (oracle_score, oracle_ledger) = client.get_credit_score_oracle(&m1);
+    assert_eq!(oracle_score, 10);
+    // last_updated_ledger must be non-zero
+    assert!(oracle_ledger > 0, "last_updated_ledger must be set after a score change");
+
+    // 3. A second round: advance ledger then contribute again
+    let ledger_after_first = oracle_ledger;
+    env.ledger().with_mut(|l| l.sequence_number += 10);
+    env.ledger().set_timestamp(4000);
+    client.close_round();
+
+    env.ledger().set_timestamp(4100);
+    client.contribute(&m1, &token_admin, &100);
+    client.contribute(&m2, &token_admin, &100);
+
+    let (oracle_score_2, oracle_ledger_2) = client.get_credit_score_oracle(&m1);
+    assert_eq!(oracle_score_2, 20);
+    assert!(
+        oracle_ledger_2 > ledger_after_first,
+        "last_updated_ledger must advance with each score update"
+    );
+
+    // 4. m2 score must be independent of m1
+    let (oracle_score_m2, _) = client.get_credit_score_oracle(&m2);
+    assert_eq!(oracle_score_m2, 20);
+
+    // 5. A member with no interactions returns (0, 0)
+    let unknown = Address::generate(&env);
+    let (unknown_score, unknown_ledger) = client.get_credit_score_oracle(&unknown);
+    assert_eq!(unknown_score, 0);
+    assert_eq!(unknown_ledger, 0);
+
+    let _ = token_admin_client;
+}
+
 
 
 
