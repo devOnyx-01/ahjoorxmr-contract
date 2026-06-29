@@ -125,6 +125,32 @@ Stellar/Soroban utilizes State Archival to manage network storage footprint. Idl
 - **Token Standard**: SEP-41 / Stellar Asset Contract (XLM or any compatible token)
 - **Testing**: Soroban test utilities
 
+## FAQ
+
+**Q: What happens if I miss a contribution round?**
+
+A: You receive a penalty. After `max_defaults` consecutive missed rounds you are suspended from the group.
+
+**Q: Can I pay my contribution in parts?**
+
+A: Yes. The contract supports partial installments — contribute any amount up to the remaining balance and the round tracks your cumulative total.
+
+**Q: What tokens are accepted?**
+
+A: Only tokens on the admin-controlled whitelist (`ahjoor-token-whitelist`). XLM and any SEP-41 compatible token can be whitelisted.
+
+**Q: What is the maximum protocol fee?**
+
+A: 5% (500 basis points), hard-capped and enforced on-chain. Admins cannot set a higher fee.
+
+**Q: What happens if a dispute arbiter goes inactive?**
+
+A: After the configured timeout (default 7 days), anyone can call `enforce_dispute_timeout(escrow_id)` to release funds to the pre-configured default winner.
+
+**Q: How do I prevent my contract state from being archived?**
+
+A: Call `bump_storage()` periodically (recommended every ~30 days of inactivity). If archival does occur, state can be restored via `stellar contract restore`.
+
 ## Resources
 
 - [Stellar Documentation](https://developers.stellar.org/)
