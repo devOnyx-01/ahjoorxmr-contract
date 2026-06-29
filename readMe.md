@@ -113,6 +113,37 @@ Ahjoor's smart contracts handle:
 - **Automated Payouts**: Scheduled recipients claim the full pot when their round is due
 - **Round Progression**: Time-based round advancement using Stellar ledger timestamps
 
+## Security Model
+
+Ahjoor's contracts are designed with defense-in-depth across every interaction:
+
+### Access Control
+- Every state-mutating function requires the caller to sign with their Stellar keypair via `require_auth()`. Unauthorized callers are rejected at the SDK level before any logic executes.
+- Role-based checks (buyer, seller, arbiter, inspector) are enforced per-function so that, for example, only the designated arbiter can resolve a dispute and only the buyer can release funds.
+
+### Fund Custody
+- Funds are held exclusively by the deployed contract address — never by an EOA. Token transfers only occur through explicit, permissioned entry-points (`release`, `refund`, `resolve_dispute`).
+- Multi-party seller payouts are split in basis-points (BPS), ensuring the sum always equals 10 000 before any transfer is executed.
+
+### Dispute & Arbitration
+- Disputes freeze the escrow, preventing unilateral fund movement by either party.
+- A configurable `dispute_timeout_seconds` ensures that an unresponsive arbiter cannot lock funds indefinitely: after the timeout the configured default winner (buyer or seller) can claim.
+- The cooling-off window after an arbiter verdict gives the losing party a defined period to review before finalisation.
+
+### Collateral & Slashing
+- Optional seller collateral (configured in BPS at creation) is locked until dispute resolution. On a buyer-favour ruling, a configurable `collateral_forfeit_bps` share is slashed as a penalty, deterring bad-faith sellers.
+- An `UnderCollateralized` status blocks release if the collateral value drops below the required ratio, protecting buyers in volatile markets.
+
+### Token Whitelist
+- All contracts integrate with the `ahjoor-token-whitelist` contract. Only explicitly whitelisted SEP-41 tokens are accepted, preventing interactions with malicious or spoofed token contracts.
+
+### Replay & Overflow Protection
+- The Soroban runtime enforces transaction uniqueness; replayed invocations are rejected at the ledger level.
+- Rust's `overflow-checks = true` release profile setting (see `Cargo.toml`) causes any arithmetic overflow to panic rather than wrap silently.
+
+### State Archival Safety
+- TTL bump logic is called on every write path so that active contract state is never silently archived mid-operation. Callers can also invoke `bump_storage()` manually to extend TTL during periods of low activity.
+
 ## State Archival & TTL
 
 Stellar/Soroban utilizes State Archival to manage network storage footprint. Idle contracts and data entries will eventually be archived. Ahjoor handles state preservation automatically when members interact with it (e.g. `init` or `contribute`). However, if the contract goes unused for a long period, participants should occasionally call the `bump_storage()` function to manually extend the time-to-live (TTL) of the contract's instance storage and avoid sudden state archival.
