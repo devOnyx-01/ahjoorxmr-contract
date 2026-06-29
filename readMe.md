@@ -105,13 +105,31 @@ make lint
 
 ## Architecture
 
-Ahjoor's smart contracts handle:
+Ahjoor is composed of five Soroban smart contracts. The diagram below shows how users, admins, and contracts relate to each other.
 
-- **Group Management**: Create and manage multiple independent ROSCA groups
-- **Access Control**: Only pre-registered participants can contribute to a group
-- **Contribution Tracking**: Immutable record of who has paid each round
-- **Automated Payouts**: Scheduled recipients claim the full pot when their round is due
-- **Round Progression**: Time-based round advancement using Stellar ledger timestamps
+```mermaid
+graph TD
+    User --> ROSCA[ahjoor-rosca\nGroup savings rounds]
+    User --> Escrow[ahjoor-escrow\nEscrow with dispute/arbiter]
+    User --> Payments[ahjoor-payments\nTwo-step auth + capture]
+    User --> Refund[ahjoor-refund\nRefund handling]
+    Admin --> Whitelist[ahjoor-token-whitelist\nControls allowed tokens]
+    Whitelist --> ROSCA
+    Whitelist --> Escrow
+    Whitelist --> Payments
+```
+
+### Contract Responsibilities
+
+| Contract                   | Role                                                                           |
+| -------------------------- | ------------------------------------------------------------------------------ |
+| **ahjoor-rosca**           | Manages rotating savings groups — round lifecycle, contributions, and payouts  |
+| **ahjoor-escrow**          | Holds funds in escrow with optional arbiter and dispute/timeout resolution     |
+| **ahjoor-payments**        | Two-step authorization and capture flow for merchant-style payments            |
+| **ahjoor-refund**          | Handles refund issuance and claim logic for cancelled or reversed transactions |
+| **ahjoor-token-whitelist** | Admin-controlled registry of tokens permitted across all other contracts       |
+
+The token whitelist sits at the foundation — `ahjoor-rosca`, `ahjoor-escrow`, and `ahjoor-payments` each consult it before accepting any token transfer, giving admins a single control point for token policy across the platform.
 
 ## State Archival & TTL
 
@@ -131,6 +149,6 @@ Stellar/Soroban utilizes State Archival to manage network storage footprint. Idl
 - [Soroban Smart Contracts](https://soroban.stellar.org/)
 - [Stellar CLI Reference](https://developers.stellar.org/docs/tools/developer-tools)
 
-  ## Community
+    ## Community
 
 - [Telegram Group Chat](https://t.me/ahjoor)
