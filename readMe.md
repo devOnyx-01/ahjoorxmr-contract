@@ -12,6 +12,15 @@ ROSCAs are one of the oldest and most widely used savings systems in the world, 
 - **Cost-Effective**: Built on Stellar's efficient, low-fee blockchain infrastructure
 - **Scalable**: Designed to support many groups running simultaneously
 
+## Glossary
+
+- **ROSCA** – Rotating Savings and Credit Association: a group where members pool fixed amounts each cycle and one member receives the full pot per round.
+- **Ajo** – Nigerian (Yoruba) term for a community savings circle
+- **Esusu** – West African community savings circle
+- **Susu** – Caribbean / West African savings circle variant
+- **Tanda** – Latin American ROSCA
+- **Chit Fund** – South Asian, often formalized and legally regulated ROSCA
+
 ## Use Cases
 
 - Community savings circles (Ajo, Esusu, Susu, Tanda, Chit Funds)
