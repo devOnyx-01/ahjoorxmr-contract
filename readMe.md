@@ -269,4 +269,5 @@ A: Call `bump_storage()` periodically (recommended every ~30 days of inactivity)
 
 ## Documentation
 
+- [Payments Authorization and Capture Flow](docs/payments-flow.md) - lifecycle guide for `authorize_payment`, `capture_payment`, missed capture expiry, and related events.
 - [Contract Error Codes](docs/errors.md) — consolidated reference of every numeric `#[contracterror]` code exposed by the Ahjoor contracts.
