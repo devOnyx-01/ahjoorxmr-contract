@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN, Env, Map, String, Symbol, Vec};
 use ahjoor_token_whitelist::TokenWhitelistClient;
 
 // --- Storage TTL Constants ---
@@ -477,6 +477,8 @@ pub enum DataKey2 {
     MultiBuyerReleaseApprovals(u32),
     /// Set to true once add_allowed_token is called; activates internal token allowlist enforcement.
     AllowlistActivated,
+    /// #??: Accumulated protocol fees awaiting admin withdrawal, keyed by token address
+    AccruedFees(Address),
 }
 
 /// #357: On-chain reputation record for an inspector.
@@ -1804,6 +1806,8 @@ impl AhjoorEscrowContract {
             if env.ledger().timestamp() < veto_ts + cooldown {
                 panic!("SellerVetoActive: admin must override_seller_veto before release");
             }
+        }
+
         // #366: Block release if seller has raised an active veto
         let veto_ts: Option<u64> = env
             .storage()
@@ -2779,17 +2783,17 @@ impl AhjoorEscrowContract {
         let protocol_fee = (escrow.amount * fee_bps as i128) / 10_000;
 
         if protocol_fee > 0 {
-            let fee_recipient: Address = env
+            let token = escrow.token.clone();
+            let mut accrued: i128 = env
                 .storage()
                 .instance()
-                .get(&DataKey::FeeRecipient)
-                .expect("FeeRecipient not set");
-            client.transfer(
-                &env.current_contract_address(),
-                &fee_recipient,
-                &protocol_fee,
-            );
-            events::emit_protocol_fee_paid(env, escrow_id, protocol_fee, fee_recipient);
+                .get(&DataKey2::AccruedFees(token.clone()))
+                .unwrap_or(0);
+            accrued = accrued.checked_add(protocol_fee).expect("AccruedFees overflow");
+            env.storage()
+                .instance()
+                .set(&DataKey2::AccruedFees(token.clone()), &accrued);
+            events::emit_protocol_fee_paid(env, escrow_id, protocol_fee, env.current_contract_address());
             Self::record_bounty_disbursement(env, escrow_id, protocol_fee);
         }
 
@@ -3423,6 +3427,36 @@ impl AhjoorEscrowContract {
             .unwrap_or(0);
         let fee_recipient: Option<Address> = env.storage().instance().get(&DataKey::FeeRecipient);
         (fee_bps, fee_recipient)
+    }
+
+    /// Withdraw accumulated protocol fees for a given token. Admin only.
+    /// Emits a FeesWithdrawn event on success.
+    /// Panics if amount is zero, exceeds the accrued balance, or caller is not admin.
+    pub fn withdraw_fees(env: Env, admin: Address, amount: i128, token: Address, destination: Address) {
+        Self::require_admin(&env, &admin);
+        if amount <= 0 {
+            panic!("Withdrawal amount must be positive");
+        }
+        let key = DataKey2::AccruedFees(token.clone());
+        let mut accrued: i128 = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(0);
+        if amount > accrued {
+            panic!("Insufficient accrued fees");
+        }
+        accrued = accrued.checked_sub(amount).expect("AccruedFees underflow");
+        if accrued == 0 {
+            env.storage().instance().remove(&key);
+        } else {
+            env.storage()
+                .instance()
+                .set(&key, &accrued);
+        }
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &destination, &amount);
+        events::emit_fees_withdrawn(&env, amount, destination);
     }
 
     /// Anyone may trigger release when the escrow's oracle condition is met.
@@ -7958,7 +7992,7 @@ impl AhjoorEscrowContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_veto_overridden(&env, escrow_id, admin, now);
+        events::emit_veto_overridden(&env, escrow_id, admin.clone(), now);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -8044,44 +8078,7 @@ impl AhjoorEscrowContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
-    /// Seller raises a veto that blocks fund release from an active escrow.
-    /// Records the veto timestamp for the override window calculation.
-    pub fn raise_seller_veto(env: Env, seller: Address, escrow_id: u32) {
-        Self::require_not_paused(&env);
-        seller.require_auth();
-        let escrow: Escrow = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow(escrow_id))
-            .expect("Escrow not found");
-        if escrow.seller != seller {
-            panic!("Only the escrow seller can raise a veto");
-        }
-        if !Self::is_open_escrow_status(escrow.status) {
-            panic!("Escrow is not active");
-        }
-        if env
-            .storage()
-            .persistent()
-            .get::<_, u64>(&DataKey2::VetoTimestamp(escrow_id))
-            .is_some()
-        {
-            panic!("SellerVetoAlreadyRaised");
-        }
-        let now = env.ledger().timestamp();
-        env.storage()
-            .persistent()
-            .set(&DataKey2::VetoTimestamp(escrow_id), &now);
-        env.storage().persistent().extend_ttl(
-            &DataKey2::VetoTimestamp(escrow_id),
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        events::emit_seller_veto_raised(&env, escrow_id, seller, now);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
+
 
     /// Seller cancels their veto before the override window elapses, restoring normal flow.
     pub fn cancel_seller_veto(env: Env, seller: Address, escrow_id: u32) {
@@ -8180,7 +8177,7 @@ impl AhjoorEscrowContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        events::emit_veto_overridden(&env, escrow_id, admin, reason_hash, elapsed);
+        events::emit_veto_overridden(&env, escrow_id, admin, elapsed);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);

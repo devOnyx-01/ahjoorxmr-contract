@@ -1693,10 +1693,6 @@ pub fn emit_scheduled_release_executed(
 pub struct SellerVetoRaised {
     pub escrow_id: u32,
     pub seller: Address,
-    pub raised_at: u64,
-}
-
-/// Event: Admin overrode an active seller veto, resetting the cooldown.
     pub veto_timestamp: u64,
 }
 
@@ -1717,15 +1713,6 @@ pub struct VetoOverridden {
     pub overridden_at: u64,
 }
 
-pub fn emit_seller_veto_raised(e: &Env, escrow_id: u32, seller: Address, raised_at: u64) {
-    SellerVetoRaised {
-        escrow_id,
-        seller,
-        raised_at,
-    pub reason_hash: BytesN<32>,
-    pub elapsed_seconds: u64,
-}
-
 pub fn emit_seller_veto_raised(e: &Env, escrow_id: u32, seller: Address, veto_timestamp: u64) {
     SellerVetoRaised { escrow_id, seller, veto_timestamp }.publish(e);
 }
@@ -1734,14 +1721,8 @@ pub fn emit_seller_veto_cancelled(e: &Env, escrow_id: u32, seller: Address) {
     SellerVetoCancelled { escrow_id, seller }.publish(e);
 }
 
-pub fn emit_veto_overridden(
-    e: &Env,
-    escrow_id: u32,
-    admin: Address,
-    reason_hash: BytesN<32>,
-    elapsed_seconds: u64,
-) {
-    VetoOverridden { escrow_id, admin, reason_hash, elapsed_seconds }.publish(e);
+pub fn emit_veto_overridden(e: &Env, escrow_id: u32, admin: Address, overridden_at: u64) {
+    VetoOverridden { escrow_id, admin, overridden_at }.publish(e);
 }
 
 // ── #376: Bounty Board Milestone Gating Events ───────────────────────────────
@@ -1835,11 +1816,6 @@ pub fn emit_milestone_verified(
     .publish(e);
 }
 
-pub fn emit_veto_overridden(e: &Env, escrow_id: u32, admin: Address, overridden_at: u64) {
-    VetoOverridden {
-        escrow_id,
-        admin,
-        overridden_at,
 pub fn emit_bounty_milestone_verifier_replaced(
     e: &Env,
     escrow_id: u32,
@@ -1854,4 +1830,18 @@ pub fn emit_bounty_milestone_verifier_replaced(
         new_verifier,
     }
     .publish(e);
+}
+
+// ── Fee Withdrawal Events ─────────────────────────────────────────────────
+
+/// Event: Admin withdrew accumulated protocol fees
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct FeesWithdrawn {
+    pub amount: i128,
+    pub destination: Address,
+}
+
+pub fn emit_fees_withdrawn(e: &Env, amount: i128, destination: Address) {
+    FeesWithdrawn { amount, destination }.publish(e);
 }

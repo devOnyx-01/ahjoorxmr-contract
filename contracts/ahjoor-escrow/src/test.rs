@@ -976,13 +976,13 @@ fn test_resolve_dispute_split_with_fee() {
         &String::from_str(&s.env, "Partial issue"),
         &1000,
     );
-    // fee = 1000 * 100 / 10000 = 10; distributable = 990; 50% split → buyer=495, seller=495
+    // fee = 1000 * 100 / 10000 = 10; distributable = 990; 50% split → buyer=495, seller=495; fee accrued
     s.client.resolve_dispute(&arbiter, &escrow_id, &50u32);
 
-    assert_eq!(s.token_client.balance(&fee_recipient), 10);
+    assert_eq!(s.token_client.balance(&fee_recipient), 0);
     assert_eq!(s.token_client.balance(&buyer), 495);
     assert_eq!(s.token_client.balance(&seller), 495);
-    assert_eq!(s.token_client.balance(&s.client.address), 0);
+    assert_eq!(s.token_client.balance(&s.client.address), 10);
 }
 
 #[test]
@@ -1076,10 +1076,10 @@ fn test_protocol_fee_deducted_on_resolve_to_seller() {
     );
     s.client.resolve_dispute(&arbiter, &escrow_id, &0u32);
 
-    // fee = 1000 * 100 / 10000 = 10; seller gets 990
+    // fee = 1000 * 100 / 10000 = 10; seller gets 990; fee is accrued in contract
     assert_eq!(s.token_client.balance(&seller), 990);
-    assert_eq!(s.token_client.balance(&fee_recipient), 10);
-    assert_eq!(s.token_client.balance(&s.client.address), 0);
+    assert_eq!(s.token_client.balance(&fee_recipient), 0);
+    assert_eq!(s.token_client.balance(&s.client.address), 10);
 }
 
 #[test]
@@ -1107,10 +1107,10 @@ fn test_protocol_fee_deducted_on_resolve_to_buyer() {
     );
     s.client.resolve_dispute(&arbiter, &escrow_id, &100u32);
 
-    // fee = 500 * 200 / 10000 = 10; buyer gets 490, started with 500 after deposit
+    // fee = 500 * 200 / 10000 = 10; buyer gets 490; fee is accrued in contract
     assert_eq!(s.token_client.balance(&buyer), 990); // 1000 - 500 deposited + 490 refunded
-    assert_eq!(s.token_client.balance(&fee_recipient), 10);
-    assert_eq!(s.token_client.balance(&s.client.address), 0);
+    assert_eq!(s.token_client.balance(&fee_recipient), 0);
+    assert_eq!(s.token_client.balance(&s.client.address), 10);
 }
 
 #[test]
@@ -4569,4 +4569,97 @@ fn test_partial_release_non_active() {
     // Try to request partial release (should panic)
     let justification_hash = BytesN::from_array(&s.env, &[1u8; 32]);
     s.client.request_partial_release(&seller, &escrow_id, &100, &justification_hash);
+}
+
+// ===========================================================================
+//  Fee Withdrawal Tests
+// ===========================================================================
+
+#[test]
+fn test_withdraw_fees_happy_path() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    let fee_recipient = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    // 200 bps = 2% protocol fee
+    s.client.update_protocol_fee(&s.admin, &200, &fee_recipient);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer, &seller, &arbiter, &500, &s.token_addr, &deadline,
+        &None, &Vec::new(&s.env), &false, &0u32,
+    );
+
+    // Dispute and resolve to generate fees
+    s.client.dispute_escrow(&buyer, &escrow_id, &String::from_str(&s.env, "d"), &500);
+    s.client.resolve_dispute(&arbiter, &escrow_id, &0u32);
+
+    // fee = 500 * 200 / 10000 = 10 accrued
+    let destination = Address::generate(&s.env);
+    assert_eq!(s.token_client.balance(&s.client.address), 10);
+
+    s.client.withdraw_fees(&s.admin, &10, &s.token_addr, &destination);
+
+    assert_eq!(s.token_client.balance(&destination), 10);
+    assert_eq!(s.token_client.balance(&s.client.address), 0);
+}
+
+#[test]
+fn test_withdraw_fees_zero_amount_rejected() {
+    let s = setup();
+
+    let result = s.client.try_withdraw_fees(
+        &s.admin, &0, &s.token_addr, &Address::generate(&s.env),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_withdraw_fees_exceeds_accrued_rejected() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    s.client.update_protocol_fee(&s.admin, &100, &Address::generate(&s.env));
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer, &seller, &arbiter, &100, &s.token_addr, &deadline,
+        &None, &Vec::new(&s.env), &false, &0u32,
+    );
+
+    s.client.dispute_escrow(&seller, &escrow_id, &String::from_str(&s.env, "d"), &100);
+    s.client.resolve_dispute(&arbiter, &escrow_id, &100u32);
+
+    // fee = 100 * 100 / 10000 = 1; try withdrawing 2
+    let result = s.client.try_withdraw_fees(
+        &s.admin, &2, &s.token_addr, &Address::generate(&s.env),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_withdraw_fees_non_admin_rejected() {
+    let s = setup();
+    let non_admin = Address::generate(&s.env);
+
+    let result = s.client.try_withdraw_fees(
+        &non_admin, &100, &s.token_addr, &Address::generate(&s.env),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_withdraw_fees_zero_balance_on_fresh_contract_rejected() {
+    let s = setup();
+
+    let result = s.client.try_withdraw_fees(
+        &s.admin, &1, &s.token_addr, &Address::generate(&s.env),
+    );
+    assert!(result.is_err());
 }
