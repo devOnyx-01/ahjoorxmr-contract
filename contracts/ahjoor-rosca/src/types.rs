@@ -370,6 +370,11 @@ pub enum DataKey3 {
     MemberReceiptIds(Address),
     // #456: Waitlist priority ordering mode
     WaitlistPriorityMode,       // WaitlistMode — settable by admin
+        // #456: Waitlist priority ordering mode
+    WaitlistPriorityMode,       // WaitlistMode — settable by admin
+    // #454: Collective goal reward pool
+    GoalRewardPool,             // i128 — funded by admin, distributed once collective_goal is reached
+    GoalRewardDistributed,  
 }
 
 

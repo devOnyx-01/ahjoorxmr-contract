@@ -1,9 +1,10 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, panic_with_error, token, Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
-};
-use soroban_sdk::xdr::ToXdr;
 use ahjoor_token_whitelist::TokenWhitelistClient;
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{
+    contract, contractimpl, panic_with_error, token, Address, Bytes, BytesN, Env, Map, String,
+    Symbol, Vec,
+};
 
 // Instance storage: config, counters, and active round state (bounded, shared TTL)
 pub(crate) const INSTANCE_LIFETIME_THRESHOLD: u32 = 100_000;
@@ -24,19 +25,19 @@ pub(crate) const MIGRATION_TIMEOUT_SECONDS: u64 = 604800; // 7 days in seconds
 pub mod types;
 pub use types::*;
 
+mod audit_trail;
 mod errors;
 mod events;
 mod internals;
-mod audit_trail;
 pub mod savings_goal_tracking;
 pub mod savings_goal_tracking_impl;
-mod test_tiers;
-mod test_weighted_voting;
-mod test_reinvest;
-mod test_token_whitelist;
-mod test_slot_auction;
-mod test_sealed_slot_auction;
 mod test_migration;
+mod test_reinvest;
+mod test_sealed_slot_auction;
+mod test_slot_auction;
+mod test_tiers;
+mod test_token_whitelist;
+mod test_weighted_voting;
 // mod test_co_payer_split;        // source file not yet committed
 // mod test_contribution_receipts; // source file not yet committed
 mod migration_client;
@@ -179,17 +180,19 @@ impl AhjoorContract {
             .instance()
             .set(&DataKey::SuspendedMembers, &Vec::<Address>::new(&env));
         // Persistent: RoundHistory grows by one record per round — must not share instance TTL
-        env.storage()
-            .persistent()
-            .set(&PersistentKey::RoundHistory, &Vec::<PayoutRecord>::new(&env));
+        env.storage().persistent().set(
+            &PersistentKey::RoundHistory,
+            &Vec::<PayoutRecord>::new(&env),
+        );
         env.storage().persistent().extend_ttl(
             &PersistentKey::RoundHistory,
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        env.storage()
-            .persistent()
-            .set(&PersistentKey::ReputationScores, &Map::<Address, i128>::new(&env));
+        env.storage().persistent().set(
+            &PersistentKey::ReputationScores,
+            &Map::<Address, i128>::new(&env),
+        );
         env.storage().persistent().extend_ttl(
             &PersistentKey::ReputationScores,
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -266,12 +269,14 @@ impl AhjoorContract {
             .set(&DataKey::MaxMembers, &max_members);
 
         // Timestamp-based Payout Scheduling
-        env.storage()
-            .instance()
-            .set(&DataKey2::UseTimestampSchedule, &config.use_timestamp_schedule);
-        env.storage()
-            .instance()
-            .set(&DataKey2::RoundDurationSeconds, &config.round_duration_seconds);
+        env.storage().instance().set(
+            &DataKey2::UseTimestampSchedule,
+            &config.use_timestamp_schedule,
+        );
+        env.storage().instance().set(
+            &DataKey2::RoundDurationSeconds,
+            &config.round_duration_seconds,
+        );
 
         if config.use_timestamp_schedule {
             let timestamp_deadline = resolved_start_at + config.round_duration_seconds;
@@ -307,12 +312,14 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey2::MaxSkipsPerCycle, &config.max_skips_per_cycle);
-        env.storage()
-            .instance()
-            .set(&DataKey2::SkipRequests, &Map::<(Address, u32), bool>::new(&env));
-        env.storage()
-            .instance()
-            .set(&DataKey2::MemberSkips, &Map::<(Address, u32), u32>::new(&env));
+        env.storage().instance().set(
+            &DataKey2::SkipRequests,
+            &Map::<(Address, u32), bool>::new(&env),
+        );
+        env.storage().instance().set(
+            &DataKey2::MemberSkips,
+            &Map::<(Address, u32), u32>::new(&env),
+        );
 
         // Voting Mode Initialization
         env.storage()
@@ -320,9 +327,10 @@ impl AhjoorContract {
             .set(&DataKey2::VotingMode, &config.voting_mode);
 
         // Reinvestment Initialization
-        env.storage()
-            .instance()
-            .set(&DataKey2::ReinvestPreference, &Map::<Address, bool>::new(&env));
+        env.storage().instance().set(
+            &DataKey2::ReinvestPreference,
+            &Map::<Address, bool>::new(&env),
+        );
 
         // Governance Initialization
         env.storage()
@@ -348,7 +356,10 @@ impl AhjoorContract {
             .set(&DataKey2::QuorumConfig, &quorum_config);
 
         // Guard: reject if contribution_amount × max_members would overflow i128.
-        if contribution_amount.checked_mul(max_members as i128).is_none() {
+        if contribution_amount
+            .checked_mul(max_members as i128)
+            .is_none()
+        {
             panic_with_error!(&env, ExtError::InvalidAmount);
         }
 
@@ -366,9 +377,10 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey3::AuctionEnabled, &config.auction_enabled);
-        env.storage()
-            .instance()
-            .set(&DataKey3::AuctionWindowLedgers, &config.auction_window_ledgers);
+        env.storage().instance().set(
+            &DataKey3::AuctionWindowLedgers,
+            &config.auction_window_ledgers,
+        );
         // No auction open yet
         env.storage()
             .instance()
@@ -376,9 +388,7 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey3::AuctionBids, &Vec::<SlotBid>::new(&env));
-        env.storage()
-            .instance()
-            .set(&DataKey3::AuctionRound, &0u32);
+        env.storage().instance().set(&DataKey3::AuctionRound, &0u32);
 
         env.storage()
             .instance()
@@ -674,11 +684,7 @@ impl AhjoorContract {
         Self::require_token_allowed(&env, &token);
 
         let client = token::Client::new(&env, &token);
-        client.transfer(
-            &contributor,
-            &env.current_contract_address(),
-            &amount,
-        );
+        client.transfer(&contributor, &env.current_contract_address(), &amount);
 
         let mut insurance_pool: i128 = env
             .storage()
@@ -833,9 +839,17 @@ impl AhjoorContract {
 
         // #218: collect reinstatement fee before first contribution after reinstatement
         {
-            let mut pending: Vec<Address> = env.storage().instance().get(&DataKey2::PendingReinstatementFee).unwrap_or(Vec::new(&env));
+            let mut pending: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey2::PendingReinstatementFee)
+                .unwrap_or(Vec::new(&env));
             if pending.contains(&contributor) {
-                let fee: i128 = env.storage().instance().get(&DataKey2::ReinstatementFee).unwrap_or(0);
+                let fee: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey2::ReinstatementFee)
+                    .unwrap_or(0);
                 if fee > 0 {
                     let fee_token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
                     let fee_client = token::Client::new(&env, &fee_token);
@@ -843,8 +857,14 @@ impl AhjoorContract {
                     events::emit_reinstatement_fee_collected(&env, contributor.clone(), fee);
                 }
                 let mut new_pending: Vec<Address> = Vec::new(&env);
-                for m in pending.iter() { if m != contributor { new_pending.push_back(m); } }
-                env.storage().instance().set(&DataKey2::PendingReinstatementFee, &new_pending);
+                for m in pending.iter() {
+                    if m != contributor {
+                        new_pending.push_back(m);
+                    }
+                }
+                env.storage()
+                    .instance()
+                    .set(&DataKey2::PendingReinstatementFee, &new_pending);
             }
         }
 
@@ -878,7 +898,7 @@ impl AhjoorContract {
         let member_required_amount = (base_amount * tier_bps as i128) / 10_000;
 
         let amount_to_transfer = if token == base_token {
-            amount  // For base token, transfer the exact amount specified
+            amount // For base token, transfer the exact amount specified
         } else {
             let rates: Map<Address, i128> = env
                 .storage()
@@ -1016,7 +1036,11 @@ impl AhjoorContract {
                     events::emit_late_count_reset(&env, contributor.clone());
                 }
                 Self::apply_reputation_delta(&env, contributor.clone(), 10, "on_time_full");
-                Self::update_credit_score_internal(&env, &contributor, Symbol::new(&env, "on_time"));
+                Self::update_credit_score_internal(
+                    &env,
+                    &contributor,
+                    Symbol::new(&env, "on_time"),
+                );
             }
             paid_members.push_back(contributor.clone());
             env.storage()
@@ -1062,7 +1086,11 @@ impl AhjoorContract {
                         .instance()
                         .get(&DataKey::CurrentRound)
                         .unwrap_or(0);
-                    events::emit_round_auto_closed_early(&env, current_round, env.ledger().timestamp());
+                    events::emit_round_auto_closed_early(
+                        &env,
+                        current_round,
+                        env.ledger().timestamp(),
+                    );
                 }
             }
 
@@ -1305,8 +1333,11 @@ impl AhjoorContract {
 
         let mut defaulters = Vec::new(&env);
         for member in members.iter() {
-            let has_skipped = skip_requests.get((member.clone(), current_round)).unwrap_or(false);
-            if !paid_members.contains(&member) && !exited_members.contains(&member) && !has_skipped {
+            let has_skipped = skip_requests
+                .get((member.clone(), current_round))
+                .unwrap_or(false);
+            if !paid_members.contains(&member) && !exited_members.contains(&member) && !has_skipped
+            {
                 defaulters.push_back(member);
             }
         }
@@ -1430,8 +1461,11 @@ impl AhjoorContract {
         // Identify defaulters (non-contributors, non-exited, non-skippers)
         let mut defaulters: Vec<Address> = Vec::new(&env);
         for member in members.iter() {
-            let has_skipped = skip_requests.get((member.clone(), current_round)).unwrap_or(false);
-            if !paid_members.contains(&member) && !exited_members.contains(&member) && !has_skipped {
+            let has_skipped = skip_requests
+                .get((member.clone(), current_round))
+                .unwrap_or(false);
+            if !paid_members.contains(&member) && !exited_members.contains(&member) && !has_skipped
+            {
                 defaulters.push_back(member.clone());
             }
         }
@@ -1593,7 +1627,11 @@ impl AhjoorContract {
             // Credit score: every non-exited member who completed the cycle
             for member in members.iter() {
                 if !exited_members.contains(&member) {
-                    Self::update_credit_score_internal(&env, &member, Symbol::new(&env, "completed"));
+                    Self::update_credit_score_internal(
+                        &env,
+                        &member,
+                        Symbol::new(&env, "completed"),
+                    );
                 }
             }
         }
@@ -1608,7 +1646,9 @@ impl AhjoorContract {
                 let cycle_start = (cycle_number - 1) * cycle_len;
                 let mut qualifying: Vec<Address> = Vec::new(&env);
                 for member in members.iter() {
-                    if exited_members.contains(&member) { continue; }
+                    if exited_members.contains(&member) {
+                        continue;
+                    }
                     let defaults = default_count.get(member.clone()).unwrap_or(0);
                     let mut had_skip = false;
                     for r in cycle_start..=(current_round) {
@@ -1640,7 +1680,8 @@ impl AhjoorContract {
                         0
                     };
                     if actual_bonus > 0 {
-                        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+                        let token_addr: Address =
+                            env.storage().instance().get(&DataKey::Token).unwrap();
                         let token_client = token::Client::new(&env, &token_addr);
                         for member in qualifying.iter() {
                             token_client.transfer(
@@ -1651,7 +1692,9 @@ impl AhjoorContract {
                             reward_pool -= actual_bonus;
                             events::emit_cycle_bonus_paid(&env, member, actual_bonus, cycle_number);
                         }
-                        env.storage().instance().set(&DataKey::RewardPool, &reward_pool);
+                        env.storage()
+                            .instance()
+                            .set(&DataKey::RewardPool, &reward_pool);
                     }
                 }
             }
@@ -1745,17 +1788,32 @@ impl AhjoorContract {
     pub fn set_cycle_bonus(env: Env, admin: Address, amount: i128) {
         internals::check_not_paused(&env);
         admin.require_auth();
-        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
-        if amount < 0 { panic_with_error!(&env, Error::AmountMustBePositive); }
-        env.storage().instance().set(&DataKey4::CycleBonusAmount, &amount);
+        let a: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("No admin");
+        if admin != a {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        if amount < 0 {
+            panic_with_error!(&env, Error::AmountMustBePositive);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey4::CycleBonusAmount, &amount);
         events::emit_cycle_bonus_configured(&env, amount);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Returns the configured cycle bonus amount (0 if not set).
     pub fn get_cycle_bonus(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey4::CycleBonusAmount).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey4::CycleBonusAmount)
+            .unwrap_or(0)
     }
 
     // ─── Slot Auction ─────────────────────────────────────────────────────────
@@ -1839,11 +1897,7 @@ impl AhjoorContract {
         let mut new_bids: Vec<SlotBid> = Vec::new(&env);
         for bid in bids.iter() {
             if bid.bidder == bidder {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &bidder,
-                    &bid.amount,
-                );
+                token_client.transfer(&env.current_contract_address(), &bidder, &bid.amount);
             } else {
                 new_bids.push_back(bid);
             }
@@ -1877,19 +1931,29 @@ impl AhjoorContract {
     pub fn set_use_timestamp_schedule(env: Env, admin: Address, value: bool) {
         internals::check_not_paused(&env);
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("No admin");
         if admin != stored_admin {
             panic_with_error!(&env, ExtError::OnlyAdminAllowed);
         }
-        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
         if current_round > 0 {
             panic_with_error!(&env, Error::CannotChangeMidRound);
         }
-        env.storage().instance().set(&DataKey2::UseTimestampSchedule, &value);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .set(&DataKey2::UseTimestampSchedule, &value);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
-
-
 
     /// Update an existing bid during the auction window.
     ///
@@ -1972,9 +2036,13 @@ impl AhjoorContract {
             placed_at: env.ledger().timestamp(),
         });
 
-        env.storage().instance().set(&DataKey3::AuctionBids, &new_bids);
+        env.storage()
+            .instance()
+            .set(&DataKey3::AuctionBids, &new_bids);
         events::emit_slot_bid_placed(&env, 0, bidder, desired_slot, new_bid_amount);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Resolve the current slot auction.
@@ -2060,11 +2128,7 @@ impl AhjoorContract {
         // Refund all losing bids
         for (i, bid) in bids.iter().enumerate() {
             if i as u32 != winner_idx {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &bid.bidder,
-                    &bid.amount,
-                );
+                token_client.transfer(&env.current_contract_address(), &bid.bidder, &bid.amount);
             }
         }
 
@@ -2235,7 +2299,9 @@ impl AhjoorContract {
             reveal_until: 0,
             open: false,
         };
-        env.storage().instance().set(&DataKey3::SealedAuction, &state);
+        env.storage()
+            .instance()
+            .set(&DataKey3::SealedAuction, &state);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -2273,15 +2339,19 @@ impl AhjoorContract {
         state.commit_until = now + state.commit_duration;
         state.reveal_until = state.commit_until + state.reveal_duration;
         state.open = true;
-        env.storage().instance().set(&DataKey3::SealedAuction, &state);
+        env.storage()
+            .instance()
+            .set(&DataKey3::SealedAuction, &state);
 
         // Fresh per-round bookkeeping.
-        env.storage()
-            .instance()
-            .set(&DataKey3::SealedCommitters(round), &Vec::<Address>::new(&env));
-        env.storage()
-            .instance()
-            .set(&DataKey3::SealedRevealedBids(round), &Vec::<SlotBid>::new(&env));
+        env.storage().instance().set(
+            &DataKey3::SealedCommitters(round),
+            &Vec::<Address>::new(&env),
+        );
+        env.storage().instance().set(
+            &DataKey3::SealedRevealedBids(round),
+            &Vec::<SlotBid>::new(&env),
+        );
 
         events::emit_sealed_auction_opened(&env, 0, round, state.commit_until, state.reveal_until);
 
@@ -2297,12 +2367,7 @@ impl AhjoorContract {
     /// up front and is also the maximum amount the bidder may later reveal; it
     /// keeps the bid amount hidden during the commit phase. One commit per bidder
     /// per round. Only valid during the commit phase.
-    pub fn commit_slot_bid(
-        env: Env,
-        bidder: Address,
-        commit_hash: BytesN<32>,
-        deposit: i128,
-    ) {
+    pub fn commit_slot_bid(env: Env, bidder: Address, commit_hash: BytesN<32>, deposit: i128) {
         Self::sealed_require_not_paused(&env);
         bidder.require_auth();
 
@@ -2609,7 +2674,11 @@ impl AhjoorContract {
                     eligible += 1;
                 }
             }
-            let bonus: i128 = if eligible > 0 { winning_amount / eligible } else { 0 };
+            let bonus: i128 = if eligible > 0 {
+                winning_amount / eligible
+            } else {
+                0
+            };
             if bonus > 0 {
                 for m in members.iter() {
                     if m != *winner_addr && !exited.contains(&m) && !suspended.contains(&m) {
@@ -2621,7 +2690,9 @@ impl AhjoorContract {
 
         // Close the auction.
         state.open = false;
-        env.storage().instance().set(&DataKey3::SealedAuction, &state);
+        env.storage()
+            .instance()
+            .set(&DataKey3::SealedAuction, &state);
 
         let (winner_for_event, settled_bid) = match winner_addr_opt {
             Some(w) => (w, winning_amount),
@@ -2651,7 +2722,10 @@ impl AhjoorContract {
 
     /// Returns the base token address of this group (used by cross-contract migration checks).
     pub fn get_token(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Token).expect("Not initialized")
+        env.storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Not initialized")
     }
 
     /// Member initiates a cross-group migration request.
@@ -2664,12 +2738,7 @@ impl AhjoorContract {
     /// - `MigrationAlreadyPending` — a migration request already exists for this member
     /// - `TokenMismatch`         — destination group uses a different base token
     /// - `InvalidSlotIndex`      — target_slot is out of range in the destination group
-    pub fn request_group_migration(
-        env: Env,
-        member: Address,
-        to_group: Address,
-        target_slot: u32,
-    ) {
+    pub fn request_group_migration(env: Env, member: Address, to_group: Address, target_slot: u32) {
         internals::check_not_paused(&env);
         internals::check_not_frozen(&env);
         member.require_auth();
@@ -2849,8 +2918,8 @@ impl AhjoorContract {
 
         if target_slot < payout_order.len() {
             let occupant = payout_order.get(target_slot).unwrap();
-            let is_vacant = vacant_slots.contains(&target_slot)
-                || exited_members.contains(&occupant);
+            let is_vacant =
+                vacant_slots.contains(&target_slot) || exited_members.contains(&occupant);
             if !is_vacant {
                 panic_with_error!(&env, ExtError2::SlotOccupied);
             }
@@ -2993,13 +3062,7 @@ impl AhjoorContract {
             .instance()
             .set(&DataKey3::IncomingMigrations, &incoming);
 
-        events::emit_migration_executed(
-            &env,
-            member,
-            from_group,
-            dest_contract,
-            target_slot,
-        );
+        events::emit_migration_executed(&env, member, from_group, dest_contract, target_slot);
 
         env.storage()
             .instance()
@@ -3080,7 +3143,9 @@ impl AhjoorContract {
                 new_members.push_back(m);
             }
         }
-        env.storage().instance().set(&DataKey::Members, &new_members);
+        env.storage()
+            .instance()
+            .set(&DataKey::Members, &new_members);
 
         // Find and mark the member's slot as Vacant in PayoutOrder
         let payout_order: Vec<Address> = env
@@ -3117,7 +3182,9 @@ impl AhjoorContract {
             .unwrap_or(Vec::new(&env));
         if !exited.contains(&member) {
             exited.push_back(member.clone());
-            env.storage().instance().set(&DataKey::ExitedMembers, &exited);
+            env.storage()
+                .instance()
+                .set(&DataKey::ExitedMembers, &exited);
         }
 
         // Mark request as executed
@@ -3152,7 +3219,6 @@ impl AhjoorContract {
             .get(&DataKey::Admin)
             .expect("Not initialized");
 
-
         if caller != member && caller != admin {
             panic_with_error!(&env, ExtError::OnlyAdminAllowed);
         }
@@ -3179,13 +3245,13 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey3::IncomingMigrations)
             .unwrap_or(Map::new(&env));
-            
+
         if incoming.contains_key(member.clone()) {
             let inc = incoming.get(member.clone()).unwrap();
             let src_client = RoscaMigrationClient::new(&env, &inc.from_group);
             let req_opt = src_client.get_migration_request(&member);
             let mut is_timed_out = false;
-            
+
             if let Some(req) = req_opt {
                 if env.ledger().timestamp() > req.created_at + crate::MIGRATION_TIMEOUT_SECONDS {
                     is_timed_out = true;
@@ -3237,33 +3303,78 @@ impl AhjoorContract {
     pub fn update_round_duration(env: Env, admin: Address, new_duration_seconds: u64) {
         internals::check_not_paused(&env);
         admin.require_auth();
-        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
+        let a: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("No admin");
+        if admin != a {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
 
-        let min_dur: u64 = env.storage().instance().get(&DataKey4::MinRoundDuration).unwrap_or(60);
-        let max_dur: u64 = env.storage().instance().get(&DataKey4::MaxRoundDuration).unwrap_or(u64::MAX);
+        let min_dur: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey4::MinRoundDuration)
+            .unwrap_or(60);
+        let max_dur: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey4::MaxRoundDuration)
+            .unwrap_or(u64::MAX);
         if new_duration_seconds < min_dur || new_duration_seconds > max_dur {
             panic_with_error!(&env, ExtError::RoundDurationOutOfBounds);
         }
 
-        let old_duration: u64 = env.storage().instance().get(&DataKey::RoundDuration).unwrap_or(0);
-        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+        let old_duration: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoundDuration)
+            .unwrap_or(0);
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
 
-        env.storage().instance().set(&DataKey4::PendingRoundDuration, &new_duration_seconds);
-        events::emit_round_duration_update_scheduled(&env, old_duration, new_duration_seconds, current_round + 1);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .set(&DataKey4::PendingRoundDuration, &new_duration_seconds);
+        events::emit_round_duration_update_scheduled(
+            &env,
+            old_duration,
+            new_duration_seconds,
+            current_round + 1,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Admin configures the min/max bounds for round duration.
     pub fn set_round_duration_bounds(env: Env, admin: Address, min_seconds: u64, max_seconds: u64) {
         internals::check_not_paused(&env);
         admin.require_auth();
-        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
-        if min_seconds == 0 || min_seconds > max_seconds { panic_with_error!(&env, ExtError::InvalidAmount); }
-        env.storage().instance().set(&DataKey4::MinRoundDuration, &min_seconds);
-        env.storage().instance().set(&DataKey4::MaxRoundDuration, &max_seconds);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        let a: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("No admin");
+        if admin != a {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        if min_seconds == 0 || min_seconds > max_seconds {
+            panic_with_error!(&env, ExtError::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey4::MinRoundDuration, &min_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey4::MaxRoundDuration, &max_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Admin manually penalises a specific defaulter from the current round's
@@ -3323,12 +3434,7 @@ impl AhjoorContract {
             env.storage()
                 .instance()
                 .set(&DataKey4::PendingPenalties, &pending_penalties);
-            events::emit_grace_period_warning(
-                &env,
-                member,
-                current_round,
-                grace_expires_at,
-            );
+            events::emit_grace_period_warning(&env, member, current_round, grace_expires_at);
             return;
         }
 
@@ -3415,12 +3521,7 @@ impl AhjoorContract {
             env.storage()
                 .instance()
                 .set(&DataKey4::PendingPenalties, &pending_penalties);
-            events::emit_grace_period_warning(
-                &env,
-                member,
-                current_round,
-                grace_expires_at,
-            );
+            events::emit_grace_period_warning(&env, member, current_round, grace_expires_at);
             return;
         }
 
@@ -4022,7 +4123,9 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey2::QuorumConfig)
             .unwrap_or(Map::new(&env));
-        let required_quorum = quorum_config.get(ProposalType::MemberFreeze).unwrap_or(6_700);
+        let required_quorum = quorum_config
+            .get(ProposalType::MemberFreeze)
+            .unwrap_or(6_700);
 
         let current_time = env.ledger().timestamp();
         let deadline = current_time + 86_400; // 24h default vote window
@@ -4047,7 +4150,9 @@ impl AhjoorContract {
             .get(&DataKey::Proposals)
             .unwrap_or(Map::new(&env));
         proposals.set(proposal_id, proposal);
-        env.storage().instance().set(&DataKey::Proposals, &proposals);
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposals, &proposals);
 
         let mut proposal_votes: Map<u32, Map<Address, bool>> = env
             .storage()
@@ -4342,7 +4447,11 @@ impl AhjoorContract {
 
         let voter_weight = Self::get_member_voting_weight(env.clone(), voter.clone());
         if voter_weight == 0 {
-            let voting_mode: VotingMode = env.storage().instance().get(&DataKey2::VotingMode).unwrap_or(VotingMode::Equal);
+            let voting_mode: VotingMode = env
+                .storage()
+                .instance()
+                .get(&DataKey2::VotingMode)
+                .unwrap_or(VotingMode::Equal);
             if voting_mode == VotingMode::WeightedByContributions {
                 panic_with_error!(&env, ExtError::InsufficientWeight);
             }
@@ -4362,7 +4471,8 @@ impl AhjoorContract {
                 // This voter is a delegate; check if delegator hasn't voted yet
                 let delegator_voted = votes.contains_key(delegator.clone());
                 if !delegator_voted {
-                    let delegator_weight = Self::get_member_voting_weight(env.clone(), delegator.clone());
+                    let delegator_weight =
+                        Self::get_member_voting_weight(env.clone(), delegator.clone());
                     if vote_for {
                         delegator_votes_for += delegator_weight;
                     } else {
@@ -4384,7 +4494,8 @@ impl AhjoorContract {
                 if active {
                     let delegator_voted = votes.contains_key(delegator.clone());
                     if !delegator_voted {
-                        let delegator_weight = Self::get_member_voting_weight(env.clone(), delegator.clone());
+                        let delegator_weight =
+                            Self::get_member_voting_weight(env.clone(), delegator.clone());
                         if vote_for {
                             delegator_votes_for += delegator_weight;
                         } else {
@@ -4413,7 +4524,7 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey2::VotingMode)
             .unwrap_or(VotingMode::Equal);
-        
+
         if voting_mode == VotingMode::WeightedByContributions {
             events::emit_weighted_vote_cast(&env, voter, proposal_id, voter_weight);
         } else {
@@ -4478,7 +4589,8 @@ impl AhjoorContract {
             }
         };
 
-        let required_votes = ((total_possible_votes * proposal.required_quorum as i128) + 9999) / 10000;
+        let required_votes =
+            ((total_possible_votes * proposal.required_quorum as i128) + 9999) / 10000;
 
         if total_votes < required_votes {
             proposal.status = ProposalStatus::Rejected;
@@ -4568,7 +4680,9 @@ impl AhjoorContract {
                     unfrozen_at_ledger: None,
                     resolution_hash: None,
                 });
-                env.storage().persistent().set(&PersistentKey::FreezeLog, &log);
+                env.storage()
+                    .persistent()
+                    .set(&PersistentKey::FreezeLog, &log);
                 env.storage().persistent().extend_ttl(
                     &PersistentKey::FreezeLog,
                     PERSISTENT_LIFETIME_THRESHOLD,
@@ -4753,7 +4867,7 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey2::EmergencyPayoutConfig)
             .unwrap_or(EmergencyPayoutConfig {
-                emergency_quorum_bps: 6667, // default 66.67%
+                emergency_quorum_bps: 6667,            // default 66.67%
                 vote_window_seconds: 7 * 24 * 60 * 60, // default 7 days
                 max_emergency_per_cycle: 1,
             });
@@ -4844,7 +4958,10 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey2::EmergencyPayoutVotes)
             .unwrap_or(Map::new(&env));
-        if votes.get((current_round, requester.clone(), voter.clone())).unwrap_or(false) {
+        if votes
+            .get((current_round, requester.clone(), voter.clone()))
+            .unwrap_or(false)
+        {
             panic!("Already voted on this emergency payout request");
         }
 
@@ -4958,7 +5075,8 @@ impl AhjoorContract {
             }
         };
 
-        let required_votes = ((total_possible_votes * config.emergency_quorum_bps as i128) + 9999) / 10000;
+        let required_votes =
+            ((total_possible_votes * config.emergency_quorum_bps as i128) + 9999) / 10000;
         let total_votes = request.votes_for + request.votes_against;
 
         if total_votes < required_votes {
@@ -5021,7 +5139,11 @@ impl AhjoorContract {
 
         // Transfer funds to requester
         let client = token::Client::new(&env, &token_addr);
-        client.transfer(&env.current_contract_address(), &requester, &contribution_amount);
+        client.transfer(
+            &env.current_contract_address(),
+            &requester,
+            &contribution_amount,
+        );
 
         // Mark requester as paid for this round
         let mut paid_members: Vec<Address> = env
@@ -5036,7 +5158,12 @@ impl AhjoorContract {
                 .set(&DataKey::PaidMembers, &paid_members);
         }
 
-        events::emit_emergency_payout_executed(&env, requester.clone(), current_round, contribution_amount);
+        events::emit_emergency_payout_executed(
+            &env,
+            requester.clone(),
+            current_round,
+            contribution_amount,
+        );
 
         env.storage()
             .instance()
@@ -5144,7 +5271,13 @@ impl AhjoorContract {
                 let share = (contribution * total_pool) / total_contributions;
                 if share > 0 {
                     client.transfer(&env.current_contract_address(), &member, &share);
-                    events::emit_member_refunded(&env, member.clone(), share, contribution, total_pool);
+                    events::emit_member_refunded(
+                        &env,
+                        member.clone(),
+                        share,
+                        contribution,
+                        total_pool,
+                    );
                 }
             }
         }
@@ -5169,7 +5302,13 @@ impl AhjoorContract {
             .get(&DataKey::CurrentRound)
             .unwrap_or(0);
 
-        events::emit_group_dissolved(&env, current_round, reason_hash, total_pool, members.len() as u32);
+        events::emit_group_dissolved(
+            &env,
+            current_round,
+            reason_hash,
+            total_pool,
+            members.len() as u32,
+        );
 
         env.storage()
             .instance()
@@ -5222,7 +5361,7 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey2::DissolutionConfig)
             .unwrap_or(DissolutionConfig {
-                dissolution_quorum_bps: 7500, // default 75%
+                dissolution_quorum_bps: 7500,           // default 75%
                 vote_window_seconds: 14 * 24 * 60 * 60, // default 14 days
             });
 
@@ -5257,7 +5396,12 @@ impl AhjoorContract {
     // --- #398: Contribution-Weight Voting Delegation ---
 
     /// Delegate contribution-weight voting power to `delegate` until `expiry_ledger`.
-    pub fn delegate_contribution_vote(env: Env, delegator: Address, delegate: Address, expiry_ledger: u64) {
+    pub fn delegate_contribution_vote(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+        expiry_ledger: u64,
+    ) {
         internals::check_not_paused(&env);
         delegator.require_auth();
 
@@ -5304,12 +5448,17 @@ impl AhjoorContract {
             .get(&DataKey3::ContribDelegations)
             .unwrap_or(Map::new(&env));
 
-        contrib_delegations.set(delegator.clone(), ContribDelegationRecord {
-            proxy: delegate.clone(),
-            expiry: expiry_ledger,
-            expiry_mode,
-        });
-        env.storage().instance().set(&DataKey3::ContribDelegations, &contrib_delegations);
+        contrib_delegations.set(
+            delegator.clone(),
+            ContribDelegationRecord {
+                proxy: delegate.clone(),
+                expiry: expiry_ledger,
+                expiry_mode,
+            },
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey3::ContribDelegations, &contrib_delegations);
 
         events::emit_vote_delegated(&env, delegator, delegate);
 
@@ -5334,7 +5483,9 @@ impl AhjoorContract {
         }
 
         contrib_delegations.remove(delegator.clone());
-        env.storage().instance().set(&DataKey3::ContribDelegations, &contrib_delegations);
+        env.storage()
+            .instance()
+            .set(&DataKey3::ContribDelegations, &contrib_delegations);
 
         events::emit_delegation_revoked(&env, delegator);
 
@@ -5502,7 +5653,8 @@ impl AhjoorContract {
             .unwrap_or(Map::new(&env));
         let votes_for: i128 = vote_counts.get(current_round).unwrap_or(0);
 
-        let required_votes = ((total_possible_votes * config.dissolution_quorum_bps as i128) + 9999) / 10000;
+        let required_votes =
+            ((total_possible_votes * config.dissolution_quorum_bps as i128) + 9999) / 10000;
 
         if votes_for < required_votes {
             panic_with_error!(&env, ExtError::DissolutionQuorumNotMet);
@@ -5618,11 +5770,7 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey::TotalCollected)
             .unwrap_or(0);
-        let fee_bps: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(0);
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
 
         let total_members = members.len() as u32;
         let suspended_count = suspended.len() as u32;
@@ -6036,9 +6184,7 @@ impl AhjoorContract {
             panic_with_error!(&env, Error::FeeExceedsMaximum);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeBps, &new_fee_bps);
+        env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
 
         env.storage()
             .instance()
@@ -6047,17 +6193,12 @@ impl AhjoorContract {
 
     /// Get the current protocol fee in basis points.
     pub fn get_fee_bps(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
     /// Get the protocol fee recipient address.
     pub fn get_fee_recipient(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey2::FeeRecipient)
+        env.storage().instance().get(&DataKey2::FeeRecipient)
     }
 
     /// Admin configures the reputation-gated fee discount.
@@ -6080,7 +6221,10 @@ impl AhjoorContract {
         if admin != stored_admin {
             panic_with_error!(&env, ExtError::OnlyAdminAllowed);
         }
-        let cfg = RepFeeDiscountConfig { threshold, discount_bps };
+        let cfg = RepFeeDiscountConfig {
+            threshold,
+            discount_bps,
+        };
         env.storage()
             .instance()
             .set(&DataKey3::RepFeeDiscount, &cfg);
@@ -6091,9 +6235,7 @@ impl AhjoorContract {
 
     /// Returns the current reputation-gated fee discount config, if one has been set.
     pub fn get_reputation_fee_discount(env: Env) -> Option<RepFeeDiscountConfig> {
-        env.storage()
-            .instance()
-            .get(&DataKey3::RepFeeDiscount)
+        env.storage().instance().get(&DataKey3::RepFeeDiscount)
     }
 
     /// Get the maximum number of consecutive defaults before suspension.
@@ -6135,9 +6277,7 @@ impl AhjoorContract {
             .get(&DataKey::MaxMembers)
             .unwrap_or(50);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::MaxMembers, &new_max);
+        env.storage().instance().set(&DataKey::MaxMembers, &new_max);
 
         events::emit_max_members_upd(&env, old_max, new_max);
     }
@@ -6215,10 +6355,9 @@ impl AhjoorContract {
             .unwrap_or(0);
         if current_timestamp_deadline > 0 {
             let next_deadline = current_timestamp_deadline + pause_duration;
-            env.storage().instance().set(
-                &DataKey::RoundDeadlineTimestamp,
-                &next_deadline,
-            );
+            env.storage()
+                .instance()
+                .set(&DataKey::RoundDeadlineTimestamp, &next_deadline);
             let current_round: u32 = env
                 .storage()
                 .instance()
@@ -6827,8 +6966,16 @@ impl AhjoorContract {
                 1 => {
                     // PenaliseDefaulter
                     if let Some(member) = target_member {
-                        let penalty: i128 = env.storage().instance().get(&DataKey::PenaltyAmount).unwrap_or(0);
-                        let round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+                        let penalty: i128 = env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::PenaltyAmount)
+                            .unwrap_or(0);
+                        let round: u32 = env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::CurrentRound)
+                            .unwrap_or(0);
                         Self::apply_penalty(&env, member, penalty, round);
                     }
                 }
@@ -6847,12 +6994,15 @@ impl AhjoorContract {
         events::emit_admin_action_proposed(
             &env,
             0, // action_id not used in simplified version
-            Symbol::new(&env, match action_type {
-                0 => "RemoveMember",
-                1 => "PenaliseDefaulter",
-                2 => "UpdateFee",
-                _ => "Unknown",
-            }),
+            Symbol::new(
+                &env,
+                match action_type {
+                    0 => "RemoveMember",
+                    1 => "PenaliseDefaulter",
+                    2 => "UpdateFee",
+                    _ => "Unknown",
+                },
+            ),
             admin,
         );
 
@@ -6862,7 +7012,13 @@ impl AhjoorContract {
     }
 
     /// Approve a pending admin action (co-admin only)
-    pub fn approve_admin_action(env: Env, approver: Address, action_type: u32, target_member: Option<Address>, payload: Option<i128>) {
+    pub fn approve_admin_action(
+        env: Env,
+        approver: Address,
+        action_type: u32,
+        target_member: Option<Address>,
+        payload: Option<i128>,
+    ) {
         internals::check_not_paused(&env);
         approver.require_auth();
 
@@ -6892,8 +7048,16 @@ impl AhjoorContract {
             1 => {
                 // PenaliseDefaulter
                 if let Some(member) = target_member {
-                    let penalty: i128 = env.storage().instance().get(&DataKey::PenaltyAmount).unwrap_or(0);
-                    let round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+                    let penalty: i128 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::PenaltyAmount)
+                        .unwrap_or(0);
+                    let round: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::CurrentRound)
+                        .unwrap_or(0);
                     Self::apply_penalty(&env, member, penalty, round);
                 }
             }
@@ -6909,12 +7073,15 @@ impl AhjoorContract {
         events::emit_admin_action_executed(
             &env,
             0,
-            Symbol::new(&env, match action_type {
-                0 => "RemoveMember",
-                1 => "PenaliseDefaulter",
-                2 => "UpdateFee",
-                _ => "Unknown",
-            }),
+            Symbol::new(
+                &env,
+                match action_type {
+                    0 => "RemoveMember",
+                    1 => "PenaliseDefaulter",
+                    2 => "UpdateFee",
+                    _ => "Unknown",
+                },
+            ),
         );
 
         env.storage()
@@ -6924,31 +7091,98 @@ impl AhjoorContract {
 
     // ─── #213: Payout Slot Swap ───────────────────────────────────────────────
 
-    pub fn set_slot_swap_config(env: Env, admin: Address, requires_admin: bool, expiry_seconds: u64) {
+    pub fn set_slot_swap_config(
+        env: Env,
+        admin: Address,
+        requires_admin: bool,
+        expiry_seconds: u64,
+    ) {
         admin.require_auth();
         internals::check_not_paused(&env);
-        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
-        env.storage().instance().set(&DataKey2::SlotSwapRequiresAdmin, &requires_admin);
-        env.storage().instance().set(&DataKey2::SlotSwapExpirySeconds, &expiry_seconds);
+        let a: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("No admin");
+        if admin != a {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey2::SlotSwapRequiresAdmin, &requires_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey2::SlotSwapExpirySeconds, &expiry_seconds);
     }
 
-    pub fn request_slot_swap(env: Env, initiator: Address, round_a: u32, round_b: u32, counterparty: Address) -> u32 {
+    pub fn request_slot_swap(
+        env: Env,
+        initiator: Address,
+        round_a: u32,
+        round_b: u32,
+        counterparty: Address,
+    ) -> u32 {
         initiator.require_auth();
         internals::check_not_paused(&env);
-        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).expect("Not init");
-        if !members.contains(&initiator) || !members.contains(&counterparty) { panic_with_error!(&env, Error::OnlyMembersAllowed); }
-        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
-        let payout_order: Vec<Address> = env.storage().instance().get(&DataKey::PayoutOrder).unwrap();
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not init");
+        if !members.contains(&initiator) || !members.contains(&counterparty) {
+            panic_with_error!(&env, Error::OnlyMembersAllowed);
+        }
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let payout_order: Vec<Address> =
+            env.storage().instance().get(&DataKey::PayoutOrder).unwrap();
         let order_len = payout_order.len() as u32;
-        if round_a >= order_len || round_b >= order_len || round_a <= current_round || round_b <= current_round { panic_with_error!(&env, ExtError::InvalidAmount); }
-        if payout_order.get(round_a).unwrap() != initiator || payout_order.get(round_b).unwrap() != counterparty { panic_with_error!(&env, Error::OnlyMembersAllowed); }
-        let expiry: u64 = env.storage().instance().get(&DataKey2::SlotSwapExpirySeconds).unwrap_or(86_400);
+        if round_a >= order_len
+            || round_b >= order_len
+            || round_a <= current_round
+            || round_b <= current_round
+        {
+            panic_with_error!(&env, ExtError::InvalidAmount);
+        }
+        if payout_order.get(round_a).unwrap() != initiator
+            || payout_order.get(round_b).unwrap() != counterparty
+        {
+            panic_with_error!(&env, Error::OnlyMembersAllowed);
+        }
+        let expiry: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SlotSwapExpirySeconds)
+            .unwrap_or(86_400);
         let now = env.ledger().timestamp();
-        let swap_id: u32 = env.storage().instance().get(&DataKey2::SlotSwapCounter).unwrap_or(0) + 1;
-        env.storage().instance().set(&DataKey2::SlotSwapCounter, &swap_id);
-        let swap = SlotSwap { id: swap_id, initiator: initiator.clone(), counterparty: counterparty.clone(), round_a, round_b, status: SlotSwapStatus::Pending, created_at: now, expiry_at: now + expiry, admin_approved: false };
-        let mut swaps: Map<u32, SlotSwap> = env.storage().instance().get(&DataKey2::SlotSwaps).unwrap_or(Map::new(&env));
+        let swap_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SlotSwapCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey2::SlotSwapCounter, &swap_id);
+        let swap = SlotSwap {
+            id: swap_id,
+            initiator: initiator.clone(),
+            counterparty: counterparty.clone(),
+            round_a,
+            round_b,
+            status: SlotSwapStatus::Pending,
+            created_at: now,
+            expiry_at: now + expiry,
+            admin_approved: false,
+        };
+        let mut swaps: Map<u32, SlotSwap> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SlotSwaps)
+            .unwrap_or(Map::new(&env));
         swaps.set(swap_id, swap);
         env.storage().instance().set(&DataKey2::SlotSwaps, &swaps);
         events::emit_slot_swap_requested(&env, swap_id, initiator, counterparty, round_a, round_b);
@@ -6958,10 +7192,18 @@ impl AhjoorContract {
     pub fn accept_slot_swap(env: Env, counterparty: Address, swap_id: u32) {
         counterparty.require_auth();
         internals::check_not_paused(&env);
-        let mut swaps: Map<u32, SlotSwap> = env.storage().instance().get(&DataKey2::SlotSwaps).unwrap_or(Map::new(&env));
+        let mut swaps: Map<u32, SlotSwap> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SlotSwaps)
+            .unwrap_or(Map::new(&env));
         let mut swap = swaps.get(swap_id).expect("Swap not found");
-        if swap.counterparty != counterparty { panic_with_error!(&env, Error::OnlyMembersAllowed); }
-        if swap.status != SlotSwapStatus::Pending { panic_with_error!(&env, Error::ProposalNotPending); }
+        if swap.counterparty != counterparty {
+            panic_with_error!(&env, Error::OnlyMembersAllowed);
+        }
+        if swap.status != SlotSwapStatus::Pending {
+            panic_with_error!(&env, Error::ProposalNotPending);
+        }
         if env.ledger().timestamp() > swap.expiry_at {
             swap.status = SlotSwapStatus::Expired;
             swaps.set(swap_id, swap);
@@ -6973,16 +7215,30 @@ impl AhjoorContract {
         swaps.set(swap_id, swap.clone());
         env.storage().instance().set(&DataKey2::SlotSwaps, &swaps);
         events::emit_slot_swap_accepted(&env, swap_id, counterparty);
-        let requires_admin: bool = env.storage().instance().get(&DataKey2::SlotSwapRequiresAdmin).unwrap_or(false);
-        if !requires_admin { Self::execute_slot_swap_inner(&env, swap_id); }
+        let requires_admin: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SlotSwapRequiresAdmin)
+            .unwrap_or(false);
+        if !requires_admin {
+            Self::execute_slot_swap_inner(&env, swap_id);
+        }
     }
 
     pub fn reject_slot_swap(env: Env, counterparty: Address, swap_id: u32) {
         counterparty.require_auth();
-        let mut swaps: Map<u32, SlotSwap> = env.storage().instance().get(&DataKey2::SlotSwaps).unwrap_or(Map::new(&env));
+        let mut swaps: Map<u32, SlotSwap> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SlotSwaps)
+            .unwrap_or(Map::new(&env));
         let mut swap = swaps.get(swap_id).expect("Swap not found");
-        if swap.counterparty != counterparty { panic_with_error!(&env, Error::OnlyMembersAllowed); }
-        if swap.status != SlotSwapStatus::Pending { panic_with_error!(&env, Error::ProposalNotPending); }
+        if swap.counterparty != counterparty {
+            panic_with_error!(&env, Error::OnlyMembersAllowed);
+        }
+        if swap.status != SlotSwapStatus::Pending {
+            panic_with_error!(&env, Error::ProposalNotPending);
+        }
         swap.status = SlotSwapStatus::Rejected;
         swaps.set(swap_id, swap);
         env.storage().instance().set(&DataKey2::SlotSwaps, &swaps);
@@ -6991,27 +7247,50 @@ impl AhjoorContract {
 
     pub fn approve_slot_swap(env: Env, admin: Address, swap_id: u32) {
         admin.require_auth();
-        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
-        let mut swaps: Map<u32, SlotSwap> = env.storage().instance().get(&DataKey2::SlotSwaps).unwrap_or(Map::new(&env));
+        let a: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("No admin");
+        if admin != a {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        let mut swaps: Map<u32, SlotSwap> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SlotSwaps)
+            .unwrap_or(Map::new(&env));
         let swap = swaps.get(swap_id).expect("Swap not found");
-        if swap.status != SlotSwapStatus::Accepted { panic_with_error!(&env, Error::ProposalNotPending); }
+        if swap.status != SlotSwapStatus::Accepted {
+            panic_with_error!(&env, Error::ProposalNotPending);
+        }
         Self::execute_slot_swap_inner(&env, swap_id);
     }
 
     fn execute_slot_swap_inner(env: &Env, swap_id: u32) {
-        let mut swaps: Map<u32, SlotSwap> = env.storage().instance().get(&DataKey2::SlotSwaps).unwrap_or(Map::new(env));
+        let mut swaps: Map<u32, SlotSwap> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SlotSwaps)
+            .unwrap_or(Map::new(env));
         let mut swap = swaps.get(swap_id).unwrap();
-        let mut payout_order: Vec<Address> = env.storage().instance().get(&DataKey::PayoutOrder).unwrap();
+        let mut payout_order: Vec<Address> =
+            env.storage().instance().get(&DataKey::PayoutOrder).unwrap();
         let addr_a = payout_order.get(swap.round_a).unwrap();
         let addr_b = payout_order.get(swap.round_b).unwrap();
         let mut new_order: Vec<Address> = Vec::new(env);
         for (i, addr) in payout_order.iter().enumerate() {
-            if i as u32 == swap.round_a { new_order.push_back(addr_b.clone()); }
-            else if i as u32 == swap.round_b { new_order.push_back(addr_a.clone()); }
-            else { new_order.push_back(addr); }
+            if i as u32 == swap.round_a {
+                new_order.push_back(addr_b.clone());
+            } else if i as u32 == swap.round_b {
+                new_order.push_back(addr_a.clone());
+            } else {
+                new_order.push_back(addr);
+            }
         }
-        env.storage().instance().set(&DataKey::PayoutOrder, &new_order);
+        env.storage()
+            .instance()
+            .set(&DataKey::PayoutOrder, &new_order);
         swap.status = SlotSwapStatus::Executed;
         swaps.set(swap_id, swap.clone());
         env.storage().instance().set(&DataKey2::SlotSwaps, &swaps);
@@ -7023,14 +7302,26 @@ impl AhjoorContract {
     pub fn set_insurance_coverage_mode(env: Env, admin: Address, mode: InsuranceCoverageMode) {
         admin.require_auth();
         internals::check_not_paused(&env);
-        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
-        env.storage().instance().set(&DataKey2::InsuranceCoverageMode, &mode);
+        let a: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("No admin");
+        if admin != a {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey2::InsuranceCoverageMode, &mode);
         events::emit_insurance_coverage_mode_set(&env, mode as u32);
     }
 
     pub fn get_insurance_claims(env: Env, round: u32) -> Vec<InsuranceClaim> {
-        let claims: Map<u32, Vec<InsuranceClaim>> = env.storage().instance().get(&DataKey2::InsuranceClaims).unwrap_or(Map::new(&env));
+        let claims: Map<u32, Vec<InsuranceClaim>> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::InsuranceClaims)
+            .unwrap_or(Map::new(&env));
         claims.get(round).unwrap_or(Vec::new(&env))
     }
 
@@ -7039,25 +7330,64 @@ impl AhjoorContract {
     pub fn set_reinstatement_fee(env: Env, admin: Address, fee: i128) {
         admin.require_auth();
         internals::check_not_paused(&env);
-        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
-        if fee < 0 { panic_with_error!(&env, Error::AmountMustBePositive); }
-        env.storage().instance().set(&DataKey2::ReinstatementFee, &fee);
+        let a: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("No admin");
+        if admin != a {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        if fee < 0 {
+            panic_with_error!(&env, Error::AmountMustBePositive);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey2::ReinstatementFee, &fee);
     }
 
     pub fn request_reinstatement(env: Env, member: Address, reason_hash: BytesN<32>) -> u32 {
         member.require_auth();
         internals::check_not_paused(&env);
-        let suspended: Vec<Address> = env.storage().instance().get(&DataKey::SuspendedMembers).unwrap_or(Vec::new(&env));
-        if !suspended.contains(&member) { panic_with_error!(&env, Error::NotAMember); }
-        let am: Map<Address, u32> = env.storage().instance().get(&DataKey2::ActiveReinstatementProposal).unwrap_or(Map::new(&env));
-        if am.contains_key(member.clone()) { panic_with_error!(&env, Error::AlreadyContributed); }
-        let quorum_config: Map<ProposalType, u32> = env.storage().instance().get(&DataKey2::QuorumConfig).unwrap_or(Map::new(&env));
-        let required_quorum = quorum_config.get(ProposalType::Reinstatement).unwrap_or(5_100);
+        let suspended: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuspendedMembers)
+            .unwrap_or(Vec::new(&env));
+        if !suspended.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+        let am: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::ActiveReinstatementProposal)
+            .unwrap_or(Map::new(&env));
+        if am.contains_key(member.clone()) {
+            panic_with_error!(&env, Error::AlreadyContributed);
+        }
+        let quorum_config: Map<ProposalType, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::QuorumConfig)
+            .unwrap_or(Map::new(&env));
+        let required_quorum = quorum_config
+            .get(ProposalType::Reinstatement)
+            .unwrap_or(5_100);
         let now = env.ledger().timestamp();
-        let mut proposals: Map<u32, Proposal> = env.storage().instance().get(&DataKey::Proposals).unwrap_or(Map::new(&env));
-        let proposal_id: u32 = env.storage().instance().get(&DataKey::ProposalCounter).unwrap_or(0) + 1;
-        env.storage().instance().set(&DataKey::ProposalCounter, &proposal_id);
+        let mut proposals: Map<u32, Proposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposals)
+            .unwrap_or(Map::new(&env));
+        let proposal_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCounter, &proposal_id);
         let proposal = Proposal {
             id: proposal_id,
             proposal_type: ProposalType::Reinstatement,
@@ -7073,10 +7403,14 @@ impl AhjoorContract {
             required_quorum,
         };
         proposals.set(proposal_id, proposal);
-        env.storage().instance().set(&DataKey::Proposals, &proposals);
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposals, &proposals);
         let mut active = am;
         active.set(member.clone(), proposal_id);
-        env.storage().instance().set(&DataKey2::ActiveReinstatementProposal, &active);
+        env.storage()
+            .instance()
+            .set(&DataKey2::ActiveReinstatementProposal, &active);
         events::emit_reinstatement_requested(&env, member, proposal_id);
         proposal_id
     }
@@ -7124,7 +7458,9 @@ impl AhjoorContract {
                 ns.push_back(m);
             }
         }
-        env.storage().instance().set(&DataKey::SuspendedMembers, &ns);
+        env.storage()
+            .instance()
+            .set(&DataKey::SuspendedMembers, &ns);
 
         // Reset default count
         let mut dc: Map<Address, u32> = env
@@ -7169,7 +7505,9 @@ impl AhjoorContract {
         // Mark proposal Executed and clear the ActiveReinstatementProposal entry
         proposal.status = ProposalStatus::Executed;
         proposals.set(proposal_id, proposal);
-        env.storage().instance().set(&DataKey::Proposals, &proposals);
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposals, &proposals);
 
         let mut am2: Map<Address, u32> = env
             .storage()
@@ -7287,7 +7625,9 @@ impl AhjoorContract {
             panic!("Not on waitlist");
         }
 
-        env.storage().instance().set(&DataKey2::Waitlist, &new_waitlist);
+        env.storage()
+            .instance()
+            .set(&DataKey2::Waitlist, &new_waitlist);
         events::emit_waitlist_updated(&env, caller, false, new_waitlist.len() as u32);
 
         env.storage()
@@ -7328,7 +7668,9 @@ impl AhjoorContract {
             panic!("Address not on waitlist");
         }
 
-        env.storage().instance().set(&DataKey2::Waitlist, &new_waitlist);
+        env.storage()
+            .instance()
+            .set(&DataKey2::Waitlist, &new_waitlist);
         events::emit_waitlist_updated(&env, target, false, new_waitlist.len() as u32);
 
         env.storage()
@@ -7501,12 +7843,12 @@ impl AhjoorContract {
                 buf
             })
             .into();
-        env.events().publish(
-            (Symbol::new(env, "WaitlistUpdated"),),
-            (order_hash,),
-        );
+        env.events()
+            .publish((Symbol::new(env, "WaitlistUpdated"),), (order_hash,));
 
-        env.storage().instance().set(&DataKey2::Waitlist, &new_waitlist);
+        env.storage()
+            .instance()
+            .set(&DataKey2::Waitlist, &new_waitlist);
 
         // Add to members
         let mut members: Vec<Address> = env
@@ -7524,7 +7866,9 @@ impl AhjoorContract {
             .get(&DataKey::PayoutOrder)
             .expect("Payout order not set");
         payout_order.push_back(new_member.clone());
-        env.storage().instance().set(&DataKey::PayoutOrder, &payout_order);
+        env.storage()
+            .instance()
+            .set(&DataKey::PayoutOrder, &payout_order);
 
         // Calculate catch-up contribution: rounds already elapsed × contribution_amount
         let current_round: u32 = env
@@ -7543,7 +7887,11 @@ impl AhjoorContract {
         if catch_up_amount > 0 {
             let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
             let client = token::Client::new(env, &token_addr);
-            client.transfer(&new_member, &env.current_contract_address(), &catch_up_amount);
+            client.transfer(
+                &new_member,
+                &env.current_contract_address(),
+                &catch_up_amount,
+            );
         }
 
         // #352: Rebalance contributions now that active member count has changed
@@ -7637,7 +7985,8 @@ impl AhjoorContract {
             .storage()
             .instance()
             .get(&DataKey4::MergeProposalCounter)
-            .unwrap_or(0) + 1;
+            .unwrap_or(0)
+            + 1;
         env.storage()
             .instance()
             .set(&DataKey4::MergeProposalCounter, &proposal_id);
@@ -7672,11 +8021,7 @@ impl AhjoorContract {
     /// Group B admin signals consent to the merge by setting `accepted = true` on the proposal.
     /// This is the consent-only step; it does NOT copy members or set GroupStatus.
     /// Call `complete_merge` afterwards to execute the merge.
-    pub fn accept_merge(
-        env: Env,
-        admin: Address,
-        merge_proposal_id: u32,
-    ) {
+    pub fn accept_merge(env: Env, admin: Address, merge_proposal_id: u32) {
         internals::check_not_paused(&env);
         admin.require_auth();
         let stored_admin: Address = env
@@ -7693,7 +8038,9 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey4::MergeProposals)
             .unwrap_or(Map::new(&env));
-        let mut proposal = proposals.get(merge_proposal_id).expect("Merge proposal not found");
+        let mut proposal = proposals
+            .get(merge_proposal_id)
+            .expect("Merge proposal not found");
 
         if proposal.accepted {
             panic!("Merge proposal already accepted");
@@ -7749,7 +8096,9 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey4::MergeProposals)
             .unwrap_or(Map::new(&env));
-        let proposal = proposals.get(merge_proposal_id).expect("Merge proposal not found");
+        let proposal = proposals
+            .get(merge_proposal_id)
+            .expect("Merge proposal not found");
 
         // Guard: Group B admin must have accepted the proposal first
         if !proposal.accepted {
@@ -7797,7 +8146,9 @@ impl AhjoorContract {
         }
 
         env.storage().instance().set(&DataKey::Members, &members);
-        env.storage().instance().set(&DataKey::PayoutOrder, &payout_order);
+        env.storage()
+            .instance()
+            .set(&DataKey::PayoutOrder, &payout_order);
 
         // Permanently mark the source group as merged — prevents re-execution
         env.storage()
@@ -7828,7 +8179,9 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey4::MergeProposals)
             .unwrap_or(Map::new(&env));
-        proposals.get(proposal_id).expect("Merge proposal not found")
+        proposals
+            .get(proposal_id)
+            .expect("Merge proposal not found")
     }
 
     /// Returns the current GroupStatus for this group.
@@ -7879,7 +8232,9 @@ impl AhjoorContract {
             unfrozen_at_ledger: None,
             resolution_hash: None,
         });
-        env.storage().persistent().set(&PersistentKey::FreezeLog, &log);
+        env.storage()
+            .persistent()
+            .set(&PersistentKey::FreezeLog, &log);
         env.storage().persistent().extend_ttl(
             &PersistentKey::FreezeLog,
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -7913,14 +8268,21 @@ impl AhjoorContract {
             panic_with_error!(&env, ExtError::CoSignerAlreadySet);
         }
 
-        co_signers.set(member.clone(), CoSignerRecord {
-            co_signer: co_signer.clone(),
-            status: CoSignerStatus::Pending,
-        });
-        env.storage().instance().set(&DataKey4::CoSigners, &co_signers);
+        co_signers.set(
+            member.clone(),
+            CoSignerRecord {
+                co_signer: co_signer.clone(),
+                status: CoSignerStatus::Pending,
+            },
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey4::CoSigners, &co_signers);
 
         events::emit_co_signer_set(&env, group_id, member, co_signer);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Contract-level admin unfreezes the group, logging the resolution on-chain.
@@ -7957,7 +8319,9 @@ impl AhjoorContract {
         record.unfrozen_at_ledger = Some(env.ledger().sequence());
         record.resolution_hash = Some(resolution_hash.clone());
         log.set(last_idx, record);
-        env.storage().persistent().set(&PersistentKey::FreezeLog, &log);
+        env.storage()
+            .persistent()
+            .set(&PersistentKey::FreezeLog, &log);
         env.storage().persistent().extend_ttl(
             &PersistentKey::FreezeLog,
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -7979,15 +8343,17 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey4::CoSigners)
             .unwrap_or(Map::new(&env));
-        let mut record = co_signers.get(member.clone()).unwrap_or_else(|| {
-            panic_with_error!(&env, ExtError::NoCoSignerFound)
-        });
+        let mut record = co_signers
+            .get(member.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError::NoCoSignerFound));
         if record.co_signer != co_signer {
             panic_with_error!(&env, ExtError::NotTheCoSigner);
         }
         record.status = CoSignerStatus::Active;
         co_signers.set(member.clone(), record);
-        env.storage().instance().set(&DataKey4::CoSigners, &co_signers);
+        env.storage()
+            .instance()
+            .set(&DataKey4::CoSigners, &co_signers);
 
         events::emit_co_signer_accepted(&env, group_id, member, co_signer);
         env.storage()
@@ -8204,7 +8570,11 @@ impl AhjoorContract {
         let total_transfer_amount = amount + insurance_deduction;
 
         let client = token::Client::new(&env, &token);
-        client.transfer(&proxy, &env.current_contract_address(), &total_transfer_amount);
+        client.transfer(
+            &proxy,
+            &env.current_contract_address(),
+            &total_transfer_amount,
+        );
 
         if insurance_deduction > 0 {
             let mut insurance_pool: i128 = env
@@ -8243,7 +8613,9 @@ impl AhjoorContract {
         Self::apply_reputation_delta(&env, member.clone(), 10, "on_time_full");
         Self::update_credit_score_internal(&env, &member, Symbol::new(&env, "on_time"));
         paid_members.push_back(member.clone());
-        env.storage().instance().set(&DataKey::PaidMembers, &paid_members);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaidMembers, &paid_members);
 
         let mut total_participations: u32 = env
             .storage()
@@ -8279,11 +8651,7 @@ impl AhjoorContract {
                     .instance()
                     .get(&DataKey::CurrentRound)
                     .unwrap_or(0);
-                events::emit_round_auto_closed_early(
-                    &env,
-                    current_round,
-                    env.ledger().timestamp(),
-                );
+                events::emit_round_auto_closed_early(&env, current_round, env.ledger().timestamp());
             }
         }
 
@@ -8344,7 +8712,13 @@ impl AhjoorContract {
             .instance()
             .set(&DataKey3::ProxyAuthorizations, &proxy_auths);
         if proxy_exhausted {
-            events::emit_proxy_expired(&env, group_id, member.clone(), proxy_addr, env.ledger().sequence() as u64);
+            events::emit_proxy_expired(
+                &env,
+                group_id,
+                member.clone(),
+                proxy_addr,
+                env.ledger().sequence() as u64,
+            );
         }
 
         if !activation_emitted {
@@ -8405,9 +8779,9 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey4::CoSigners)
             .unwrap_or(Map::new(&env));
-        let record = co_signers.get(member.clone()).unwrap_or_else(|| {
-            panic_with_error!(&env, ExtError::NoCoSignerFound)
-        });
+        let record = co_signers
+            .get(member.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError::NoCoSignerFound));
         if record.co_signer != co_signer {
             panic_with_error!(&env, ExtError::NotTheCoSigner);
         }
@@ -8421,9 +8795,9 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey3::CoSignerWindowStart)
             .unwrap_or(Map::new(&env));
-        let start = window_starts.get(member.clone()).unwrap_or_else(|| {
-            panic_with_error!(&env, ExtError::CoSignerWindowNotOpen)
-        });
+        let start = window_starts
+            .get(member.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError::CoSignerWindowNotOpen));
         let co_signer_window: u32 = env
             .storage()
             .instance()
@@ -8446,7 +8820,9 @@ impl AhjoorContract {
         if !paid_members.contains(&member) {
             paid_members.push_back(member.clone());
         }
-        env.storage().instance().set(&DataKey::PaidMembers, &paid_members);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaidMembers, &paid_members);
 
         // Clear the window
         let mut window_starts_mut: Map<Address, u32> = env
@@ -8488,7 +8864,9 @@ impl AhjoorContract {
             panic_with_error!(&env, ExtError::NoCoSignerFound);
         }
         co_signers.remove(member.clone());
-        env.storage().instance().set(&DataKey4::CoSigners, &co_signers);
+        env.storage()
+            .instance()
+            .set(&DataKey4::CoSigners, &co_signers);
 
         let _ = group_id; // used in event
         env.storage()
@@ -8510,12 +8888,27 @@ impl AhjoorContract {
     pub fn set_min_snapshot_interval(env: Env, admin: Address, interval_ledgers: u32) {
         internals::check_not_paused(&env);
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if admin != stored_admin { panic!("Only admin can set snapshot interval"); }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set snapshot interval");
+        }
 
-        env.storage().persistent().set(&PersistentKey::MinSnapshotIntervalLedgers, &interval_ledgers);
-        env.storage().persistent().extend_ttl(&PersistentKey::MinSnapshotIntervalLedgers, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage().persistent().set(
+            &PersistentKey::MinSnapshotIntervalLedgers,
+            &interval_ledgers,
+        );
+        env.storage().persistent().extend_ttl(
+            &PersistentKey::MinSnapshotIntervalLedgers,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Any member or admin takes a snapshot of the current group state.
@@ -8525,17 +8918,33 @@ impl AhjoorContract {
         caller.require_auth();
 
         // Caller must be a member or admin
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).unwrap_or(Vec::new(&env));
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .unwrap_or(Vec::new(&env));
         if caller != admin && !members.contains(&caller) {
             panic_with_error!(&env, Error::OnlyMembersAllowed);
         }
 
         // Spam guard — only applies if a previous snapshot exists
         let current_ledger = env.ledger().sequence();
-        let min_interval: u32 = env.storage().persistent().get(&PersistentKey::MinSnapshotIntervalLedgers).unwrap_or(0);
+        let min_interval: u32 = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::MinSnapshotIntervalLedgers)
+            .unwrap_or(0);
         if min_interval > 0 {
-            if let Some(last_ledger) = env.storage().persistent().get::<PersistentKey, u32>(&PersistentKey::LastSnapshotLedger) {
+            if let Some(last_ledger) = env
+                .storage()
+                .persistent()
+                .get::<PersistentKey, u32>(&PersistentKey::LastSnapshotLedger)
+            {
                 if current_ledger < last_ledger.saturating_add(min_interval) {
                     panic_with_error!(&env, ExtError::SnapshotTooSoon);
                 }
@@ -8543,11 +8952,23 @@ impl AhjoorContract {
         }
 
         // Collect current state
-        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
-        let payout_order: Vec<Address> = env.storage().instance().get(&DataKey::PayoutOrder).unwrap_or(Vec::new(&env));
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .unwrap_or(Vec::new(&env));
 
         // Compute pooled balance: sum of member contributions this round
-        let member_contributions: Map<Address, i128> = env.storage().instance().get(&DataKey::MemberContributions).unwrap_or(Map::new(&env));
+        let member_contributions: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberContributions)
+            .unwrap_or(Map::new(&env));
         let mut pooled_balance: i128 = 0;
         for (_, amt) in member_contributions.iter() {
             pooled_balance = pooled_balance.saturating_add(amt);
@@ -8567,7 +8988,11 @@ impl AhjoorContract {
         let state_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
         // Load existing snapshot log and append
-        let mut log: Vec<GroupSnapshot> = env.storage().persistent().get(&PersistentKey::SnapshotLog).unwrap_or(Vec::new(&env));
+        let mut log: Vec<GroupSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::SnapshotLog)
+            .unwrap_or(Vec::new(&env));
         let snapshot_id = log.len() as u32;
 
         let snapshot = GroupSnapshot {
@@ -8582,28 +9007,50 @@ impl AhjoorContract {
         };
 
         log.push_back(snapshot);
-        env.storage().persistent().set(&PersistentKey::SnapshotLog, &log);
-        env.storage().persistent().extend_ttl(&PersistentKey::SnapshotLog, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage()
+            .persistent()
+            .set(&PersistentKey::SnapshotLog, &log);
+        env.storage().persistent().extend_ttl(
+            &PersistentKey::SnapshotLog,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Update last snapshot ledger
-        env.storage().persistent().set(&PersistentKey::LastSnapshotLedger, &current_ledger);
-        env.storage().persistent().extend_ttl(&PersistentKey::LastSnapshotLedger, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage()
+            .persistent()
+            .set(&PersistentKey::LastSnapshotLedger, &current_ledger);
+        env.storage().persistent().extend_ttl(
+            &PersistentKey::LastSnapshotLedger,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         events::emit_snapshot_taken(&env, snapshot_id, caller, state_hash);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
         snapshot_id
     }
 
     /// Returns a specific snapshot by ID.
     pub fn get_snapshot(env: Env, snapshot_id: u32) -> GroupSnapshot {
-        let log: Vec<GroupSnapshot> = env.storage().persistent().get(&PersistentKey::SnapshotLog).unwrap_or(Vec::new(&env));
+        let log: Vec<GroupSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::SnapshotLog)
+            .unwrap_or(Vec::new(&env));
         log.get(snapshot_id).expect("Snapshot not found")
     }
 
     /// Returns the total number of snapshots taken.
     pub fn get_snapshot_count(env: Env) -> u32 {
-        let log: Vec<GroupSnapshot> = env.storage().persistent().get(&PersistentKey::SnapshotLog).unwrap_or(Vec::new(&env));
+        let log: Vec<GroupSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::SnapshotLog)
+            .unwrap_or(Vec::new(&env));
         log.len() as u32
     }
 
@@ -8652,7 +9099,16 @@ impl AhjoorContract {
         }
 
         // Delegate to the main init path
-        Self::init(env, admin, members, contribution_amount, token, round_duration, config, start_at);
+        Self::init(
+            env,
+            admin,
+            members,
+            contribution_amount,
+            token,
+            round_duration,
+            config,
+            start_at,
+        );
     }
 
     /// Member joins an already-initialised tiered group choosing a tier.
@@ -8665,13 +9121,21 @@ impl AhjoorContract {
         member.require_auth();
 
         // Validate that the group has tiers configured
-        let tiers: Vec<Tier> = env.storage().instance().get(&DataKey3::GroupTiers).expect("Group has no tiers; use create_group_tiered");
+        let tiers: Vec<Tier> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::GroupTiers)
+            .expect("Group has no tiers; use create_group_tiered");
 
         if tier_id >= tiers.len() {
             panic_with_error!(&env, ExtError::TierNotFound);
         }
 
-        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).expect("Not initialized");
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
         if !members.contains(&member) {
             panic!("Only existing members can join with a tier; use add_member first");
         }
@@ -8685,10 +9149,14 @@ impl AhjoorContract {
             .get(&DataKey3::MemberTierIndex)
             .unwrap_or(Map::new(&env));
         member_tier_index.set(member.clone(), tier_id);
-        env.storage().instance().set(&DataKey3::MemberTierIndex, &member_tier_index);
+        env.storage()
+            .instance()
+            .set(&DataKey3::MemberTierIndex, &member_tier_index);
 
         events::emit_member_joined_with_tier(&env, member, tier_id);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Member requests a tier change.  The change is queued and takes effect
@@ -8697,7 +9165,11 @@ impl AhjoorContract {
         internals::check_not_paused(&env);
         member.require_auth();
 
-        let tiers: Vec<Tier> = env.storage().instance().get(&DataKey3::GroupTiers).expect("Group has no tiers");
+        let tiers: Vec<Tier> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::GroupTiers)
+            .expect("Group has no tiers");
         if new_tier_id >= tiers.len() {
             panic_with_error!(&env, ExtError::TierNotFound);
         }
@@ -8719,22 +9191,50 @@ impl AhjoorContract {
             .get(&DataKey3::PendingTierChange)
             .unwrap_or(Map::new(&env));
         pending.set(member.clone(), new_tier_id);
-        env.storage().instance().set(&DataKey3::PendingTierChange, &pending);
+        env.storage()
+            .instance()
+            .set(&DataKey3::PendingTierChange, &pending);
 
-        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
-        let payout_order: Vec<Address> = env.storage().instance().get(&DataKey::PayoutOrder).unwrap_or(Vec::new(&env));
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .unwrap_or(Vec::new(&env));
         let cycle_len = payout_order.len() as u32;
-        let effective_cycle = if cycle_len > 0 { (current_round / cycle_len) + 1 } else { 1 };
+        let effective_cycle = if cycle_len > 0 {
+            (current_round / cycle_len) + 1
+        } else {
+            1
+        };
 
-        events::emit_member_tier_changed(&env, member, current_tier_id, new_tier_id, effective_cycle);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_member_tier_changed(
+            &env,
+            member,
+            current_tier_id,
+            new_tier_id,
+            effective_cycle,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Admin applies any queued tier changes (called at the start of each new cycle).
     pub fn apply_pending_tier_changes(env: Env, admin: Address) {
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if admin != stored_admin { panic!("Only admin can apply tier changes"); }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can apply tier changes");
+        }
 
         let pending: Map<Address, u32> = env
             .storage()
@@ -8742,7 +9242,9 @@ impl AhjoorContract {
             .get(&DataKey3::PendingTierChange)
             .unwrap_or(Map::new(&env));
 
-        if pending.is_empty() { return; }
+        if pending.is_empty() {
+            return;
+        }
 
         let mut member_tier_index: Map<Address, u32> = env
             .storage()
@@ -8750,10 +9252,22 @@ impl AhjoorContract {
             .get(&DataKey3::MemberTierIndex)
             .unwrap_or(Map::new(&env));
 
-        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
-        let payout_order: Vec<Address> = env.storage().instance().get(&DataKey::PayoutOrder).unwrap_or(Vec::new(&env));
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .unwrap_or(Vec::new(&env));
         let cycle_len = payout_order.len() as u32;
-        let current_cycle = if cycle_len > 0 { current_round / cycle_len } else { 0 };
+        let current_cycle = if cycle_len > 0 {
+            current_round / cycle_len
+        } else {
+            0
+        };
 
         for (member, new_tier_id) in pending.iter() {
             let old_tier = member_tier_index.get(member.clone()).unwrap_or(0);
@@ -8761,14 +9275,24 @@ impl AhjoorContract {
             events::emit_member_tier_changed(&env, member, old_tier, new_tier_id, current_cycle);
         }
 
-        env.storage().instance().set(&DataKey3::MemberTierIndex, &member_tier_index);
-        env.storage().instance().set(&DataKey3::PendingTierChange, &Map::<Address, u32>::new(&env));
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .set(&DataKey3::MemberTierIndex, &member_tier_index);
+        env.storage().instance().set(
+            &DataKey3::PendingTierChange,
+            &Map::<Address, u32>::new(&env),
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Returns the tier definitions for this group.
     pub fn get_group_tiers(env: Env) -> Vec<Tier> {
-        env.storage().instance().get(&DataKey3::GroupTiers).unwrap_or(Vec::new(&env))
+        env.storage()
+            .instance()
+            .get(&DataKey3::GroupTiers)
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Returns the tier index for a specific member (0 = first tier or no tier).
@@ -8797,8 +9321,14 @@ impl AhjoorContract {
         completion_weight: i128,
     ) {
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if admin != stored_admin { panic!("Only admin can set score weights"); }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set score weights");
+        }
 
         let weights = ScoreWeights {
             on_time_weight,
@@ -8807,18 +9337,32 @@ impl AhjoorContract {
             exit_weight,
             completion_weight,
         };
-        env.storage().instance().set(&DataKey3::ScoreWeights, &weights);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .set(&DataKey3::ScoreWeights, &weights);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Admin sets the minimum credit score required to join this group.
     pub fn set_min_credit_score(env: Env, admin: Address, min_score: i128) {
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if admin != stored_admin { panic!("Only admin can set minimum credit score"); }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set minimum credit score");
+        }
 
-        env.storage().instance().set(&DataKey3::MinCreditScore, &min_score);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .set(&DataKey3::MinCreditScore, &min_score);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Returns the current credit score record for a member.
@@ -8848,10 +9392,7 @@ impl AhjoorContract {
             .get(&PersistentKey::MemberCreditScores)
             .unwrap_or(Map::new(&env));
 
-        let score = scores
-            .get(member.clone())
-            .map(|ms| ms.score)
-            .unwrap_or(0);
+        let score = scores.get(member.clone()).map(|ms| ms.score).unwrap_or(0);
 
         let last_updated: u32 = env
             .storage()
@@ -8930,12 +9471,7 @@ impl AhjoorContract {
     }
 
     /// Vote on treasury round proposal (#314)
-    pub fn vote_treasury_round(
-        env: Env,
-        member: Address,
-        round_index: u32,
-        vote_for: bool,
-    ) {
+    pub fn vote_treasury_round(env: Env, member: Address, round_index: u32, vote_for: bool) {
         member.require_auth();
 
         let members: Vec<Address> = env
@@ -8982,9 +9518,10 @@ impl AhjoorContract {
             events::emit_treasury_round_confirmed(&env, round_index);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey3::TreasuryRoundVotes(round_index, member), &vote_for);
+        env.storage().instance().set(
+            &DataKey3::TreasuryRoundVotes(round_index, member),
+            &vote_for,
+        );
         env.storage()
             .instance()
             .set(&DataKey3::TreasuryRoundProposal(round_index), &proposal);
@@ -9076,10 +9613,10 @@ impl AhjoorContract {
             score: 0,
         });
 
-        let on_time_sym  = Symbol::new(env, "on_time");
-        let late_sym     = Symbol::new(env, "late");
-        let default_sym  = Symbol::new(env, "default");
-        let exit_sym     = Symbol::new(env, "early_exit");
+        let on_time_sym = Symbol::new(env, "on_time");
+        let late_sym = Symbol::new(env, "late");
+        let default_sym = Symbol::new(env, "default");
+        let exit_sym = Symbol::new(env, "early_exit");
         let complete_sym = Symbol::new(env, "completed");
 
         if reason == on_time_sym {
@@ -9115,7 +9652,9 @@ impl AhjoorContract {
             + (ms.groups_completed as i128 * weights.completion_weight);
 
         scores.set(member.clone(), ms.clone());
-        env.storage().persistent().set(&PersistentKey::MemberCreditScores, &scores);
+        env.storage()
+            .persistent()
+            .set(&PersistentKey::MemberCreditScores, &scores);
         env.storage().persistent().extend_ttl(
             &PersistentKey::MemberCreditScores,
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -9125,9 +9664,10 @@ impl AhjoorContract {
         if old_score != ms.score {
             // #457: Track ledger at which credit score last changed for cross-contract oracle
             let current_ledger = env.ledger().sequence();
-            env.storage()
-                .persistent()
-                .set(&PersistentKey::CreditScoreUpdatedAt(member.clone()), &current_ledger);
+            env.storage().persistent().set(
+                &PersistentKey::CreditScoreUpdatedAt(member.clone()),
+                &current_ledger,
+            );
             env.storage().persistent().extend_ttl(
                 &PersistentKey::CreditScoreUpdatedAt(member.clone()),
                 PERSISTENT_LIFETIME_THRESHOLD,
@@ -9191,12 +9731,17 @@ impl AhjoorContract {
             .get(&DataKey3::ContribDelegations)
             .unwrap_or(Map::new(&env));
 
-        delegations.set(member.clone(), ContribDelegationRecord {
-            proxy: proxy.clone(),
-            expiry: expiry_ledger,
-            expiry_mode,
-        });
-        env.storage().instance().set(&DataKey3::ContribDelegations, &delegations);
+        delegations.set(
+            member.clone(),
+            ContribDelegationRecord {
+                proxy: proxy.clone(),
+                expiry: expiry_ledger,
+                expiry_mode,
+            },
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey3::ContribDelegations, &delegations);
 
         events::emit_delegation_granted(&env, group_id, member, proxy, expiry_ledger);
         env.storage()
@@ -9221,7 +9766,9 @@ impl AhjoorContract {
         let rec = delegations.get(member.clone()).unwrap();
         let proxy = rec.proxy.clone();
         delegations.remove(member.clone());
-        env.storage().instance().set(&DataKey3::ContribDelegations, &delegations);
+        env.storage()
+            .instance()
+            .set(&DataKey3::ContribDelegations, &delegations);
 
         events::emit_contribution_delegation_revoked(&env, group_id, member, proxy);
         env.storage()
@@ -9281,7 +9828,9 @@ impl AhjoorContract {
                 .get(&DataKey3::ContribDelegations)
                 .unwrap_or(Map::new(&env));
             delegations_mut.remove(member.clone());
-            env.storage().instance().set(&DataKey3::ContribDelegations, &delegations_mut);
+            env.storage()
+                .instance()
+                .set(&DataKey3::ContribDelegations, &delegations_mut);
             events::emit_proxy_expired(&env, 0, member.clone(), proxy.clone(), rec.expiry);
             panic_with_error!(&env, ExtError::DelegationExpired);
         }
@@ -9333,15 +9882,12 @@ impl AhjoorContract {
 
         let token_client = token::Client::new(&env, &token);
         // Proxy spends from member's account (requires pre-approved allowance)
-        token_client.transfer_from(
-            &proxy,
-            &member,
-            &env.current_contract_address(),
-            &amount,
-        );
+        token_client.transfer_from(&proxy, &member, &env.current_contract_address(), &amount);
 
         paid_members.push_back(member.clone());
-        env.storage().instance().set(&DataKey::PaidMembers, &paid_members);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaidMembers, &paid_members);
 
         let mut member_contributions: Map<Address, i128> = env
             .storage()
@@ -9405,9 +9951,9 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey::Proposals)
             .unwrap_or(Map::new(&env));
-        let mut proposal = proposals.get(proposal_id).unwrap_or_else(|| {
-            panic_with_error!(&env, Error::ProposalNotFound)
-        });
+        let mut proposal = proposals
+            .get(proposal_id)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
         let now = env.ledger().timestamp();
         if now > proposal.deadline {
@@ -9431,8 +9977,12 @@ impl AhjoorContract {
         }
         votes.set(proposal_id, round_votes);
         proposals.set(proposal_id, proposal);
-        env.storage().instance().set(&DataKey::Proposals, &proposals);
-        env.storage().instance().set(&DataKey::ProposalVotes, &votes);
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposals, &proposals);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalVotes, &votes);
 
         events::emit_voted(&env, proposal_id, member, approve);
         env.storage()
@@ -9566,7 +10116,12 @@ impl AhjoorContract {
     }
 
     /// Member confirms their participation in the split.
-    pub fn confirm_split_participation(env: Env, member: Address, _group_id: u32, proposal_id: u32) {
+    pub fn confirm_split_participation(
+        env: Env,
+        member: Address,
+        _group_id: u32,
+        proposal_id: u32,
+    ) {
         internals::check_not_paused(&env);
         member.require_auth();
 
@@ -9615,7 +10170,6 @@ impl AhjoorContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
-
 
     /// Execute the group split once all members have confirmed.
     /// Marks the source group as `Split`, distributes the pool reserve
@@ -9691,11 +10245,7 @@ impl AhjoorContract {
             let per_member_share = total_balance / (members.len() as i128);
             for m in unconfirmed.iter() {
                 if per_member_share > 0 {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &m,
-                        &per_member_share,
-                    );
+                    token_client.transfer(&env.current_contract_address(), &m, &per_member_share);
                 }
             }
         }
@@ -9772,7 +10322,9 @@ impl AhjoorContract {
             .instance()
             .get(&DataKey3::MinCreditScore)
             .unwrap_or(i128::MIN);
-        if min_score == i128::MIN { return; } // no minimum configured
+        if min_score == i128::MIN {
+            return;
+        } // no minimum configured
 
         let scores: Map<Address, MemberScore> = env
             .storage()
@@ -10078,16 +10630,19 @@ impl AhjoorContract {
         let member_count = payout_order.len() as u32;
 
         // Create seed: sha256(ledger_sequence || member_count)
-        let seed_input = Bytes::from_array(&env, &[
-            ledger_hash as u8,
-            (ledger_hash >> 8) as u8,
-            (ledger_hash >> 16) as u8,
-            (ledger_hash >> 24) as u8,
-            member_count as u8,
-            (member_count >> 8) as u8,
-            (member_count >> 16) as u8,
-            (member_count >> 24) as u8,
-        ]);
+        let seed_input = Bytes::from_array(
+            &env,
+            &[
+                ledger_hash as u8,
+                (ledger_hash >> 8) as u8,
+                (ledger_hash >> 16) as u8,
+                (ledger_hash >> 24) as u8,
+                member_count as u8,
+                (member_count >> 8) as u8,
+                (member_count >> 16) as u8,
+                (member_count >> 24) as u8,
+            ],
+        );
         let seed_hash = env.crypto().sha256(&seed_input);
         let seed_bytes = seed_hash.to_bytes();
 
@@ -10121,11 +10676,7 @@ impl AhjoorContract {
 
     /// Fisher-Yates shuffle using seed-derived randomness.
     /// Deterministic: same seed produces same shuffle.
-    fn fisher_yates_shuffle(
-        env: &Env,
-        mut items: Vec<Address>,
-        seed: &BytesN<32>,
-    ) -> Vec<Address> {
+    fn fisher_yates_shuffle(env: &Env, mut items: Vec<Address>, seed: &BytesN<32>) -> Vec<Address> {
         let n = items.len();
         if n <= 1 {
             return items;
@@ -10262,17 +10813,162 @@ impl AhjoorContract {
         internals::check_not_paused(&env);
         admin.require_auth();
         let stored_admin: Address = env
-            .storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if admin != stored_admin { panic!("Only admin can fund the savings reward pool"); }
-        if amount <= 0 { panic!("Amount must be positive"); }
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can fund the savings reward pool");
+        }
+        if amount <= 0 {
+            panic!("Amount must be positive");
+        }
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not set");
         let client = token::Client::new(&env, &token_addr);
         client.transfer(&admin, &env.current_contract_address(), &amount);
 
-        let pool: i128 = env.storage().instance().get(&DataKey::RewardPool).unwrap_or(0);
-        env.storage().instance().set(&DataKey::RewardPool, &(pool + amount));
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RewardPool)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::RewardPool, &(pool + amount));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin funds the collective-goal reward pool. Tokens are transferred from admin
+    /// to the contract and credited to `DataKey3::GoalRewardPool`. This pool is
+    /// distributed once when the group's `collective_goal` is reached (#454).
+    pub fn fund_goal_reward_pool(env: Env, admin: Address, amount: i128) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        if amount <= 0 {
+            panic_with_error!(&env, Error::AmountMustBePositive);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not set");
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&admin, &env.current_contract_address(), &amount);
+
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::GoalRewardPool)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey3::GoalRewardPool, &(pool + amount));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the current collective-goal reward pool balance.
+    pub fn get_goal_reward_pool(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey3::GoalRewardPool)
+            .unwrap_or(0)
+    }
+
+    /// Returns whether the collective-goal reward has already been distributed.
+    pub fn is_goal_reward_distributed(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey3::GoalRewardDistributed)
+            .unwrap_or(false)
+    }
+
+    /// Internal: distributes `GoalRewardPool` equally among all non-defaulting
+    /// members once, gated by `GoalRewardDistributed`. Called when the collective
+    /// goal milestone (100%) is reached (#454).
+    fn distribute_goal_reward(env: &Env) {
+        let already_distributed: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey3::GoalRewardDistributed)
+            .unwrap_or(false);
+        if already_distributed {
+            return;
+        }
+
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::GoalRewardPool)
+            .unwrap_or(0);
+
+        // Always gate, even if pool is empty, so this only ever fires once.
+        env.storage()
+            .instance()
+            .set(&DataKey3::GoalRewardDistributed, &true);
+
+        if pool <= 0 {
+            return;
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .unwrap_or(Vec::new(env));
+        let default_count: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DefaultCount)
+            .unwrap_or(Map::new(env));
+
+        let mut eligible: Vec<Address> = Vec::new(env);
+        for m in members.iter() {
+            if default_count.get(m.clone()).unwrap_or(0) == 0 {
+                eligible.push_back(m);
+            }
+        }
+
+        let count = eligible.len() as i128;
+        if count == 0 {
+            return;
+        }
+
+        let per_member = pool / count;
+        if per_member <= 0 {
+            return;
+        }
+
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let client = token::Client::new(env, &token_addr);
+
+        for m in eligible.iter() {
+            client.transfer(&env.current_contract_address(), &m, &per_member);
+            events::emit_milestone_reached(env, 0u32, m.clone(), 100u32, per_member);
+        }
+
+        // Any remainder from integer division stays in the pool; zero it out
+        // since it's been "spent" against this milestone.
+        env.storage()
+            .instance()
+            .set(&DataKey3::GoalRewardPool, &0i128);
     }
 
     /// Create a new savings goal for a group member.
@@ -10290,8 +10986,17 @@ impl AhjoorContract {
         metadata: Map<String, String>,
     ) -> u32 {
         savings_goal_tracking_impl::SavingsGoalTrackingImpl::create_goal(
-            &env, member, group_id, name, description, target_amount, token,
-            target_date, priority, category, metadata,
+            &env,
+            member,
+            group_id,
+            name,
+            description,
+            target_amount,
+            token,
+            target_date,
+            priority,
+            category,
+            metadata,
         )
     }
 
@@ -10301,7 +11006,9 @@ impl AhjoorContract {
         goal_id: u32,
         milestones: Vec<savings_goal_tracking::Milestone>,
     ) {
-        savings_goal_tracking_impl::SavingsGoalTrackingImpl::add_milestones(&env, goal_id, milestones);
+        savings_goal_tracking_impl::SavingsGoalTrackingImpl::add_milestones(
+            &env, goal_id, milestones,
+        );
     }
 
     /// Contribute to a savings goal. Milestone thresholds are checked and token rewards
@@ -10320,7 +11027,10 @@ impl AhjoorContract {
 
     /// Returns the savings goal reward pool balance.
     pub fn get_savings_reward_pool(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::RewardPool).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::RewardPool)
+            .unwrap_or(0)
     }
 
     /// Returns the bitmask of claimed milestones for a (goal_id, member) pair.
@@ -10347,22 +11057,42 @@ impl AhjoorContract {
         internals::check_not_frozen(&env);
         member.require_auth();
 
-        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).expect("Not initialized");
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
         if !members.contains(&member) {
             panic_with_error!(&env, Error::NotAMember);
         }
-        let exited: Vec<Address> = env.storage().instance().get(&DataKey::ExitedMembers).unwrap_or(Vec::new(&env));
+        let exited: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExitedMembers)
+            .unwrap_or(Vec::new(&env));
         if exited.contains(&member) {
             panic_with_error!(&env, Error::MemberHasExited);
         }
 
-        if env.storage().persistent().has(&DataKey3::CoPayerSplits(member.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey3::CoPayerSplits(member.clone()))
+        {
             panic_with_error!(&env, ExtError2::CopayerSplitsAlreadySet);
         }
 
         // Determine required contribution for member (accounting for tiers).
-        let base_amount: i128 = env.storage().instance().get(&DataKey::ContributionAmt).unwrap();
-        let tiers: Map<Address, u32> = env.storage().instance().get(&DataKey2::MemberTiers).unwrap_or(Map::new(&env));
+        let base_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContributionAmt)
+            .unwrap();
+        let tiers: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MemberTiers)
+            .unwrap_or(Map::new(&env));
         let tier_bps = tiers.get(member.clone()).unwrap_or(10_000);
         let required = (base_amount * tier_bps as i128) / 10_000;
 
@@ -10378,14 +11108,18 @@ impl AhjoorContract {
         }
 
         let co_payer_count = splits.len() as u32;
-        env.storage().persistent().set(&DataKey3::CoPayerSplits(member.clone()), &splits);
+        env.storage()
+            .persistent()
+            .set(&DataKey3::CoPayerSplits(member.clone()), &splits);
         env.storage().persistent().extend_ttl(
             &DataKey3::CoPayerSplits(member.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
         events::emit_co_payer_split_registered(&env, member, co_payer_count, total);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Remove the co-payer splits for `member`. Only the member can revoke.
@@ -10393,16 +11127,28 @@ impl AhjoorContract {
         internals::check_not_paused(&env);
         member.require_auth();
 
-        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).expect("Not initialized");
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
         if !members.contains(&member) {
             panic_with_error!(&env, Error::NotAMember);
         }
-        if !env.storage().persistent().has(&DataKey3::CoPayerSplits(member.clone())) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey3::CoPayerSplits(member.clone()))
+        {
             panic_with_error!(&env, ExtError2::NoCopayersRegistered);
         }
-        env.storage().persistent().remove(&DataKey3::CoPayerSplits(member.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey3::CoPayerSplits(member.clone()));
         events::emit_co_payer_split_revoked(&env, member);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Contribute on behalf of `member` using registered co-payer splits.
@@ -10419,27 +11165,47 @@ impl AhjoorContract {
         internals::check_not_frozen(&env);
         member.require_auth();
 
-        let start_at: u64 = env.storage().instance().get(&DataKey4::StartAt).unwrap_or(env.ledger().timestamp());
+        let start_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey4::StartAt)
+            .unwrap_or(env.ledger().timestamp());
         if env.ledger().timestamp() < start_at {
             panic_with_error!(&env, ExtError::GroupNotYetActive);
         }
 
-        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).expect("Not initialized");
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
         if !members.contains(&member) {
             panic_with_error!(&env, Error::NotAMember);
         }
-        let exited: Vec<Address> = env.storage().instance().get(&DataKey::ExitedMembers).unwrap_or(Vec::new(&env));
+        let exited: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExitedMembers)
+            .unwrap_or(Vec::new(&env));
         if exited.contains(&member) {
             panic_with_error!(&env, Error::MemberHasExited);
         }
 
-        let mut paid_members: Vec<Address> = env.storage().instance().get(&DataKey::PaidMembers).expect("Not initialized");
+        let mut paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .expect("Not initialized");
         if paid_members.contains(&member) {
             panic_with_error!(&env, Error::AlreadyContributed);
         }
 
         // Validate token is approved.
-        let approved_tokens: Vec<Address> = env.storage().instance().get(&DataKey::ApprovedTokens).unwrap_or(Vec::new(&env));
+        let approved_tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ApprovedTokens)
+            .unwrap_or(Vec::new(&env));
         if !approved_tokens.contains(&token) {
             panic_with_error!(&env, Error::TokenNotApproved);
         }
@@ -10451,19 +11217,35 @@ impl AhjoorContract {
             .get(&DataKey3::CoPayerSplits(member.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, ExtError2::NoCopayersRegistered));
 
-        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap();
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap();
         let token_client = token::Client::new(&env, &token);
         let mut total_transferred: i128 = 0;
 
         for split in splits.iter() {
-            token_client.transfer(&split.co_payer, &env.current_contract_address(), &split.amount);
-            events::emit_co_payer_contributed(&env, member.clone(), split.co_payer.clone(), split.amount, current_round);
+            token_client.transfer(
+                &split.co_payer,
+                &env.current_contract_address(),
+                &split.amount,
+            );
+            events::emit_co_payer_contributed(
+                &env,
+                member.clone(),
+                split.co_payer.clone(),
+                split.amount,
+                current_round,
+            );
             total_transferred += split.amount;
         }
 
         // Mark member as paid and record contribution amount.
         paid_members.push_back(member.clone());
-        env.storage().instance().set(&DataKey::PaidMembers, &paid_members);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaidMembers, &paid_members);
 
         let mut member_contributions: Map<Address, i128> = env
             .storage()
@@ -10471,14 +11253,25 @@ impl AhjoorContract {
             .get(&DataKey::MemberContributions)
             .unwrap_or(Map::new(&env));
         member_contributions.set(member.clone(), total_transferred);
-        env.storage().instance().set(&DataKey::MemberContributions, &member_contributions);
+        env.storage()
+            .instance()
+            .set(&DataKey::MemberContributions, &member_contributions);
 
         // Update savings goal tracking if configured.
-        let total_collected: i128 = env.storage().instance().get(&DataKey::TotalCollected).unwrap_or(0) + total_transferred;
-        env.storage().instance().set(&DataKey::TotalCollected, &total_collected);
+        let total_collected: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCollected)
+            .unwrap_or(0)
+            + total_transferred;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalCollected, &total_collected);
 
         events::emit_contrib(&env, member, current_round, token, total_transferred);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Return the registered co-payer splits for `member`, or an empty list.
@@ -10515,22 +11308,20 @@ impl AhjoorContract {
             .get(&DataKey3::ContributionReceiptCounter)
             .unwrap_or(0)
     }
-
 }
 
 mod test;
-mod test_new_features;
 mod test_contrib_delegation;
-mod test_group_split;
-mod test_skip;
-mod test_quorum;
-mod test_waitlist;
 mod test_cosigner_guarantee;
-mod test_proxy;
-mod test_group_freeze;
-mod test_snapshot;
 mod test_emergency_reserve;
+mod test_group_freeze;
+mod test_group_split;
+mod test_new_features;
+mod test_proxy;
+mod test_quorum;
 #[cfg(test)]
 mod test_savings_milestone_rewards;
+mod test_skip;
+mod test_snapshot;
+mod test_waitlist;
 pub use events::*;
-
